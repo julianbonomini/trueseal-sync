@@ -26,6 +26,10 @@ pub enum SessionError {
     PushFailed { msg: String },
     #[error("invalid pairing token")]
     InvalidToken,
+    #[error("not in any group")]
+    NotInGroup,
+    #[error("group has been destroyed")]
+    GroupDestroyed,
 }
 
 impl From<CoreSessionError> for SessionError {
@@ -33,9 +37,7 @@ impl From<CoreSessionError> for SessionError {
         match e {
             CoreSessionError::ConnectionFailed(msg) => SessionError::ConnectionFailed { msg },
             CoreSessionError::PushFailed(msg) => SessionError::PushFailed { msg },
-            CoreSessionError::NotInGroup => SessionError::PushFailed {
-                msg: "not in group".into(),
-            },
+            CoreSessionError::NotInGroup => SessionError::NotInGroup,
             CoreSessionError::InvalidKeypairBytes => SessionError::InvalidKeyLength {
                 expected: 64,
                 got: 0,
@@ -193,9 +195,9 @@ impl HushFfiSession {
         self.inner.cancel_pairing();
     }
 
-    /// Encrypt `blob` and fan out to all group members.
-    /// Returns an error if the session has no manifest (not in any group).
-    pub fn push_sync(&self, blob: Vec<u8>) -> Result<(), SessionError> {
+    /// Encrypt `blob` and fan out to all current group members.
+    /// Returns `SessionError::NotInGroup` if the session has no manifest yet.
+    pub fn send(&self, blob: Vec<u8>) -> Result<(), SessionError> {
         self.inner.push_sync(blob).map_err(SessionError::from)
     }
 
@@ -271,6 +273,13 @@ mod tests {
                 got: 10
             })
         ));
+    }
+
+    /// SessionError::NotInGroup variant exists and is distinct.
+    #[test]
+    fn not_in_group_error_variant_exists() {
+        let e = SessionError::NotInGroup;
+        assert!(matches!(e, SessionError::NotInGroup));
     }
 
     /// Store::load_or_generate round-trips the same keypair on second call.
