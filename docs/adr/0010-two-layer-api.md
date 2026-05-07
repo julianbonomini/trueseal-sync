@@ -14,11 +14,12 @@ UniFFI exposes **only the session layer** to Swift and Kotlin. The primitives ar
 
 ```rust
 HushSession::new(
-    keypair_bytes: [u8; 64],              // caller loaded from storage
+    keypair_bytes: [u8; 64],               // caller loaded from storage
     relay_addr: &str,
     relay_pub: [u8; 32],
     on_message: impl Fn(Message),
     on_keypair_rotated: impl Fn([u8; 64]), // fired after revocation; caller must re-persist
+    on_paired: impl Fn([u8; 32]),          // fired after accept_pair(); caller bootstraps new device
 )
 
 // Pairing flow
@@ -30,6 +31,10 @@ session.accept_pair(noise_pub: [u8; 32])  // caller calls this after reviewing o
 // required before the device is added to the paired list. Auto-accept is intentionally
 // not provided: the Pairing Payload encodes the initiator's public key (a delivery
 // address, not a secret), so any device that knows it could push a Pair message.
+//
+// After accept_pair(), the session fires on_paired(noise_pub) so the caller can
+// bootstrap the new device with historical state. What to send is entirely the
+// caller's decision — hush-sync does not define a bootstrap protocol.
 //
 // Pairing window: opened by start_pairing(), closed by timeout (default 60s),
 // successful accept_pair(), or explicit cancel_pairing(). accept_pair() is a

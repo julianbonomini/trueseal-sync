@@ -104,6 +104,23 @@ _Avoid_: invite, token, code (acceptable in UX copy, not in protocol docs)
 > **Dev:** "If I want to share clipboard history with a colleague, do I need a separate server?"
 > **Domain expert:** "No. Pair with their device — exchange public keys via QR or pairing phrase. After that, push blobs addressed to their public key. The relay handles it. There's no server-side concept of 'allowed senders'."
 
+## What hush-sync is and is not responsible for
+
+**hush-sync is responsible for:**
+- Encrypting and delivering blobs from one Device to another via the Relay
+- Pairing (key exchange ceremony)
+- Revocation (Sync Group reset + keypair rotation)
+- Ordered delivery with sender-side gap protection (outbox replay on reconnect)
+- Notifying the caller when a new Device pairs (`on_paired`) so the caller can bootstrap it
+
+**hush-sync is NOT responsible for:**
+- What the bytes in a blob mean — that is the caller's data model
+- Conflict resolution — the caller decides what to do when two devices diverge
+- Bootstrapping a new device with historical state — the caller decides what to send after `on_paired` fires (full state, snapshot, last N entries, etc.)
+- Persistent storage of keypairs or operation logs — the caller owns storage
+
+This boundary means hush-sync is a **transport primitive with ordering and encryption guarantees**, not an application protocol. The caller builds the application protocol on top.
+
 ## Flagged ambiguities
 
 - "handshake" — reserved for the Noise Protocol layer (hush-noise). Do not use for the Pairing ceremony. Pairing uses a Pairing Token; the underlying Noise XX handshake is an implementation detail.
