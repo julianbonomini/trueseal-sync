@@ -18,6 +18,8 @@ rand = "0.8"
 thiserror = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 prost = "0.13"
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "io-util"] }
+hush-noise = { path = "../hush-noise/rust" }
 
 [build-dependencies]
 prost-build = "0.13"
