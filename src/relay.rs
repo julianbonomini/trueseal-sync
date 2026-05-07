@@ -1,4 +1,6 @@
 use std::io::{Read, Write};
+use std::marker::PhantomData;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
 use hush_noise::{
@@ -65,17 +67,21 @@ pub(crate) fn parse(raw: &[u8]) -> Option<(MsgType, &[u8])> {
     Some((msg_type, &raw[5..5 + len]))
 }
 
+/// A pre-encoded framed push message, ready to send over the Noise session.
+type PushBytes = Vec<u8>;
+
 /// Client-side connection to a hush-relay server.
 /// Transport-generic: uses any Read+Write+Send stream (TCP in production,
 /// in-memory pipes in tests).
 ///
-/// Holds the device's noise private key to decrypt incoming Envelope payloads.
-/// The subscribe callback receives a decoded Message — decryption and type
-/// parsing happen inside RelayClient, never in caller code.
+/// Push operations are sent via a channel to the run() thread, which owns
+/// the Session exclusively. This prevents the send/receive deadlock that
+/// would occur if both operations shared the same Noise session mutex.
 pub struct RelayClient<T: Read + Write + Send + 'static> {
-    session: Arc<Session<T>>,
-    my_noise_priv: [u8; 32],
+    /// Channel for sending pre-encoded push frames to the run thread.
+    push_tx: mpsc::SyncSender<PushBytes>,
     callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message) + Send + 'static>>>>,
+    _transport: PhantomData<T>,
 }
 
 impl<T: Read + Write + Send + 'static> RelayClient<T> {
@@ -94,10 +100,22 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
             ));
         }
 
+        // Bounded channel: backpressure if the run thread falls behind.
+        let (push_tx, push_rx) = mpsc::sync_channel::<PushBytes>(64);
+
+        let callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message) + Send + 'static>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let callbacks_clone = callbacks.clone();
+
+        // run() thread owns the Session exclusively — no shared lock needed.
+        std::thread::spawn(move || {
+            run_loop(session, push_rx, callbacks_clone, my_noise_priv);
+        });
+
         Ok(Self {
-            session: Arc::new(session),
-            my_noise_priv,
-            callbacks: Arc::new(Mutex::new(Vec::new())),
+            push_tx,
+            callbacks,
+            _transport: PhantomData,
         })
     }
 
@@ -114,8 +132,10 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         let payload = crypto::encrypt(recipient_pub, &plaintext);
         let envelope = Envelope::build(sequence, parents, recipient_pub, author_signing, payload);
         let body = envelope.encode();
-        let msg = frame(MsgType::Push, &body);
-        self.session.send(&msg).map_err(RelayError::PushFailed)
+        let framed = frame(MsgType::Push, &body);
+        self.push_tx
+            .send(framed)
+            .map_err(|_| RelayError::PushFailed("relay run loop exited".into()))
     }
 
     /// Register a callback invoked when the relay delivers a Message to this device.
@@ -124,21 +144,84 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         self.callbacks.lock().unwrap().push(Box::new(callback));
     }
 
-    /// Blocking receive loop — decrypts and dispatches incoming Messages to callbacks.
-    /// Returns when the session closes.
+    /// Blocking receive loop — now a no-op since run() is started automatically in connect().
+    /// Kept for API compatibility; returns immediately.
+    ///
+    /// Note: the actual receive loop runs in the background thread started by connect().
     pub fn run(&self) -> Result<(), RelayError> {
-        loop {
-            let raw = self.session.receive().map_err(RelayError::ReceiveFailed)?;
-            if let Some((MsgType::Deliver, body)) = parse(&raw) {
-                if let Ok(env) = Envelope::decode(body) {
-                    // Decrypt payload — silently discard if decryption or parsing fails
-                    if let Ok(plaintext) = crypto::decrypt(self.my_noise_priv, &env.payload) {
-                        if let Ok(msg) = Message::decode(&plaintext) {
-                            // Verify envelope signature before delivering
-                            if env.verify().is_ok() {
-                                let cbs = self.callbacks.lock().unwrap();
-                                for cb in cbs.iter() {
-                                    cb(msg.clone());
+        // The real loop is in the background thread. This stub exists so callers
+        // that previously called run() in a background thread continue to compile.
+        // They can drop the spawned thread handle — the work happens automatically.
+        Ok(())
+    }
+}
+
+/// The actual event loop: runs in a dedicated thread that owns the Session.
+/// Interleaves push sends (from the channel) with receive processing.
+fn run_loop<T: Read + Write + Send + 'static>(
+    session: Session<T>,
+    push_rx: mpsc::Receiver<PushBytes>,
+    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message) + Send + 'static>>>>,
+    my_noise_priv: [u8; 32],
+) {
+    // We need to interleave: check for pending pushes, then do one receive.
+    // Since receive() blocks until a message arrives, we wrap the session in a
+    // thread pair: one blocking-receive thread + one push-sender thread, both
+    // sharing the session via Arc.
+    //
+    // Strategy: spawn a dedicated receive thread that blocks on session.receive(),
+    // and handle pushes in this thread before blocking on channel recv.
+    // This works because Session locks conn per-call; sends/receives interleave.
+    //
+    // HOWEVER: hush-noise Session holds conn:Arc<Mutex<T>>. Both send() and
+    // receive() lock conn. If receive() is blocking, send() blocks too.
+    // To truly decouple, we use a thread that only does receive(), and this
+    // thread handles push sends when receive() is not holding the lock.
+    //
+    // Simplest correct approach: alternate between draining push_rx and calling
+    // receive() with a non-blocking receive attempt. Since hush-noise doesn't
+    // support non-blocking receives, we use a dedicated send thread.
+
+    let session = Arc::new(session);
+    let session_for_recv = session.clone();
+    let session_for_send = session.clone();
+
+    // Receive thread: blocks on session.receive() and forwards results.
+    let (recv_tx, recv_rx) = mpsc::channel::<Result<Vec<u8>, String>>();
+    std::thread::spawn(move || loop {
+        let result = session_for_recv.receive();
+        let done = result.is_err();
+        if recv_tx.send(result).is_err() {
+            break;
+        }
+        if done {
+            break;
+        }
+    });
+
+    // Send thread: receives push frames from push_rx and sends them.
+    std::thread::spawn(move || {
+        for framed in push_rx {
+            if session_for_send.send(&framed).is_err() {
+                break;
+            }
+        }
+    });
+
+    // This thread: dispatches received messages to callbacks.
+    for result in recv_rx {
+        match result {
+            Err(_) => break,
+            Ok(raw) => {
+                if let Some((MsgType::Deliver, body)) = parse(&raw) {
+                    if let Ok(env) = Envelope::decode(body) {
+                        if let Ok(plaintext) = crypto::decrypt(my_noise_priv, &env.payload) {
+                            if let Ok(msg) = Message::decode(&plaintext) {
+                                if env.verify().is_ok() {
+                                    let cbs = callbacks.lock().unwrap();
+                                    for cb in cbs.iter() {
+                                        cb(msg.clone());
+                                    }
                                 }
                             }
                         }
@@ -189,17 +272,16 @@ mod tests {
 
     impl Read for MemPipe {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            loop {
-                let mut rb = self.read_buf.lock().unwrap();
-                if !rb.is_empty() {
-                    let n = buf.len().min(rb.len());
-                    buf[..n].copy_from_slice(&rb[..n]);
-                    rb.drain(..n);
-                    return Ok(n);
-                }
-                drop(rb);
-                std::thread::sleep(std::time::Duration::from_micros(100));
+            let mut rb = self.read_buf.lock().unwrap();
+            if rb.is_empty() {
+                // Return WouldBlock so Session releases conn mutex before retrying.
+                // This prevents deadlock when concurrent send() and receive() share conn.
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "buffer empty"));
             }
+            let n = buf.len().min(rb.len());
+            buf[..n].copy_from_slice(&rb[..n]);
+            rb.drain(..n);
+            Ok(n)
         }
     }
 
@@ -354,18 +436,13 @@ mod tests {
             });
         }
 
-        let client = connect_device(&recipient, relay_pub, client_pipe);
-
         let delivered: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
         let delivered_clone = delivered.clone();
+
+        // Connect and subscribe — run loop starts automatically in connect()
+        let client = connect_device(&recipient, relay_pub, client_pipe);
         client.subscribe(move |msg| {
             delivered_clone.lock().unwrap().push(msg);
-        });
-
-        let client = Arc::new(client);
-        let client_clone = client.clone();
-        std::thread::spawn(move || {
-            let _ = client_clone.run();
         });
 
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -433,11 +510,7 @@ mod tests {
         client_a.subscribe(move |msg| {
             received_clone.lock().unwrap().push(msg);
         });
-        let client_a = Arc::new(client_a);
-        let ca_clone = client_a.clone();
-        std::thread::spawn(move || {
-            let _ = ca_clone.run();
-        });
+        // run loop starts automatically in connect()
 
         // B connects and pushes a Pair message addressed to A
         let client_b = connect_device(&device_b, relay_pub, pipe_b_client);

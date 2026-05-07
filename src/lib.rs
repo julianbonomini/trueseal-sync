@@ -9,6 +9,7 @@ pub mod message;
 pub mod operation_log;
 pub mod relay;
 pub mod revocation;
+pub mod session;
 
 pub use keys::{NoisePublicKey, SigningPublicKey};
 pub use operation_log::LogEntry;
