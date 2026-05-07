@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use crate::manifest::{GroupManifest, ManifestError};
+
 #[derive(Debug, Error)]
 pub enum MessageError {
     #[error("unknown message type: {0}")]
@@ -8,14 +10,17 @@ pub enum MessageError {
     TooShort,
     #[error("invalid pairing payload")]
     InvalidPairingPayload,
+    #[error("invalid group manifest: {0}")]
+    InvalidManifest(#[from] ManifestError),
 }
 
 // 1-byte type tags — private to hush-sync, invisible to the Relay
 const TAG_PAIR: u8 = 0x01;
 const TAG_SYNC: u8 = 0x02;
 const TAG_REVOKE: u8 = 0x03;
+const TAG_GROUP_MANIFEST: u8 = 0x04;
 
-/// The three message types hush-sync defines.
+/// The message types hush-sync defines.
 /// Callers receive this from subscribe callbacks after decryption and parsing.
 /// The Relay never sees the type tag — it lives inside the encrypted payload.
 #[derive(Debug, Clone, PartialEq)]
@@ -29,8 +34,10 @@ pub enum Message {
     /// An opaque application blob — clipboard entry, secret, or any caller data.
     /// hush-sync delivers the body verbatim; the caller interprets it.
     Sync { body: Vec<u8> },
-    /// Full Sync Group reset. Recipients wipe their paired list and rotate keypairs.
+    /// Full Sync Group reset. Recipients wipe their group state and rotate keypairs.
     Revoke,
+    /// A signed, versioned Group Manifest update.
+    GroupManifest { manifest: GroupManifest },
 }
 
 impl Message {
@@ -52,6 +59,11 @@ impl Message {
                 out
             }
             Message::Revoke => vec![TAG_REVOKE],
+            Message::GroupManifest { manifest } => {
+                let mut out = vec![TAG_GROUP_MANIFEST];
+                out.extend_from_slice(&manifest.encode());
+                out
+            }
         }
     }
 
@@ -76,6 +88,10 @@ impl Message {
                 body: bytes[1..].to_vec(),
             }),
             TAG_REVOKE => Ok(Message::Revoke),
+            TAG_GROUP_MANIFEST => {
+                let manifest = GroupManifest::decode(&bytes[1..])?;
+                Ok(Message::GroupManifest { manifest })
+            }
             other => Err(MessageError::UnknownType(other)),
         }
     }
@@ -106,6 +122,10 @@ pub fn decode_pairing_payload(bytes: &[u8]) -> Result<([u8; 32], [u8; 32]), Mess
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::{NoisePublicKey, SigningPublicKey};
+    use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
 
     /// Tracer bullet: a Sync message encodes and decodes to the same body.
     #[test]
@@ -133,6 +153,42 @@ mod tests {
         let msg = Message::Revoke;
         let decoded = Message::decode(&msg.encode()).expect("should decode");
         assert_eq!(decoded, msg);
+    }
+
+    /// A GroupManifest message round-trips with all manifest data intact.
+    #[test]
+    fn group_manifest_message_round_trips() {
+        let key = SigningKey::generate(&mut OsRng);
+        let member = ManifestMember {
+            noise_pub: NoisePublicKey([7u8; 32]),
+            signing_pub: SigningPublicKey(key.verifying_key().to_bytes()),
+            name: "CobaltEagle".into(),
+        };
+        let manifest = GroupManifest::new(new_group_id(), 1, vec![member], &key);
+        let msg = Message::GroupManifest {
+            manifest: manifest.clone(),
+        };
+        let decoded = Message::decode(&msg.encode()).expect("should decode");
+        assert_eq!(decoded, msg);
+    }
+
+    /// GroupManifest message preserves signature and verifies correctly after decode.
+    #[test]
+    fn group_manifest_message_verifies_after_decode() {
+        let key = SigningKey::generate(&mut OsRng);
+        let member = ManifestMember {
+            noise_pub: NoisePublicKey([9u8; 32]),
+            signing_pub: SigningPublicKey(key.verifying_key().to_bytes()),
+            name: "SilverHawk".into(),
+        };
+        let manifest = GroupManifest::new(new_group_id(), 1, vec![member], &key);
+        let msg = Message::GroupManifest { manifest };
+        let decoded = Message::decode(&msg.encode()).expect("should decode");
+        if let Message::GroupManifest { manifest: m } = decoded {
+            assert!(m.verify(None).is_ok());
+        } else {
+            panic!("expected GroupManifest variant");
+        }
     }
 
     /// An unknown type tag returns an error.
