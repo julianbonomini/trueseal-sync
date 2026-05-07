@@ -7,7 +7,9 @@ use hush_noise::{
 };
 use thiserror::Error;
 
+use crate::crypto;
 use crate::envelope::Envelope;
+use crate::message::Message;
 
 #[derive(Debug, Error)]
 pub enum RelayError {
@@ -65,9 +67,14 @@ pub(crate) fn parse(raw: &[u8]) -> Option<(MsgType, &[u8])> {
 /// Client-side connection to a hush-relay server.
 /// Transport-generic: uses any Read+Write+Send stream (TCP in production,
 /// in-memory pipes in tests).
+///
+/// Holds the device's noise private key to decrypt incoming Envelope payloads.
+/// The subscribe callback receives a decoded Message — decryption and type
+/// parsing happen inside RelayClient, never in caller code.
 pub struct RelayClient<T: Read + Write + Send + 'static> {
     session: Arc<Session<T>>,
-    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Envelope) + Send + 'static>>>>,
+    my_noise_priv: [u8; 32],
+    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message) + Send + 'static>>>>,
 }
 
 impl<T: Read + Write + Send + 'static> RelayClient<T> {
@@ -77,7 +84,8 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         relay_pub: [u8; 32],
         my_keypair: NoiseKeypair,
     ) -> Result<Self, RelayError> {
-        let session = dial(transport, my_keypair).map_err(|e| RelayError::HandshakeFailed(e))?;
+        let my_noise_priv = my_keypair.private();
+        let session = dial(transport, my_keypair).map_err(RelayError::HandshakeFailed)?;
 
         if session.remote_public_key() != relay_pub {
             return Err(RelayError::HandshakeFailed(
@@ -87,37 +95,52 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
 
         Ok(Self {
             session: Arc::new(session),
+            my_noise_priv,
             callbacks: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
-    /// Push an Envelope to the relay (addressed to envelope.recipient_pub).
-    pub fn push(&self, envelope: &Envelope) -> Result<(), RelayError> {
+    /// Encrypt a Message for `recipient_pub` and push the resulting Envelope to the relay.
+    pub fn push(
+        &self,
+        message: &Message,
+        recipient_pub: [u8; 32],
+        sequence: u64,
+        parents: Vec<[u8; 32]>,
+        author_signing: &crate::envelope::SigningKeypair,
+    ) -> Result<(), RelayError> {
+        let plaintext = message.encode();
+        let payload = crypto::encrypt(recipient_pub, &plaintext);
+        let envelope = Envelope::build(sequence, parents, recipient_pub, author_signing, payload);
         let body = envelope.encode();
         let msg = frame(MsgType::Push, &body);
-        self.session
-            .send(&msg)
-            .map_err(|e| RelayError::PushFailed(e))
+        self.session.send(&msg).map_err(RelayError::PushFailed)
     }
 
-    /// Register a callback invoked when the relay delivers an Envelope to this device.
-    pub fn subscribe(&self, callback: impl Fn(Envelope) + Send + 'static) {
+    /// Register a callback invoked when the relay delivers a Message to this device.
+    /// Decryption and type parsing happen inside — callers receive a clean Message.
+    pub fn subscribe(&self, callback: impl Fn(Message) + Send + 'static) {
         self.callbacks.lock().unwrap().push(Box::new(callback));
     }
 
-    /// Blocking receive loop — delivers incoming envelopes to registered callbacks.
+    /// Blocking receive loop — decrypts and dispatches incoming Messages to callbacks.
     /// Returns when the session closes.
     pub fn run(&self) -> Result<(), RelayError> {
         loop {
-            let raw = self
-                .session
-                .receive()
-                .map_err(|e| RelayError::ReceiveFailed(e))?;
+            let raw = self.session.receive().map_err(RelayError::ReceiveFailed)?;
             if let Some((MsgType::Deliver, body)) = parse(&raw) {
                 if let Ok(env) = Envelope::decode(body) {
-                    let cbs = self.callbacks.lock().unwrap();
-                    for cb in cbs.iter() {
-                        cb(env.clone());
+                    // Decrypt payload — silently discard if decryption or parsing fails
+                    if let Ok(plaintext) = crypto::decrypt(self.my_noise_priv, &env.payload) {
+                        if let Ok(msg) = Message::decode(&plaintext) {
+                            // Verify envelope signature before delivering
+                            if env.verify().is_ok() {
+                                let cbs = self.callbacks.lock().unwrap();
+                                for cb in cbs.iter() {
+                                    cb(msg.clone());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -146,7 +169,8 @@ impl RelayClient<TcpStream> {
 mod tests {
     use super::*;
     use crate::device::DeviceKeypair;
-    use crate::envelope::{Envelope, SigningKeypair};
+    use crate::envelope::SigningKeypair;
+    use crate::message::Message;
     use hush_noise::{
         keypair::{generate_keypair, Keypair},
         session::accept,
@@ -154,7 +178,7 @@ mod tests {
     use std::io;
     use std::sync::{Arc, Mutex};
 
-    // ── In-memory bidirectional pipe (mirrors hush-noise's test pattern) ──────
+    // ── In-memory bidirectional pipe ──────────────────────────────────────────
 
     struct MemPipe {
         read_buf: Arc<Mutex<Vec<u8>>>,
@@ -204,8 +228,7 @@ mod tests {
 
     // ── Minimal fake relay ────────────────────────────────────────────────────
 
-    /// Spawns a fake relay on a MemPipe. Accepts one Noise XX connection,
-    /// receives Push messages, stores decoded envelopes.
+    /// Spawns a fake relay. Receives Push messages and records raw envelope bytes.
     fn spawn_fake_relay(relay_pipe: MemPipe, relay_keypair: Keypair) -> Arc<Mutex<Vec<Envelope>>> {
         let received = Arc::new(Mutex::new(Vec::<Envelope>::new()));
         let received_clone = received.clone();
@@ -226,10 +249,23 @@ mod tests {
         received
     }
 
-    /// Tracer bullet: a device connects to the fake relay and pushes an Envelope.
-    /// The fake relay receives and stores it.
+    /// Helper: connect a device client to a fake relay, return (client, received_envelopes)
+    fn connect_device(
+        device: &DeviceKeypair,
+        relay_pub: [u8; 32],
+        client_pipe: MemPipe,
+    ) -> RelayClient<MemPipe> {
+        RelayClient::connect(
+            client_pipe,
+            relay_pub,
+            Keypair::new(device.noise.private(), device.noise.public_key),
+        )
+        .expect("connect should succeed")
+    }
+
+    /// Tracer bullet: a device pushes a Sync message; the fake relay receives the envelope.
     #[test]
-    fn device_can_push_envelope_to_relay() {
+    fn device_can_push_sync_message_to_relay() {
         let relay_kp = generate_keypair();
         let relay_pub = relay_kp.public_key;
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
@@ -237,36 +273,37 @@ mod tests {
         let (client_pipe, relay_pipe) = mem_pipe_pair();
         let received = spawn_fake_relay(relay_pipe, relay_kp2);
 
-        let device = DeviceKeypair::generate();
-        let client = RelayClient::connect(
-            client_pipe,
-            relay_pub,
-            Keypair::new(device.noise.private(), device.noise.public_key),
-        )
-        .expect("connect should succeed");
+        let sender = DeviceKeypair::generate();
+        let recipient = DeviceKeypair::generate();
+        let client = connect_device(&sender, relay_pub, client_pipe);
 
-        let signing = SigningKeypair::generate();
-        let recipient_pub = DeviceKeypair::generate().noise.public_key;
-        let envelope = Envelope::build(1, vec![], recipient_pub, &signing, b"hello relay".to_vec());
-
-        client.push(&envelope).expect("push should succeed");
+        let msg = Message::Sync {
+            body: b"clipboard entry".to_vec(),
+        };
+        client
+            .push(
+                &msg,
+                recipient.noise.public_key,
+                1,
+                vec![],
+                &sender.signing_keypair(),
+            )
+            .expect("push should succeed");
 
         std::thread::sleep(std::time::Duration::from_millis(50));
 
         let stored = received.lock().unwrap();
         assert_eq!(stored.len(), 1, "relay should have received one envelope");
-        assert_eq!(stored[0], envelope);
     }
 
-    /// Connecting with a wrong relay public key is rejected.
+    /// Connecting with the wrong relay public key is rejected.
     #[test]
     fn wrong_relay_key_is_rejected() {
         let relay_kp = generate_keypair();
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
-        let wrong_pub = generate_keypair().public_key; // a different key
+        let wrong_pub = generate_keypair().public_key;
 
         let (client_pipe, relay_pipe) = mem_pipe_pair();
-        // Relay accepts the handshake (it doesn't know client expects a specific key)
         std::thread::spawn(move || {
             let _ = accept(relay_pipe, relay_kp2);
         });
@@ -279,51 +316,50 @@ mod tests {
         );
 
         assert!(result.is_err(), "wrong relay key should be rejected");
-        assert!(
-            matches!(result.err().unwrap(), RelayError::HandshakeFailed(_)),
-            "error should be HandshakeFailed"
-        );
+        assert!(matches!(
+            result.err().unwrap(),
+            RelayError::HandshakeFailed(_)
+        ));
     }
 
-    /// Push-on-arrival: subscribe callback fires when the fake relay delivers an Envelope.
+    /// Subscribe callback receives a decoded Message when the relay delivers an envelope.
     #[test]
-    fn subscribe_callback_fires_on_delivery() {
+    fn subscribe_callback_receives_decoded_message() {
         let relay_kp = generate_keypair();
         let relay_pub = relay_kp.public_key;
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
 
         let (client_pipe, relay_pipe) = mem_pipe_pair();
 
-        // Fake relay that delivers an envelope immediately after handshake
-        let signing = SigningKeypair::generate();
-        let device = DeviceKeypair::generate();
-        let recipient_pub = device.noise.public_key;
-        let envelope_to_deliver =
-            Envelope::build(1, vec![], recipient_pub, &signing, b"delivered!".to_vec());
-        let env_clone = envelope_to_deliver.clone();
+        let recipient = DeviceKeypair::generate();
+        let sender_signing = SigningKeypair::generate();
+        let msg_to_deliver = Message::Sync {
+            body: b"hello!".to_vec(),
+        };
 
-        std::thread::spawn(move || {
-            let session = accept(relay_pipe, relay_kp2).unwrap();
-            // Deliver an envelope to the client
-            let body = env_clone.encode();
-            let msg = frame(MsgType::Deliver, &body);
-            session.send(&msg).unwrap();
-        });
+        // Fake relay: deliver one envelope to the client after handshake
+        {
+            let recipient_pub = recipient.noise.public_key;
+            let plaintext = msg_to_deliver.encode();
+            let payload = crate::crypto::encrypt(recipient_pub, &plaintext);
+            let env = Envelope::build(1, vec![], recipient_pub, &sender_signing, payload);
+            let env_bytes = env.encode();
 
-        let client = RelayClient::connect(
-            client_pipe,
-            relay_pub,
-            Keypair::new(device.noise.private(), device.noise.public_key),
-        )
-        .expect("connect should succeed");
+            std::thread::spawn(move || {
+                let session = accept(relay_pipe, relay_kp2).unwrap();
+                let msg = frame(MsgType::Deliver, &env_bytes);
+                session.send(&msg).unwrap();
+            });
+        }
 
-        let delivered: Arc<Mutex<Vec<Envelope>>> = Arc::new(Mutex::new(Vec::new()));
+        let client = connect_device(&recipient, relay_pub, client_pipe);
+
+        let delivered: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
         let delivered_clone = delivered.clone();
-        client.subscribe(move |env| {
-            delivered_clone.lock().unwrap().push(env);
+        client.subscribe(move |msg| {
+            delivered_clone.lock().unwrap().push(msg);
         });
 
-        // Run the receive loop in a thread
         let client = Arc::new(client);
         let client_clone = client.clone();
         std::thread::spawn(move || {
@@ -334,6 +370,101 @@ mod tests {
 
         let got = delivered.lock().unwrap();
         assert_eq!(got.len(), 1, "callback should have fired once");
-        assert_eq!(got[0], envelope_to_deliver);
+        assert_eq!(got[0], msg_to_deliver);
+    }
+
+    /// Full pairing ceremony: A generates a pairing payload, B decodes it, pushes
+    /// a Pair message addressed to A. A's subscribe callback receives B's public keys.
+    ///
+    /// This is an end-to-end integration test: message → crypto → envelope → relay
+    /// → relay routes Push as Deliver → relay → crypto → envelope → message.
+    #[test]
+    fn pairing_ceremony_delivers_pair_message_to_initiator() {
+        use crate::message::{decode_pairing_payload, pairing_payload};
+
+        // ── Relay setup: two pipes (A↔relay, B↔relay) ──────────────────────
+        let relay_kp = generate_keypair();
+        let relay_pub = relay_kp.public_key;
+
+        // Two pipe pairs — one per device
+        let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
+        let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
+
+        // Routing relay: accepts A then B, receives Push from B, delivers to A.
+        // Uses raw Noise sessions directly (no RelayClient).
+        {
+            let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
+            let relay_kp_b = Keypair::new(relay_kp.private(), relay_kp.public_key);
+            std::thread::spawn(move || {
+                let sess_a = accept(pipe_a_relay, relay_kp_a).unwrap();
+                let sess_b = accept(pipe_b_relay, relay_kp_b).unwrap();
+                // Receive Push from B, route as Deliver to A
+                loop {
+                    let raw = match sess_b.receive() {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    if let Some((MsgType::Push, body)) = parse(&raw) {
+                        let deliver = frame(MsgType::Deliver, body);
+                        let _ = sess_a.send(&deliver);
+                    }
+                }
+            });
+        }
+
+        // ── Devices ─────────────────────────────────────────────────────────
+        let device_a = DeviceKeypair::generate();
+        let device_b = DeviceKeypair::generate();
+
+        // A generates its pairing payload (would be encoded as QR in real life)
+        let payload_bytes =
+            pairing_payload(&device_a.noise.public_key, &device_a.signing_public_key());
+
+        // B decodes A's pairing payload and obtains A's public keys
+        let (a_noise_pub, _a_signing_pub) =
+            decode_pairing_payload(&payload_bytes).expect("should decode pairing payload");
+
+        // A connects to the relay and subscribes
+        let client_a = connect_device(&device_a, relay_pub, pipe_a_client);
+        let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received.clone();
+        client_a.subscribe(move |msg| {
+            received_clone.lock().unwrap().push(msg);
+        });
+        let client_a = Arc::new(client_a);
+        let ca_clone = client_a.clone();
+        std::thread::spawn(move || {
+            let _ = ca_clone.run();
+        });
+
+        // B connects and pushes a Pair message addressed to A
+        let client_b = connect_device(&device_b, relay_pub, pipe_b_client);
+        let pair_msg = Message::Pair {
+            noise_pub: device_b.noise.public_key,
+            signing_pub: device_b.signing_public_key(),
+        };
+        client_b
+            .push(
+                &pair_msg,
+                a_noise_pub,
+                1,
+                vec![],
+                &device_b.signing_keypair(),
+            )
+            .expect("push should succeed");
+
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // A's callback should have received B's Pair message
+        let got = received.lock().unwrap();
+        assert_eq!(got.len(), 1, "A should have received exactly one message");
+        assert_eq!(
+            got[0],
+            Message::Pair {
+                noise_pub: device_b.noise.public_key,
+                signing_pub: device_b.signing_public_key(),
+            },
+            "A should receive B's Pair message with B's public keys"
+        );
     }
 }

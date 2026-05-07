@@ -68,6 +68,14 @@ _Avoid_: Noise (Noise is for Sessions, not Blobs), asymmetric encryption (too ge
 A full Sync Group reset triggered by any paired Device. Implemented as a `REVOKE_ALL` Blob pushed to all known paired Devices. Every recipient wipes its paired device list, generates a fresh Keypair, and disconnects. Future Blobs are addressed to the new Keypairs — the compromised Device's old public key receives nothing. The Relay enforces nothing; revocation works by key rotation, not key blocking.
 _Avoid_: ban, block, kick, deauthorise
 
+**Message**:
+The typed unit of communication in hush-sync's protocol. Three variants: `Pair` (a device requesting to join a Sync Group), `Sync` (an opaque application blob — clipboard entry, secret, or any caller-defined data), and `Revoke` (a full Sync Group reset). The message type is a private convention of hush-sync, encoded as a 1-byte tag inside the encrypted payload. The Relay never sees it. Third-party developers may use hush-relay directly with their own protocol — hush-sync is one opinionated client protocol built on the relay, not the only possible one.
+_Avoid_: packet, event, command, request
+
+**Pairing Payload**:
+The bytes produced by an initiating Device to bootstrap a Pairing ceremony. Contains the initiator's noise public key and signing public key. Intended to be encoded as a QR code by the caller — hush-sync produces and parses the raw bytes only, never the QR image itself. A Device that receives a Pairing Payload can push a `Pair` Message back to the initiator via the Relay.
+_Avoid_: invite, token, code (acceptable in UX copy, not in protocol docs)
+
 ## Relationships
 
 - A **Device** belongs to one or more **Sync Groups**

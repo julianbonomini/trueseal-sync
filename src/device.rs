@@ -2,6 +2,8 @@ use ed25519_dalek::SigningKey;
 use hush_noise::keypair::{generate_keypair as noise_generate, Keypair as NoiseKeypair};
 use rand::thread_rng;
 
+use crate::envelope::SigningKeypair;
+
 /// A device's complete identity — bundles the X25519 keypair (for Noise XX
 /// sessions and addressed encryption) with the Ed25519 keypair (for signing
 /// Envelopes). Generated once per device, persisted by the caller.
@@ -29,5 +31,12 @@ impl DeviceKeypair {
     /// The device's Ed25519 verifying key bytes — embedded in Envelopes as author_pub.
     pub fn signing_public_key(&self) -> [u8; 32] {
         self.signing.verifying_key().to_bytes()
+    }
+
+    /// Wrap the device's Ed25519 signing key as a `SigningKeypair` for use with `Envelope::build`.
+    pub fn signing_keypair(&self) -> SigningKeypair {
+        // Reconstruct from secret key bytes — ed25519_dalek::SigningKey doesn't impl Clone.
+        let secret = self.signing.to_bytes();
+        SigningKeypair::from_signing_key(SigningKey::from_bytes(&secret))
     }
 }

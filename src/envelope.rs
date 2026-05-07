@@ -26,6 +26,11 @@ impl SigningKeypair {
         Self(SigningKey::generate(&mut rand::thread_rng()))
     }
 
+    /// Wrap an existing `SigningKey` — used by `DeviceKeypair::signing_keypair()`.
+    pub fn from_signing_key(key: SigningKey) -> Self {
+        Self(key)
+    }
+
     pub fn public_key_bytes(&self) -> [u8; 32] {
         self.0.verifying_key().to_bytes()
     }
