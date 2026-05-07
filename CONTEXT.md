@@ -52,8 +52,12 @@ _Avoid_: queue, buffer, pending messages
 The unit of sync. An Object has an ID and an Operation Log. What an Object represents (a clipboard entry, a document, a chat thread) is defined by the caller — hush-sync has no opinion.
 _Avoid_: resource, entity, document, record
 
+**Sequence**:
+A monotonically increasing integer counter owned by a Device. Increments once per Envelope sent, across all Objects. Used by recipients to detect gaps — a jump from sequence 5 to sequence 7 from the same Device means one Envelope was missed, regardless of which Object it belonged to. Not scoped per Object.
+_Avoid_: message number, event ID, offset, version (those imply per-object scoping)
+
 **Envelope**:
-The metadata wrapper around a Blob that the Relay can read without decrypting content. Contains: device-scoped sequence number, parent hashes (for DAG causality), recipient public key, author public key, signature, and an opaque encrypted payload. The object ID lives inside the encrypted payload — the Relay never sees it.
+The metadata wrapper around a Blob that the Relay can read without decrypting content. Contains: a per-device global sequence number, parent hashes (for DAG causality), recipient public key, author public key, signature, and an opaque encrypted payload. The object ID lives inside the encrypted payload — the Relay never sees it. The sequence counter belongs to the sending Device, not to any Object — it increments once per Envelope sent, across all Objects.
 _Avoid_: header, wrapper, frame, message
 
 **Parent Hash**:

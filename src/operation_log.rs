@@ -5,21 +5,24 @@ use std::collections::BTreeMap;
 /// The caller maps Envelope.payload → object_id + blob after decryption.
 ///
 /// # Design notes
+/// - `sequence` is the sender Device's **global** counter — it increments once
+///   per Envelope sent, across all Objects. It is not scoped per Object.
+///   See ADR-0011.
 /// - `append` is idempotent for the same (object_id, sequence) pair: a second
 ///   write with the same sequence is silently ignored (first-write wins —
 ///   conflict resolution is the caller's concern, not the log's).
-/// - `entries_from` returns all entries with sequence >= the given value,
-///   in ascending sequence order.
+/// - `entries_from` returns all entries for an Object with sequence >= the given
+///   value, in ascending sequence order.
 /// - `mark_delivered` marks an entry as confirmed delivered to the Relay.
 ///   Entries start as undelivered. The session calls this after a successful push.
 /// - `undelivered_entries` returns all entries not yet confirmed delivered,
-///   across all object_ids, in (object_id, sequence) order. Used by the session
-///   to replay the outbox on reconnect.
+///   sorted by global sequence ascending — the correct replay order for the outbox.
 /// - v0 uses an in-memory backend (`MemLog`).
 ///   A `SqliteLog` (persisted) is the obvious next backend.
 pub trait OperationLog: Send {
     fn append(&mut self, object_id: &[u8; 32], sequence: u64, blob: Vec<u8>);
     fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64);
+    /// Returns undelivered entries sorted by global sequence ascending.
     fn undelivered_entries(&self) -> Vec<([u8; 32], u64, Vec<u8>)>;
     fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<(u64, Vec<u8>)>;
 }
@@ -71,14 +74,18 @@ impl OperationLog for MemLog {
     }
 
     fn undelivered_entries(&self) -> Vec<([u8; 32], u64, Vec<u8>)> {
-        let mut out = Vec::new();
-        for (object_id, map) in &self.inner {
-            for (seq, entry) in map {
-                if !entry.delivered {
-                    out.push((*object_id, *seq, entry.blob.clone()));
-                }
-            }
-        }
+        // Collect all undelivered entries, then sort by global sequence ascending
+        // so the session replays the outbox in the original send order.
+        let mut out: Vec<([u8; 32], u64, Vec<u8>)> = self
+            .inner
+            .iter()
+            .flat_map(|(object_id, map)| {
+                map.iter()
+                    .filter(|(_, entry)| !entry.delivered)
+                    .map(move |(seq, entry)| (*object_id, *seq, entry.blob.clone()))
+            })
+            .collect();
+        out.sort_by_key(|(_, seq, _)| *seq);
         out
     }
 
@@ -201,7 +208,7 @@ mod tests {
         assert_eq!(entries, vec![(0, b"hello".to_vec())]);
     }
 
-    /// undelivered_entries spans all object_ids, ordered by (object_id, sequence).
+    /// undelivered_entries spans all object_ids.
     #[test]
     fn undelivered_entries_spans_all_objects() {
         let mut log = MemLog::new();
@@ -211,18 +218,33 @@ mod tests {
         log.mark_delivered(&oid(1), 0);
 
         let undelivered = log.undelivered_entries();
-        // oid(1) seq 0 is delivered; oid(1) seq 1 and oid(2) seq 0 are not
         assert_eq!(undelivered.len(), 2);
         let keys: Vec<([u8; 32], u64)> = undelivered.iter().map(|(o, s, _)| (*o, *s)).collect();
         assert!(keys.contains(&(oid(1), 1)));
         assert!(keys.contains(&(oid(2), 0)));
     }
 
+    /// undelivered_entries are sorted by global sequence ascending —
+    /// the correct replay order for the outbox (ADR-0011).
+    #[test]
+    fn undelivered_entries_sorted_by_global_sequence() {
+        let mut log = MemLog::new();
+        // Interleaved sends across two objects — global sequence order is 0,1,2,3
+        log.append(&oid(1), 0, b"obj1-first".to_vec());
+        log.append(&oid(2), 1, b"obj2-first".to_vec());
+        log.append(&oid(1), 2, b"obj1-second".to_vec());
+        log.append(&oid(2), 3, b"obj2-second".to_vec());
+
+        let undelivered = log.undelivered_entries();
+        let seqs: Vec<u64> = undelivered.iter().map(|(_, s, _)| *s).collect();
+        assert_eq!(seqs, vec![0, 1, 2, 3], "must be sorted by global sequence");
+    }
+
     /// mark_delivered on unknown (object_id, sequence) is a no-op.
     #[test]
     fn mark_delivered_unknown_entry_is_noop() {
         let mut log = MemLog::new();
-        log.mark_delivered(&oid(99), 42); // should not panic
+        log.mark_delivered(&oid(99), 42);
         assert!(log.undelivered_entries().is_empty());
     }
 }
