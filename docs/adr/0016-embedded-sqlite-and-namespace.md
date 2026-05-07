@@ -30,6 +30,8 @@ All writes are wrapped in SQLite transactions. The database is opened with `jour
 
 On `create()`, if no identity row exists in the database, the library generates a fresh keypair and writes it before connecting to the relay. The caller is never asked to generate, supply, or persist identity bytes — the library manages the full lifecycle.
 
+On `destroyGroup()`, the library wipes the entire database for that namespace — identity, manifest, and outbox. The namespace is returned to a blank state. The next `create()` call on that namespace generates a fresh identity. There is no concept of an identity surviving group destruction — identity and group membership are the same thing.
+
 ### Caller-visible surface
 
 The caller can read group membership via `session.members() -> [(id, name)]` — a derived view over the manifest. They cannot read the raw identity or manifest bytes. They cannot write to the database directly.
