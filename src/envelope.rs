@@ -71,6 +71,7 @@ impl Envelope {
             &parents,
             &recipient_pub.0,
             &author_pub,
+            &payload,
         );
         Self {
             sequence,
@@ -116,6 +117,7 @@ impl Envelope {
             &self.parents,
             &self.recipient_pub,
             &self.author_pub,
+            &self.payload,
         );
         let sig = ed25519_dalek::Signature::from_bytes(&self.signature);
         vk.verify(&msg, &sig)
@@ -174,12 +176,13 @@ impl Envelope {
 }
 
 /// The canonical message bytes that are signed/verified.
-/// sequence (8 LE) || each parent (32) || recipient_pub (32) || author_pub (32)
+/// sequence (8 LE) || each parent (32) || recipient_pub (32) || author_pub (32) || payload
 fn signing_message(
     sequence: u64,
     parents: &[[u8; 32]],
     recipient_pub: &[u8; 32],
     author_pub: &[u8; 32],
+    payload: &[u8],
 ) -> Vec<u8> {
     let mut msg = Vec::new();
     msg.extend_from_slice(&sequence.to_le_bytes());
@@ -188,6 +191,7 @@ fn signing_message(
     }
     msg.extend_from_slice(recipient_pub);
     msg.extend_from_slice(author_pub);
+    msg.extend_from_slice(payload);
     msg
 }
 
@@ -197,8 +201,9 @@ fn sign(
     parents: &[[u8; 32]],
     recipient_pub: &[u8; 32],
     author_pub: &[u8; 32],
+    payload: &[u8],
 ) -> [u8; 64] {
-    let msg = signing_message(sequence, parents, recipient_pub, author_pub);
+    let msg = signing_message(sequence, parents, recipient_pub, author_pub, payload);
     key.sign(&msg).to_bytes()
 }
 
@@ -349,5 +354,17 @@ mod tests {
             let decoded = Envelope::decode(&env.encode()).expect("should decode");
             assert_eq!(&decoded, env);
         }
+    }
+
+    /// Tampering with the payload invalidates the signature — the relay is zero-trust.
+    /// Any party in transit who swaps the encrypted payload bytes is detected by the recipient.
+    #[test]
+    fn tampered_payload_fails_verification() {
+        let (mut env, _) = make_envelope();
+        env.payload = b"swapped payload".to_vec();
+        assert!(
+            env.verify().is_err(),
+            "tampered payload should fail verification"
+        );
     }
 }

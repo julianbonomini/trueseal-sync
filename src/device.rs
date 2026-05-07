@@ -1,9 +1,17 @@
 use ed25519_dalek::SigningKey;
 use hush_noise::keypair::{generate_keypair as noise_generate, Keypair as NoiseKeypair};
 use rand::thread_rng;
+use thiserror::Error;
 
 use crate::envelope::SigningKeypair;
 use crate::keys::{NoisePublicKey, SigningPublicKey};
+
+/// Errors produced when reconstructing a `DeviceKeypair` from raw bytes.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum KeypairError {
+    #[error("invalid keypair length: expected {expected} bytes, got {got}")]
+    InvalidLength { expected: usize, got: usize },
+}
 
 /// A device's complete identity — bundles the X25519 keypair (for Noise XX
 /// sessions and addressed encryption) with the Ed25519 keypair (for signing
@@ -26,10 +34,7 @@ impl DeviceKeypair {
 
     /// Reconstruct a DeviceKeypair from raw private key bytes.
     /// `noise_priv` is 32 bytes (X25519 scalar); `signing_priv` is 32 bytes (Ed25519 seed).
-    /// Returns an error if the bytes are invalid.
-    pub fn from_bytes(noise_priv: [u8; 32], signing_priv: [u8; 32]) -> Result<Self, &'static str> {
-        use hush_noise::keypair::Keypair as NoiseKeypair;
-        // Derive the X25519 public key from the private scalar.
+    pub fn from_bytes(noise_priv: [u8; 32], signing_priv: [u8; 32]) -> Result<Self, KeypairError> {
         let noise_pub =
             x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(noise_priv));
         let noise = NoiseKeypair::new(noise_priv, noise_pub.to_bytes());
@@ -50,5 +55,20 @@ impl DeviceKeypair {
         // Reconstruct from secret key bytes — ed25519_dalek::SigningKey doesn't impl Clone.
         let secret = self.signing.to_bytes();
         SigningKeypair::from_signing_key(SigningKey::from_bytes(&secret))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_bytes_round_trips_generated_keypair() {
+        let kp = DeviceKeypair::generate();
+        let noise_priv = kp.noise.private();
+        let signing_priv = kp.signing.to_bytes();
+        let kp2 = DeviceKeypair::from_bytes(noise_priv, signing_priv).expect("should reconstruct");
+        assert_eq!(kp.public_key(), kp2.public_key());
+        assert_eq!(kp.signing_public_key(), kp2.signing_public_key());
     }
 }

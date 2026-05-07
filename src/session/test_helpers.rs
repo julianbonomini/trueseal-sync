@@ -163,6 +163,60 @@ pub(super) fn spawn_bidirectional_relay(relay_kp: &Keypair, pipe_a: MemPipe, pip
     });
 }
 
+/// Spawn a bidirectional relay where each side connects in its own thread,
+/// then routes once both are connected.  Safe to use when A and B connect at
+/// unpredictable times (e.g. reconnect tests).
+pub(super) fn spawn_bidirectional_relay_parallel(
+    relay_kp: &Keypair,
+    pipe_a: MemPipe,
+    pipe_b: MemPipe,
+) {
+    use std::sync::mpsc;
+    let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_kp_b = Keypair::new(relay_kp.private(), relay_kp.public_key);
+
+    let (tx_a, rx_a) = mpsc::channel();
+    let (tx_b, rx_b) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let sess = accept(pipe_a, relay_kp_a).unwrap();
+        tx_a.send(sess).unwrap();
+    });
+    std::thread::spawn(move || {
+        let sess = accept(pipe_b, relay_kp_b).unwrap();
+        tx_b.send(sess).unwrap();
+    });
+
+    std::thread::spawn(move || {
+        let sess_a = rx_a.recv().unwrap();
+        let sess_b = rx_b.recv().unwrap();
+        let sess_a = Arc::new(sess_a);
+        let sess_b = Arc::new(sess_b);
+        let sa2 = sess_a.clone();
+        let sb2 = sess_b.clone();
+        // A → B
+        std::thread::spawn(move || loop {
+            let raw = match sa2.receive() {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            if let Some((MsgType::Push, body)) = parse(&raw) {
+                let _ = sb2.send(&frame(MsgType::Deliver, body));
+            }
+        });
+        // B → A
+        loop {
+            let raw = match sess_b.receive() {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            if let Some((MsgType::Push, body)) = parse(&raw) {
+                let _ = sess_a.send(&frame(MsgType::Deliver, body));
+            }
+        }
+    });
+}
+
 pub(super) fn relay_pub(relay_kp: &Keypair) -> NoisePublicKey {
     NoisePublicKey(relay_kp.public_key)
 }

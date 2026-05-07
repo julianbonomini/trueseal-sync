@@ -5,9 +5,9 @@
 // return `SessionError` — no silent failures.
 
 use std::net::TcpStream;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use crate::device::DeviceKeypair;
+use crate::device::{DeviceKeypair, KeypairError};
 use crate::keys::{NoisePublicKey, SigningPublicKey};
 use crate::message::Message;
 use crate::session::{HushSession, SessionError as CoreSessionError};
@@ -22,6 +22,17 @@ pub enum SessionError {
     ConnectionFailed { msg: String },
     #[error("push failed: {msg}")]
     PushFailed { msg: String },
+}
+
+impl From<KeypairError> for SessionError {
+    fn from(e: KeypairError) -> Self {
+        match e {
+            KeypairError::InvalidLength { expected, got } => SessionError::InvalidKeyLength {
+                expected: expected as u32,
+                got: got as u32,
+            },
+        }
+    }
 }
 
 impl From<CoreSessionError> for SessionError {
@@ -79,6 +90,9 @@ impl HushFfiSession {
     /// - `relay_pub`: 32-byte X25519 relay public key
     /// - `on_message`: called for every inbound `Sync` message
     /// - `on_keypair_rotated`: called after key rotation; persist the new bytes
+    ///
+    /// Automatically reconnects on relay disconnects using an exponential backoff
+    /// capped at 30 seconds.
     #[uniffi::constructor]
     pub fn create(
         keypair_bytes: Vec<u8>,
@@ -88,26 +102,48 @@ impl HushFfiSession {
         on_keypair_rotated: Box<dyn KeypairRotatedCallback>,
     ) -> Result<Arc<Self>, SessionError> {
         let keypair = keypair_from_bytes(&keypair_bytes)?;
-        let relay_pub = noise_pub_from_bytes(&relay_pub)?;
+        let relay_pub_key = noise_pub_from_bytes(&relay_pub)?;
 
         let stream = TcpStream::connect(&relay_addr)
             .map_err(|e| SessionError::ConnectionFailed { msg: e.to_string() })?;
 
-        let inner = HushSession::connect_with_log(
+        // Late-bind slot: filled after the session is built so the on_message
+        // closure can look up sender noise pub from the session's paired list.
+        let paired_slot: Arc<Mutex<Option<Arc<Mutex<crate::revocation::PairedList>>>>> =
+            Arc::new(Mutex::new(None));
+        // Wrap callbacks in Arc so the on_message closure can be Clone
+        // (required by connect_with_reconnect for the reconnect loop).
+        let on_message = Arc::new(on_message);
+        let paired_slot_cb = paired_slot.clone();
+
+        let relay_addr_factory = relay_addr.clone();
+        let inner = HushSession::connect_with_reconnect(
             stream,
-            relay_pub,
+            relay_pub_key,
             keypair,
-            move |msg| {
+            move |msg, author_signing_pub| {
                 if let Message::Sync { body } = msg {
-                    on_message.on_message(body, vec![]);
+                    let sender_noise_pub = paired_slot_cb
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|p| p.lock().unwrap().noise_pub_for_signing(&author_signing_pub))
+                        .map(|k| k.0.to_vec())
+                        .unwrap_or_default();
+                    on_message.on_message(body, sender_noise_pub);
                 }
             },
             Box::new(crate::operation_log::MemLog::new()),
             move |bytes| {
                 on_keypair_rotated.on_keypair_rotated(bytes.to_vec());
             },
+            move || TcpStream::connect(&relay_addr_factory).map_err(|e| e.to_string()),
+            None, // use default 30-second cap
         )
         .map_err(SessionError::from)?;
+
+        // Wire the paired list into the closure's slot now that the session exists.
+        *paired_slot.lock().unwrap() = Some(inner.paired.clone());
 
         Ok(Arc::new(Self { inner }))
     }
@@ -121,16 +157,16 @@ impl HushFfiSession {
     }
 
     /// Admit a device identified by its noise (32 B) and signing (32 B) public keys.
-    /// No-op if no pairing window is open or it has timed out.
+    /// Returns `true` if admitted (window was open), `false` if the window was closed
+    /// or had already expired.  Returns an error only if the key bytes are invalid length.
     pub fn accept_pair(
         &self,
         noise_pub: Vec<u8>,
         signing_pub: Vec<u8>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<bool, SessionError> {
         let noise = noise_pub_from_bytes(&noise_pub)?;
         let signing = signing_pub_from_bytes(&signing_pub)?;
-        self.inner.accept_pair(noise, signing);
-        Ok(())
+        Ok(self.inner.accept_pair(noise, signing))
     }
 
     /// Close the pairing window without admitting any device.
@@ -193,12 +229,7 @@ fn keypair_from_bytes(bytes: &[u8]) -> Result<DeviceKeypair, SessionError> {
     }
     let noise_priv: [u8; 32] = bytes[..32].try_into().unwrap();
     let signing_priv: [u8; 32] = bytes[32..].try_into().unwrap();
-    DeviceKeypair::from_bytes(noise_priv, signing_priv).map_err(|_| {
-        SessionError::InvalidKeyLength {
-            expected: 64,
-            got: 64,
-        }
-    })
+    DeviceKeypair::from_bytes(noise_priv, signing_priv).map_err(SessionError::from)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

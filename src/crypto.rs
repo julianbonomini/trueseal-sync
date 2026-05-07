@@ -128,4 +128,34 @@ mod tests {
 
         assert_eq!(recovered, plaintext);
     }
+
+    /// Decrypting with the wrong private key returns CryptoError::DecryptionFailed.
+    #[test]
+    fn wrong_key_decrypt_returns_error() {
+        let (_priv_a, pub_b) = generate_keypair();
+        let (priv_wrong, _pub_wrong) = generate_keypair();
+
+        let ciphertext = encrypt(pub_b, b"secret");
+        let result = decrypt(priv_wrong, &ciphertext);
+
+        assert!(
+            matches!(result, Err(CryptoError::DecryptionFailed)),
+            "wrong key should fail"
+        );
+    }
+
+    /// Truncated ciphertext (too short) returns CryptoError::DecryptionFailed.
+    #[test]
+    fn truncated_ciphertext_returns_error() {
+        let (priv_b, pub_b) = generate_keypair();
+        let ciphertext = encrypt(pub_b, b"secret");
+        // Cut off all but the first 4 bytes (less than nonce+tag overhead).
+        let truncated = &ciphertext[..4];
+        let result = decrypt(priv_b, truncated);
+
+        assert!(
+            matches!(result, Err(CryptoError::DecryptionFailed)),
+            "truncated ciphertext should fail"
+        );
+    }
 }

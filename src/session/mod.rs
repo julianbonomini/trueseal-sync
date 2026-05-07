@@ -101,7 +101,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         transport: T,
         relay_pub: NoisePublicKey,
         keypair: DeviceKeypair,
-        on_message: impl Fn(Message) + Send + 'static,
+        on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
     ) -> Result<Self, SessionError> {
         Self::connect_with_log(
             transport,
@@ -117,7 +117,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         transport: T,
         relay_pub: NoisePublicKey,
         keypair: DeviceKeypair,
-        on_message: impl Fn(Message) + Send + 'static,
+        on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
         op_log: Box<dyn OperationLog>,
         on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
     ) -> Result<Self, SessionError> {
@@ -152,7 +152,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 }
                 return; // never forward Revoke to caller
             }
-            on_message(msg);
+            on_message(msg, author_signing_pub);
         });
 
         Ok(Self {
@@ -170,8 +170,9 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         transport: T,
         relay_pub: NoisePublicKey,
         keypair: DeviceKeypair,
-        on_message: impl Fn(Message) + Send + 'static + Clone,
+        on_message: impl Fn(Message, [u8; 32]) + Send + 'static + Clone,
         op_log: Box<dyn OperationLog>,
+        on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
     ) -> Result<Self, SessionError> {
@@ -181,11 +182,13 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             keypair,
             on_message.clone(),
             op_log,
-            |_| {},
+            on_keypair_rotated,
         )?;
         let client_arc = session.client.clone();
         let op_log_arc = session.op_log.clone();
         let keys_arc = session.keys.clone();
+        let paired_arc = session.paired.clone();
+        let on_kpr_arc = session.on_keypair_rotated.clone();
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
         std::thread::spawn(move || {
             reconnect::reconnect_loop(
@@ -193,7 +196,9 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 op_log_arc,
                 relay_pub,
                 keys_arc,
+                paired_arc,
                 on_message,
+                on_kpr_arc,
                 Arc::new(transport_factory),
                 cap,
             );
@@ -286,17 +291,20 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     }
 
     /// Admit a device; requires both noise and signing pub keys for revoke-by-signing-key lookup.
-    pub fn accept_pair(&self, noise_pub: NoisePublicKey, signing_pub: SigningPublicKey) {
+    /// Returns `true` if the device was admitted (window open), `false` if the window was
+    /// closed or had already expired.
+    pub fn accept_pair(&self, noise_pub: NoisePublicKey, signing_pub: SigningPublicKey) -> bool {
         let mut guard = self.pairing.lock().unwrap();
         if let Some(ref window) = *guard {
             if window.is_open() {
                 self.paired.lock().unwrap().add(noise_pub, signing_pub);
                 (window.on_paired)(noise_pub);
                 *guard = None;
-                return;
+                return true;
             }
         }
         *guard = None;
+        false
     }
 
     pub fn cancel_pairing(&self) {
@@ -325,7 +333,7 @@ impl HushSession<TcpStream> {
         addr: &str,
         relay_pub: NoisePublicKey,
         keypair: DeviceKeypair,
-        on_message: impl Fn(Message) + Send + 'static,
+        on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
     ) -> Result<Self, SessionError> {
         let stream =
             TcpStream::connect(addr).map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
