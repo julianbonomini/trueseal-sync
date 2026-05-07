@@ -2,6 +2,7 @@ mod accept_pair;
 mod fanout;
 mod join_group;
 mod manifest_filter;
+mod manifest_persist;
 mod outbox;
 mod pairing;
 mod push;

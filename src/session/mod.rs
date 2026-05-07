@@ -94,6 +94,9 @@ pub struct HushSession<T: Read + Write + Send + 'static> {
     on_keypair_rotated: Arc<dyn Fn([u8; 64]) + Send + Sync + 'static>,
     /// Fired when an inbound GroupManifest excludes the local device.
     on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static>,
+    /// Fired whenever the local manifest changes (inbound update or accept_pair).
+    /// Callers use this to persist the manifest to SQLite.
+    on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static>,
 }
 
 impl<T: Read + Write + Send + 'static> HushSession<T> {
@@ -157,6 +160,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             op_log,
             on_keypair_rotated,
             || {},
+            |_| {},
         )
     }
 
@@ -168,6 +172,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         op_log: Box<dyn OperationLog>,
         on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
+        on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
     ) -> Result<Self, SessionError> {
         let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
         let noise_kp = {
@@ -180,19 +185,20 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             Arc::new(on_keypair_rotated);
         let on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static> =
             Arc::new(on_removed_from_group);
+        let on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static> =
+            Arc::new(on_manifest_changed);
 
         let keys_cb = keys.clone();
         let manifest_cb = manifest.clone();
         let on_kpr_cb = on_keypair_rotated.clone();
         let on_rfg_cb = on_removed_from_group.clone();
+        let on_mc_cb = on_manifest_changed.clone();
 
         let client = RelayClient::connect(transport, relay_pub, noise_kp)
             .map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
 
         client.subscribe(move |msg, author_signing_pub| {
             // ── Manifest-based inbound filtering ──────────────────────────
-            // If we have a manifest, only accept messages from current members.
-            // Messages from non-members are silently discarded.
             {
                 let guard = manifest_cb.lock().unwrap();
                 if let Some(ref m) = *guard {
@@ -200,18 +206,14 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                         return; // not a member — discard
                     }
                 }
-                // If manifest is None (no group yet), allow through so pairing can proceed.
             }
 
-            // ── Revoke: legacy key-rotation path (until #31 replaces it) ─
+            // ── Revoke ────────────────────────────────────────────────────
             if let Message::Revoke = &msg {
-                // Build a temporary PairedList from the current manifest for revoke lookup.
                 let maybe_kp = {
                     let guard = manifest_cb.lock().unwrap();
                     if let Some(ref m) = *guard {
-                        // Check if the sender is a member of the current manifest.
                         if m.contains_signing_pub(&author_signing_pub) {
-                            // Rotate keys and clear manifest.
                             Some(crate::device::DeviceKeypair::generate())
                         } else {
                             None
@@ -221,7 +223,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                     }
                 };
                 if let Some(new_kp) = maybe_kp {
-                    // Clear manifest on revoke.
                     *manifest_cb.lock().unwrap() = None;
                     let mut rotated = [0u8; 64];
                     rotated[..32].copy_from_slice(&new_kp.noise.private());
@@ -229,7 +230,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                     *keys_cb.lock().unwrap() = KeyState::from_keypair(&new_kp);
                     (on_kpr_cb)(rotated);
                 }
-                return; // never forward Revoke to caller
+                return;
             }
 
             // ── GroupManifest update ───────────────────────────────────────
@@ -237,24 +238,19 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 let local_signing_pub = keys_cb.lock().unwrap().signing_pub.0;
                 let mut guard = manifest_cb.lock().unwrap();
                 let accept = match *guard {
-                    None => {
-                        // No manifest yet — accept if signature is valid.
-                        incoming.verify(None).is_ok()
-                    }
-                    Some(ref current) => {
-                        // Accept if higher version, issuer was a current member, sig good.
-                        incoming.verify(Some(current)).is_ok()
-                    }
+                    None => incoming.verify(None).is_ok(),
+                    Some(ref current) => incoming.verify(Some(current)).is_ok(),
                 };
                 if accept {
                     let excluded = !incoming.contains_signing_pub(&local_signing_pub);
                     *guard = Some(incoming.clone());
+                    (on_mc_cb)(incoming);
                     drop(guard);
                     if excluded {
                         (on_rfg_cb)();
                     }
                 }
-                return; // never forward GroupManifest to caller's on_message
+                return;
             }
 
             on_message(msg, author_signing_pub);
@@ -269,6 +265,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             manifest,
             on_keypair_rotated,
             on_removed_from_group,
+            on_manifest_changed,
         })
     }
 
@@ -279,16 +276,19 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         on_message: impl Fn(Message, [u8; 32]) + Send + 'static + Clone,
         op_log: Box<dyn OperationLog>,
         on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
+        on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
     ) -> Result<Self, SessionError> {
-        let session = Self::connect_with_log(
+        let session = Self::connect_full(
             transport,
             relay_pub,
             keypair,
             on_message.clone(),
             op_log,
             on_keypair_rotated,
+            || {},
+            on_manifest_changed,
         )?;
         let client_arc = session.client.clone();
         let op_log_arc = session.op_log.clone();
@@ -296,6 +296,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let manifest_arc = session.manifest.clone();
         let on_kpr_arc = session.on_keypair_rotated.clone();
         let on_rfg_arc = session.on_removed_from_group.clone();
+        let on_mc_arc = session.on_manifest_changed.clone();
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
         std::thread::spawn(move || {
             reconnect::reconnect_loop(
@@ -307,6 +308,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 on_message,
                 on_kpr_arc,
                 on_rfg_arc,
+                on_mc_arc,
                 Arc::new(transport_factory),
                 cap,
             );
@@ -531,6 +533,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
         // Store the new manifest.
         *self.manifest.lock().unwrap() = Some(new_manifest.clone());
+        (self.on_manifest_changed)(&new_manifest);
 
         // Push GroupManifest to all existing members (excluding self).
         let msg = Message::GroupManifest {

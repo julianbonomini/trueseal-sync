@@ -50,6 +50,7 @@ fn post_reconnect_revoke_fires_on_keypair_rotated() {
             |_, _| {},
             Box::new(MemLog::new()),
             |_| {},
+            |_| {},
             move || {
                 pipe_a2_slot2
                     .lock()
@@ -76,6 +77,7 @@ fn post_reconnect_revoke_fires_on_keypair_rotated() {
             move |bytes| {
                 br.lock().unwrap().push(bytes);
             },
+            |_| {},
             move || {
                 pipe_b2_slot2
                     .lock()

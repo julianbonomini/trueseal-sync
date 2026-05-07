@@ -124,6 +124,20 @@ impl HushFfiSession {
             }
         })?;
 
+        // Open a third store handle for manifest persistence.
+        let manifest_store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
+            SessionError::ConnectionFailed {
+                msg: format!("store: {e}"),
+            }
+        })?;
+        let manifest_store_save = Arc::new(Mutex::new(
+            Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
+                SessionError::ConnectionFailed {
+                    msg: format!("store: {e}"),
+                }
+            })?,
+        ));
+
         let relay_addr_factory = relay_addr.clone();
         let inner = HushSession::connect_with_reconnect(
             stream,
@@ -152,10 +166,18 @@ impl HushFfiSession {
             move |bytes| {
                 on_keypair_rotated.on_keypair_rotated(bytes.to_vec());
             },
+            move |m: &crate::manifest::GroupManifest| {
+                let _ = manifest_store_save.lock().unwrap().save_group_manifest(m);
+            },
             move || TcpStream::connect(&relay_addr_factory).map_err(|e| e.to_string()),
             None, // use default 30-second cap
         )
         .map_err(SessionError::from)?;
+
+        // Restore manifest from store if one was persisted in a previous session.
+        if let Ok(Some(manifest)) = manifest_store.load_group_manifest() {
+            inner.set_manifest(manifest);
+        }
 
         // Wire the manifest arc into the closure's slot now that the session exists.
         *manifest_slot.lock().unwrap() = Some(inner.manifest.clone());

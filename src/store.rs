@@ -2,6 +2,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::device::DeviceKeypair;
+use crate::manifest::GroupManifest;
 use crate::operation_log::{LogEntry, OperationLog};
 
 #[derive(Debug, Error)]
@@ -170,6 +171,31 @@ impl Store {
             Ok(data) => Ok(Some(data)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    // --- manifest (typed) ---
+
+    /// Persist a `GroupManifest`. Overwrites any existing entry.
+    pub fn save_group_manifest(&self, manifest: &GroupManifest) -> Result<(), StoreError> {
+        let data = manifest.encode();
+        self.save_manifest(&data)
+    }
+
+    /// Load the `GroupManifest`. Returns `None` if none has been saved yet.
+    pub fn load_group_manifest(&self) -> Result<Option<GroupManifest>, StoreError> {
+        match self.load_manifest()? {
+            None => Ok(None),
+            Some(data) => {
+                let m = GroupManifest::decode(&data).map_err(|e| {
+                    rusqlite::Error::InvalidColumnType(
+                        0,
+                        format!("manifest decode: {e}").into(),
+                        rusqlite::types::Type::Blob,
+                    )
+                })?;
+                Ok(Some(m))
+            }
         }
     }
 }
@@ -533,5 +559,46 @@ mod tests {
         let dir = tmp_dir();
         let s = Store::open(dir.path(), "ns").expect("open");
         assert!(s.load_keypair().expect("load").is_none());
+    }
+
+    // ── Manifest (typed) tests ─────────────────────────────────────────────────
+
+    /// GroupManifest round-trips through typed save/load.
+    #[test]
+    fn manifest_typed_save_and_load_round_trips() {
+        use crate::keys::{NoisePublicKey, SigningPublicKey};
+        use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+
+        let sk = SigningKey::generate(&mut OsRng);
+        let manifest = GroupManifest::new(
+            new_group_id(),
+            1,
+            vec![ManifestMember {
+                noise_pub: NoisePublicKey([1u8; 32]),
+                signing_pub: SigningPublicKey([2u8; 32]),
+                name: "Alice".into(),
+            }],
+            &sk,
+        );
+        s.save_group_manifest(&manifest).expect("save");
+        let loaded = s
+            .load_group_manifest()
+            .expect("load")
+            .expect("should exist");
+        assert_eq!(loaded.version, 1);
+        assert_eq!(loaded.members.len(), 1);
+    }
+
+    /// No manifest on fresh store returns None.
+    #[test]
+    fn manifest_absent_on_fresh_store() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        assert!(s.load_group_manifest().expect("load").is_none());
     }
 }

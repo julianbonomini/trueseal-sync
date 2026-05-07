@@ -83,6 +83,7 @@ fn accept_pair_sends_manifest_to_new_member() {
         Box::new(MemLog::new()),
         |_| {},
         || {},
+        |_| {},
     )
     .expect("session B");
     // Watch B's manifest directly.
@@ -163,6 +164,7 @@ fn accept_pair_extends_existing_manifest() {
             Box::new(MemLog::new()),
             |_| {},
             || {},
+            |_| {},
         )
         .expect("session C");
         _session_c.manifest.clone()

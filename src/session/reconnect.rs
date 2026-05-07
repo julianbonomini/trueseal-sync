@@ -26,6 +26,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     on_message: impl Fn(Message, [u8; 32]) + Send + 'static + Clone,
     on_keypair_rotated: Arc<dyn Fn([u8; 64]) + Send + Sync + 'static>,
     on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static>,
+    on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
 ) {
@@ -63,9 +64,9 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             let manifest_cb = manifest.clone();
             let on_kpr_cb = on_keypair_rotated.clone();
             let on_rfg_cb = on_removed_from_group.clone();
+            let on_mc_cb = on_manifest_changed.clone();
             let on_message = on_message.clone();
             new_client.subscribe(move |msg, author_signing_pub| {
-                // Manifest-based inbound filtering.
                 {
                     let guard = manifest_cb.lock().unwrap();
                     if let Some(ref m) = *guard {
@@ -109,6 +110,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
                     if accept {
                         let excluded = !incoming.contains_signing_pub(&local_signing_pub);
                         *guard = Some(incoming.clone());
+                        (on_mc_cb)(incoming);
                         drop(guard);
                         if excluded {
                             (on_rfg_cb)();
