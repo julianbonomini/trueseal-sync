@@ -24,6 +24,8 @@ pub enum SessionError {
     ConnectionFailed { msg: String },
     #[error("push failed: {msg}")]
     PushFailed { msg: String },
+    #[error("invalid pairing token")]
+    InvalidToken,
 }
 
 impl From<CoreSessionError> for SessionError {
@@ -38,6 +40,7 @@ impl From<CoreSessionError> for SessionError {
                 expected: 64,
                 got: 0,
             },
+            CoreSessionError::InvalidToken => SessionError::InvalidToken,
         }
     }
 }
@@ -163,6 +166,13 @@ impl HushFfiSession {
     /// the peer's `join_group(token)` call.  Single-use; expires with the window.
     pub fn pairing_token(&self) -> String {
         self.inner.pairing_token()
+    }
+
+    /// Join a group as the responding device by decoding the initiator's `token`
+    /// and sending a `Pair` message with this device's public keys.
+    /// Returns `SessionError::InvalidToken` if the token is malformed.
+    pub fn join_group(&self, token: String) -> Result<(), SessionError> {
+        self.inner.join_group(&token).map_err(SessionError::from)
     }
 
     /// Admit a device identified by its noise (32 B) and signing (32 B) public keys.

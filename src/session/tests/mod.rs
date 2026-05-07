@@ -1,4 +1,5 @@
 mod fanout;
+mod join_group;
 mod manifest_filter;
 mod outbox;
 mod pairing;

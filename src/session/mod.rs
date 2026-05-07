@@ -36,6 +36,8 @@ pub enum SessionError {
     PushFailed(String),
     #[error("not in any group — set a manifest first")]
     NotInGroup,
+    #[error("invalid pairing token")]
+    InvalidToken,
 }
 
 // ── Internal types ────────────────────────────────────────────────────────────
@@ -98,6 +100,27 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// Current noise public key for this session.
     pub fn noise_pub(&self) -> NoisePublicKey {
         self.keys.lock().unwrap().noise_pub
+    }
+
+    /// Current signing public key for this session.
+    pub fn signing_pub(&self) -> SigningPublicKey {
+        self.keys.lock().unwrap().signing_pub
+    }
+
+    /// Send a `Pair` message to the initiator identified by `token`.
+    /// Called by the joining device after scanning a QR code or receiving the token.
+    /// Returns `SessionError::InvalidToken` if the token cannot be decoded.
+    pub fn join_group(&self, token: &str) -> Result<(), SessionError> {
+        let (initiator_noise, _initiator_signing, _initiator_name) =
+            crate::message::decode_pairing_token(token).map_err(|_| SessionError::InvalidToken)?;
+        let ks = self.keys.lock().unwrap();
+        let msg = Message::Pair {
+            noise_pub: ks.noise_pub.0,
+            signing_pub: ks.signing_pub.0,
+        };
+        drop(ks);
+        self.push_message(&msg, NoisePublicKey(initiator_noise))
+            .map_err(|e| SessionError::PushFailed(e.to_string()))
     }
 
     // ── Constructors ──────────────────────────────────────────────────────────
