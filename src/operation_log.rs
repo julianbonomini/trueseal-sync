@@ -1,5 +1,14 @@
 use std::collections::BTreeMap;
 
+/// A named entry returned from the operation log.
+/// Replaces positional tuple returns in the trait — callers use field names instead
+/// of destructuring by position, which is both more readable and refactor-safe.
+pub struct LogEntry {
+    pub object_id: [u8; 32],
+    pub sequence: u64,
+    pub blob: Vec<u8>,
+}
+
 /// A log of (sequence, blob) entries keyed by object_id.
 /// The Relay is unaware of object_ids — they live only inside encrypted payloads.
 /// The caller maps Envelope.payload → object_id + blob after decryption.
@@ -23,8 +32,8 @@ pub trait OperationLog: Send {
     fn append(&mut self, object_id: &[u8; 32], sequence: u64, blob: Vec<u8>);
     fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64);
     /// Returns undelivered entries sorted by global sequence ascending.
-    fn undelivered_entries(&self) -> Vec<([u8; 32], u64, Vec<u8>)>;
-    fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<(u64, Vec<u8>)>;
+    fn undelivered_entries(&self) -> Vec<LogEntry>;
+    fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<LogEntry>;
 }
 
 /// A single entry in the log.
@@ -73,28 +82,36 @@ impl OperationLog for MemLog {
         }
     }
 
-    fn undelivered_entries(&self) -> Vec<([u8; 32], u64, Vec<u8>)> {
+    fn undelivered_entries(&self) -> Vec<LogEntry> {
         // Collect all undelivered entries, then sort by global sequence ascending
         // so the session replays the outbox in the original send order.
-        let mut out: Vec<([u8; 32], u64, Vec<u8>)> = self
+        let mut out: Vec<LogEntry> = self
             .inner
             .iter()
             .flat_map(|(object_id, map)| {
                 map.iter()
                     .filter(|(_, entry)| !entry.delivered)
-                    .map(move |(seq, entry)| (*object_id, *seq, entry.blob.clone()))
+                    .map(move |(seq, entry)| LogEntry {
+                        object_id: *object_id,
+                        sequence: *seq,
+                        blob: entry.blob.clone(),
+                    })
             })
             .collect();
-        out.sort_by_key(|(_, seq, _)| *seq);
+        out.sort_by_key(|e| e.sequence);
         out
     }
 
-    fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<(u64, Vec<u8>)> {
+    fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<LogEntry> {
         match self.inner.get(object_id) {
             None => vec![],
             Some(map) => map
                 .range(sequence..)
-                .map(|(seq, entry)| (*seq, entry.blob.clone()))
+                .map(|(seq, entry)| LogEntry {
+                    object_id: *object_id,
+                    sequence: *seq,
+                    blob: entry.blob.clone(),
+                })
                 .collect(),
         }
     }
@@ -108,13 +125,16 @@ mod tests {
         [b; 32]
     }
 
-    /// Tracer bullet: append one entry and retrieve it.
+    /// Tracer bullet: append one entry and retrieve it via LogEntry fields.
     #[test]
     fn append_and_retrieve_single_entry() {
         let mut log = MemLog::new();
         log.append(&oid(1), 0, b"hello".to_vec());
         let entries = log.entries_from(&oid(1), 0);
-        assert_eq!(entries, vec![(0, b"hello".to_vec())]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[0].blob, b"hello");
+        assert_eq!(entries[0].object_id, oid(1));
     }
 
     /// entries_from(seq) returns only entries with sequence >= seq.
@@ -126,10 +146,11 @@ mod tests {
         log.append(&oid(1), 2, b"third".to_vec());
 
         let entries = log.entries_from(&oid(1), 1);
-        assert_eq!(
-            entries,
-            vec![(1, b"second".to_vec()), (2, b"third".to_vec())]
-        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[0].blob, b"second");
+        assert_eq!(entries[1].sequence, 2);
+        assert_eq!(entries[1].blob, b"third");
     }
 
     /// entries_from on an unknown object_id returns empty.
@@ -147,8 +168,12 @@ mod tests {
         log.append(&oid(1), 0, b"obj1".to_vec());
         log.append(&oid(2), 0, b"obj2".to_vec());
 
-        assert_eq!(log.entries_from(&oid(1), 0), vec![(0, b"obj1".to_vec())]);
-        assert_eq!(log.entries_from(&oid(2), 0), vec![(0, b"obj2".to_vec())]);
+        let e1 = log.entries_from(&oid(1), 0);
+        let e2 = log.entries_from(&oid(2), 0);
+        assert_eq!(e1.len(), 1);
+        assert_eq!(e1[0].blob, b"obj1");
+        assert_eq!(e2.len(), 1);
+        assert_eq!(e2[0].blob, b"obj2");
     }
 
     /// Second append with the same (object_id, sequence) is silently ignored
@@ -160,7 +185,8 @@ mod tests {
         log.append(&oid(1), 5, b"overwrite attempt".to_vec());
 
         let entries = log.entries_from(&oid(1), 5);
-        assert_eq!(entries, vec![(5, b"original".to_vec())]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].blob, b"original");
     }
 
     /// entries_from returns entries in ascending sequence order.
@@ -172,7 +198,7 @@ mod tests {
         log.append(&oid(1), 2, b"b".to_vec());
 
         let entries = log.entries_from(&oid(1), 0);
-        let seqs: Vec<u64> = entries.iter().map(|(s, _)| *s).collect();
+        let seqs: Vec<u64> = entries.iter().map(|e| e.sequence).collect();
         assert_eq!(seqs, vec![1, 2, 3]);
     }
 
@@ -184,7 +210,9 @@ mod tests {
 
         let undelivered = log.undelivered_entries();
         assert_eq!(undelivered.len(), 1);
-        assert_eq!(undelivered[0], (oid(1), 0, b"hello".to_vec()));
+        assert_eq!(undelivered[0].object_id, oid(1));
+        assert_eq!(undelivered[0].sequence, 0);
+        assert_eq!(undelivered[0].blob, b"hello");
     }
 
     /// mark_delivered removes an entry from undelivered_entries.
@@ -205,7 +233,8 @@ mod tests {
         log.mark_delivered(&oid(1), 0);
 
         let entries = log.entries_from(&oid(1), 0);
-        assert_eq!(entries, vec![(0, b"hello".to_vec())]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].blob, b"hello");
     }
 
     /// undelivered_entries spans all object_ids.
@@ -219,7 +248,10 @@ mod tests {
 
         let undelivered = log.undelivered_entries();
         assert_eq!(undelivered.len(), 2);
-        let keys: Vec<([u8; 32], u64)> = undelivered.iter().map(|(o, s, _)| (*o, *s)).collect();
+        let keys: Vec<([u8; 32], u64)> = undelivered
+            .iter()
+            .map(|e| (e.object_id, e.sequence))
+            .collect();
         assert!(keys.contains(&(oid(1), 1)));
         assert!(keys.contains(&(oid(2), 0)));
     }
@@ -236,7 +268,7 @@ mod tests {
         log.append(&oid(2), 3, b"obj2-second".to_vec());
 
         let undelivered = log.undelivered_entries();
-        let seqs: Vec<u64> = undelivered.iter().map(|(_, s, _)| *s).collect();
+        let seqs: Vec<u64> = undelivered.iter().map(|e| e.sequence).collect();
         assert_eq!(seqs, vec![0, 1, 2, 3], "must be sorted by global sequence");
     }
 

@@ -11,3 +11,4 @@ pub mod relay;
 pub mod revocation;
 
 pub use keys::{NoisePublicKey, SigningPublicKey};
+pub use operation_log::LogEntry;
