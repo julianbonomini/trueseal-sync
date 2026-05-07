@@ -6,21 +6,34 @@ use std::collections::BTreeMap;
 ///
 /// # Design notes
 /// - `append` is idempotent for the same (object_id, sequence) pair: a second
-///   write with the same sequence is silently ignored (last-write semantics
-///   are the caller's concern, not the log's).
+///   write with the same sequence is silently ignored (first-write wins —
+///   conflict resolution is the caller's concern, not the log's).
 /// - `entries_from` returns all entries with sequence >= the given value,
 ///   in ascending sequence order.
+/// - `mark_delivered` marks an entry as confirmed delivered to the Relay.
+///   Entries start as undelivered. The session calls this after a successful push.
+/// - `undelivered_entries` returns all entries not yet confirmed delivered,
+///   across all object_ids, in (object_id, sequence) order. Used by the session
+///   to replay the outbox on reconnect.
 /// - v0 uses an in-memory backend (`MemLog`).
 ///   A `SqliteLog` (persisted) is the obvious next backend.
 pub trait OperationLog: Send {
     fn append(&mut self, object_id: &[u8; 32], sequence: u64, blob: Vec<u8>);
+    fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64);
+    fn undelivered_entries(&self) -> Vec<([u8; 32], u64, Vec<u8>)>;
     fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<(u64, Vec<u8>)>;
 }
 
+/// A single entry in the log.
+struct Entry {
+    blob: Vec<u8>,
+    delivered: bool,
+}
+
 /// In-memory operation log. Not persisted across restarts.
-/// Key: object_id bytes. Value: BTreeMap<sequence, blob>.
+/// Key: object_id bytes. Value: BTreeMap<sequence, Entry>.
 pub struct MemLog {
-    inner: BTreeMap<[u8; 32], BTreeMap<u64, Vec<u8>>>,
+    inner: BTreeMap<[u8; 32], BTreeMap<u64, Entry>>,
 }
 
 impl MemLog {
@@ -43,7 +56,30 @@ impl OperationLog for MemLog {
             .entry(*object_id)
             .or_default()
             .entry(sequence)
-            .or_insert(blob);
+            .or_insert(Entry {
+                blob,
+                delivered: false,
+            });
+    }
+
+    fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64) {
+        if let Some(map) = self.inner.get_mut(object_id) {
+            if let Some(entry) = map.get_mut(&sequence) {
+                entry.delivered = true;
+            }
+        }
+    }
+
+    fn undelivered_entries(&self) -> Vec<([u8; 32], u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        for (object_id, map) in &self.inner {
+            for (seq, entry) in map {
+                if !entry.delivered {
+                    out.push((*object_id, *seq, entry.blob.clone()));
+                }
+            }
+        }
+        out
     }
 
     fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<(u64, Vec<u8>)> {
@@ -51,7 +87,7 @@ impl OperationLog for MemLog {
             None => vec![],
             Some(map) => map
                 .range(sequence..)
-                .map(|(seq, blob)| (*seq, blob.clone()))
+                .map(|(seq, entry)| (*seq, entry.blob.clone()))
                 .collect(),
         }
     }
@@ -131,5 +167,62 @@ mod tests {
         let entries = log.entries_from(&oid(1), 0);
         let seqs: Vec<u64> = entries.iter().map(|(s, _)| *s).collect();
         assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    /// Freshly appended entries are undelivered.
+    #[test]
+    fn appended_entries_start_as_undelivered() {
+        let mut log = MemLog::new();
+        log.append(&oid(1), 0, b"hello".to_vec());
+
+        let undelivered = log.undelivered_entries();
+        assert_eq!(undelivered.len(), 1);
+        assert_eq!(undelivered[0], (oid(1), 0, b"hello".to_vec()));
+    }
+
+    /// mark_delivered removes an entry from undelivered_entries.
+    #[test]
+    fn mark_delivered_clears_from_outbox() {
+        let mut log = MemLog::new();
+        log.append(&oid(1), 0, b"hello".to_vec());
+        log.mark_delivered(&oid(1), 0);
+
+        assert!(log.undelivered_entries().is_empty());
+    }
+
+    /// mark_delivered does not affect entries_from — delivery status is orthogonal.
+    #[test]
+    fn mark_delivered_does_not_affect_entries_from() {
+        let mut log = MemLog::new();
+        log.append(&oid(1), 0, b"hello".to_vec());
+        log.mark_delivered(&oid(1), 0);
+
+        let entries = log.entries_from(&oid(1), 0);
+        assert_eq!(entries, vec![(0, b"hello".to_vec())]);
+    }
+
+    /// undelivered_entries spans all object_ids, ordered by (object_id, sequence).
+    #[test]
+    fn undelivered_entries_spans_all_objects() {
+        let mut log = MemLog::new();
+        log.append(&oid(1), 0, b"a".to_vec());
+        log.append(&oid(2), 0, b"b".to_vec());
+        log.append(&oid(1), 1, b"c".to_vec());
+        log.mark_delivered(&oid(1), 0);
+
+        let undelivered = log.undelivered_entries();
+        // oid(1) seq 0 is delivered; oid(1) seq 1 and oid(2) seq 0 are not
+        assert_eq!(undelivered.len(), 2);
+        let keys: Vec<([u8; 32], u64)> = undelivered.iter().map(|(o, s, _)| (*o, *s)).collect();
+        assert!(keys.contains(&(oid(1), 1)));
+        assert!(keys.contains(&(oid(2), 0)));
+    }
+
+    /// mark_delivered on unknown (object_id, sequence) is a no-op.
+    #[test]
+    fn mark_delivered_unknown_entry_is_noop() {
+        let mut log = MemLog::new();
+        log.mark_delivered(&oid(99), 42); // should not panic
+        assert!(log.undelivered_entries().is_empty());
     }
 }
