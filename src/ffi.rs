@@ -102,7 +102,12 @@ impl HushPairedList {
     /// Add a device's noise public key (32 bytes) to the trusted list.
     pub fn add(&self, noise_pub: Vec<u8>) {
         if let Ok(key) = noise_pub.as_slice().try_into() as Result<[u8; 32], _> {
-            self.inner.lock().unwrap().add(NoisePublicKey(key));
+            // FFI surface: signing pub not available here; pass zeroed placeholder.
+            // This path will be replaced when issue #16 lands.
+            self.inner.lock().unwrap().add(
+                NoisePublicKey(key),
+                crate::keys::SigningPublicKey([0u8; 32]),
+            );
         }
     }
 

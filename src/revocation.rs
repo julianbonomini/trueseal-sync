@@ -1,11 +1,19 @@
 use crate::device::DeviceKeypair;
-use crate::keys::NoisePublicKey;
+use crate::keys::{NoisePublicKey, SigningPublicKey};
+
+/// An entry in the paired list — associates a device's noise and signing public keys.
+#[derive(Clone)]
+struct PairedEntry {
+    noise_pub: NoisePublicKey,
+    signing_pub: SigningPublicKey,
+}
 
 /// The set of devices this device trusts — i.e. devices it has paired with.
-/// Stored as their noise public keys (X25519). The signing key is used to
-/// verify envelope authorship (in RelayClient), so it is not needed here.
+/// Stores both noise (X25519) and signing (Ed25519) keys so that inbound
+/// `Message::Revoke` envelopes (authenticated by signing key) can be mapped
+/// back to the sender's noise public key for `handle_revoke`.
 pub struct PairedList {
-    entries: Vec<NoisePublicKey>,
+    entries: Vec<PairedEntry>,
 }
 
 impl PairedList {
@@ -15,16 +23,28 @@ impl PairedList {
         }
     }
 
-    /// Add a device's noise public key to the trusted list.
-    pub fn add(&mut self, noise_pub: NoisePublicKey) {
-        if !self.entries.contains(&noise_pub) {
-            self.entries.push(noise_pub);
+    /// Add a device to the trusted list by both its noise and signing public keys.
+    pub fn add(&mut self, noise_pub: NoisePublicKey, signing_pub: SigningPublicKey) {
+        if !self.entries.iter().any(|e| e.noise_pub == noise_pub) {
+            self.entries.push(PairedEntry {
+                noise_pub,
+                signing_pub,
+            });
         }
     }
 
     /// Whether `noise_pub` is in the trusted list.
     pub fn contains(&self, noise_pub: &NoisePublicKey) -> bool {
-        self.entries.contains(noise_pub)
+        self.entries.iter().any(|e| &e.noise_pub == noise_pub)
+    }
+
+    /// Look up the noise public key for a given signing public key.
+    /// Returns `None` if the signing key is not in the list.
+    pub fn noise_pub_for_signing(&self, signing_pub: &[u8; 32]) -> Option<NoisePublicKey> {
+        self.entries
+            .iter()
+            .find(|e| &e.signing_pub.0 == signing_pub)
+            .map(|e| e.noise_pub)
     }
 
     /// Number of paired devices.
@@ -43,7 +63,7 @@ impl PairedList {
 
     /// Iterator over all noise public keys in the list.
     pub fn iter(&self) -> impl Iterator<Item = &NoisePublicKey> {
-        self.entries.iter()
+        self.entries.iter().map(|e| &e.noise_pub)
     }
 }
 
@@ -70,6 +90,17 @@ pub fn handle_revoke(
     Some(DeviceKeypair::generate())
 }
 
+/// Process an incoming Revoke identified by the sender's signing key.
+/// Looks up the sender's noise public key in `list`, then delegates to `handle_revoke`.
+/// Returns a new `DeviceKeypair` if the revoke was accepted, `None` if ignored.
+pub fn handle_revoke_by_signing_pub(
+    list: &mut PairedList,
+    sender_signing_pub: &[u8; 32],
+) -> Option<DeviceKeypair> {
+    let noise_pub = list.noise_pub_for_signing(sender_signing_pub)?;
+    handle_revoke(list, &noise_pub)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,7 +110,7 @@ mod tests {
     fn revoke_from_trusted_sender_clears_list_and_rotates_keypair() {
         let sender = DeviceKeypair::generate();
         let mut list = PairedList::new();
-        list.add(sender.public_key());
+        list.add(sender.public_key(), sender.signing_public_key());
 
         let old_pub = sender.public_key();
         let new_kp =
@@ -99,7 +130,7 @@ mod tests {
         let trusted = DeviceKeypair::generate();
         let stranger = DeviceKeypair::generate();
         let mut list = PairedList::new();
-        list.add(trusted.public_key());
+        list.add(trusted.public_key(), trusted.signing_public_key());
 
         let result = handle_revoke(&mut list, &stranger.public_key());
 
@@ -113,7 +144,7 @@ mod tests {
     fn second_revoke_from_same_sender_is_ignored() {
         let sender = DeviceKeypair::generate();
         let mut list = PairedList::new();
-        list.add(sender.public_key());
+        list.add(sender.public_key(), sender.signing_public_key());
 
         let _ = handle_revoke(&mut list, &sender.public_key());
         let result = handle_revoke(&mut list, &sender.public_key());
@@ -133,8 +164,8 @@ mod tests {
         // Both are paired with each other
         let mut a_list = PairedList::new();
         let mut b_list = PairedList::new();
-        a_list.add(device_b.public_key());
-        b_list.add(device_a.public_key());
+        a_list.add(device_b.public_key(), device_b.signing_public_key());
+        b_list.add(device_a.public_key(), device_a.signing_public_key());
 
         // A initiates revoke: A clears its own list and rotates
         let new_a = handle_revoke(&mut a_list, &device_b.public_key())
@@ -151,5 +182,33 @@ mod tests {
         // Both have fresh keypairs distinct from the originals
         assert_ne!(new_a.public_key(), device_a.public_key());
         assert_ne!(new_b.public_key(), device_b.public_key());
+    }
+
+    /// handle_revoke_by_signing_pub accepts a revoke identified by the sender's signing key.
+    #[test]
+    fn revoke_by_signing_pub_from_trusted_sender() {
+        let sender = DeviceKeypair::generate();
+        let mut list = PairedList::new();
+        list.add(sender.public_key(), sender.signing_public_key());
+
+        let signing_bytes = sender.signing_public_key().0;
+        let new_kp = handle_revoke_by_signing_pub(&mut list, &signing_bytes)
+            .expect("revoke by signing pub should succeed");
+
+        assert!(list.is_empty());
+        assert_ne!(new_kp.public_key(), sender.public_key());
+    }
+
+    /// handle_revoke_by_signing_pub from an unknown signing key is ignored.
+    #[test]
+    fn revoke_by_signing_pub_from_unknown_sender_ignored() {
+        let trusted = DeviceKeypair::generate();
+        let stranger = DeviceKeypair::generate();
+        let mut list = PairedList::new();
+        list.add(trusted.public_key(), trusted.signing_public_key());
+
+        let result = handle_revoke_by_signing_pub(&mut list, &stranger.signing_public_key().0);
+        assert!(result.is_none());
+        assert_eq!(list.len(), 1);
     }
 }

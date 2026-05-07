@@ -81,7 +81,8 @@ type PushBytes = Vec<u8>;
 pub struct RelayClient<T: Read + Write + Send + 'static> {
     /// Channel for sending pre-encoded push frames to the run thread.
     push_tx: mpsc::SyncSender<PushBytes>,
-    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message) + Send + 'static>>>>,
+    /// Callbacks receive the decoded Message and the sender's signing public key ([u8;32]).
+    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32]) + Send + 'static>>>>,
     /// True while the background run loop is alive; set to false when relay disconnects.
     is_connected: Arc<AtomicBool>,
     _transport: PhantomData<T>,
@@ -106,7 +107,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         // Bounded channel: backpressure if the run thread falls behind.
         let (push_tx, push_rx) = mpsc::sync_channel::<PushBytes>(64);
 
-        let callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message) + Send + 'static>>>> =
+        let callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32]) + Send + 'static>>>> =
             Arc::new(Mutex::new(Vec::new()));
         let callbacks_clone = callbacks.clone();
 
@@ -152,8 +153,9 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
     }
 
     /// Register a callback invoked when the relay delivers a Message to this device.
-    /// Decryption and type parsing happen inside — callers receive a clean Message.
-    pub fn subscribe(&self, callback: impl Fn(Message) + Send + 'static) {
+    /// Decryption and type parsing happen inside — callers receive a clean `Message`
+    /// and the sender's signing public key (`author_pub` from the Envelope).
+    pub fn subscribe(&self, callback: impl Fn(Message, [u8; 32]) + Send + 'static) {
         self.callbacks.lock().unwrap().push(Box::new(callback));
     }
 
@@ -180,7 +182,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
 fn run_loop<T: Read + Write + Send + 'static>(
     session: Session<T>,
     push_rx: mpsc::Receiver<PushBytes>,
-    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message) + Send + 'static>>>>,
+    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32]) + Send + 'static>>>>,
     my_noise_priv: [u8; 32],
     is_connected: Arc<AtomicBool>,
 ) {
@@ -238,9 +240,10 @@ fn run_loop<T: Read + Write + Send + 'static>(
                         if let Ok(plaintext) = crypto::decrypt(my_noise_priv, &env.payload) {
                             if let Ok(msg) = Message::decode(&plaintext) {
                                 if env.verify().is_ok() {
+                                    let author_pub = env.author_pub;
                                     let cbs = callbacks.lock().unwrap();
                                     for cb in cbs.iter() {
-                                        cb(msg.clone());
+                                        cb(msg.clone(), author_pub);
                                     }
                                 }
                             }
@@ -476,7 +479,7 @@ mod tests {
 
         // Connect and subscribe — run loop starts automatically in connect()
         let client = connect_device(&recipient, relay_pub, client_pipe);
-        client.subscribe(move |msg| {
+        client.subscribe(move |msg, _author_pub| {
             delivered_clone.lock().unwrap().push(msg);
         });
 
@@ -542,7 +545,7 @@ mod tests {
         let client_a = connect_device(&device_a, relay_pub, pipe_a_client);
         let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
         let received_clone = received.clone();
-        client_a.subscribe(move |msg| {
+        client_a.subscribe(move |msg, _author_pub| {
             received_clone.lock().unwrap().push(msg);
         });
         // run loop starts automatically in connect()
