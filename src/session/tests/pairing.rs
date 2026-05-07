@@ -10,66 +10,43 @@ use crate::message::Message;
 use super::super::test_helpers::*;
 use super::super::HushSession;
 
+/// After accept_pair, A's manifest contains B as a member.
 #[test]
-fn pairing_ceremony_on_paired_fires_with_correct_key() {
+fn pairing_ceremony_creates_manifest_with_new_member() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, false); // B→A
+    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, true); // A→B
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
 
-    let pair_msgs: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
-    let pm = pair_msgs.clone();
     let session_a = Arc::new(
-        HushSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _| {
-            pm.lock().unwrap().push(msg);
-        })
-        .expect("session A"),
+        HushSession::connect(pipe_a_client, relay_pub, device_a, move |_, _| {})
+            .expect("session A"),
     );
 
-    let on_paired_fired: Arc<Mutex<Vec<NoisePublicKey>>> = Arc::new(Mutex::new(Vec::new()));
-    let opf = on_paired_fired.clone();
-    let _payload = session_a.start_pairing(move |k| {
-        opf.lock().unwrap().push(k);
-    });
+    let _token = session_a.pairing_token();
 
     let device_b_noise_pub = device_b.public_key();
     let device_b_signing_pub = device_b.signing_public_key();
-    let session_b =
+    let _session_b =
         HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}).expect("session B");
 
-    let pair_msg = Message::Pair {
-        noise_pub: device_b_noise_pub.0,
-        signing_pub: device_b_signing_pub.0,
-    };
-    session_b
-        .push_message(&pair_msg, session_a.noise_pub())
-        .expect("B push Pair");
+    let admitted = session_a.accept_pair(device_b_noise_pub, device_b_signing_pub);
+    assert!(admitted, "accept_pair must return true when window is open");
 
-    std::thread::sleep(Duration::from_millis(100));
-
-    let msgs = pair_msgs.lock().unwrap();
-    assert_eq!(msgs.len(), 1);
-    if let Message::Pair {
-        noise_pub,
-        signing_pub,
-    } = msgs[0]
-    {
-        drop(msgs);
-        session_a.accept_pair(
-            NoisePublicKey(noise_pub),
-            crate::keys::SigningPublicKey(signing_pub),
-        );
-    } else {
-        panic!("expected Pair message");
-    }
-
-    let paired = on_paired_fired.lock().unwrap();
-    assert_eq!(paired.len(), 1);
-    assert_eq!(paired[0].0, device_b_noise_pub.0);
+    let manifest = session_a.manifest.lock().unwrap();
+    assert!(manifest.is_some(), "A must have a manifest after pairing");
+    let m = manifest.as_ref().unwrap();
+    assert_eq!(m.members.len(), 2, "manifest must have 2 members");
+    assert!(
+        m.members
+            .iter()
+            .any(|mb| mb.noise_pub == device_b_noise_pub),
+        "B must be in the manifest"
+    );
 }
 
 #[test]

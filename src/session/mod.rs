@@ -16,8 +16,8 @@ use thiserror::Error;
 use crate::device::DeviceKeypair;
 use crate::envelope::SigningKeypair;
 use crate::keys::{NoisePublicKey, SigningPublicKey};
-use crate::manifest::GroupManifest;
-use crate::message::{pairing_payload, Message};
+use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
+use crate::message::{device_name, pairing_payload, Message};
 use crate::operation_log::{MemLog, OperationLog};
 use crate::relay::RelayClient;
 
@@ -457,20 +457,92 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// Admit a device; requires both noise and signing pub keys.
     /// Returns `true` if the device was admitted (window open), `false` if the window was
     /// closed or had already expired.
+    ///
+    /// On success: issues a new `GroupManifest` (genesis or version+1), stores it locally,
+    /// and pushes it to all existing members plus the new member.
     pub fn accept_pair(&self, noise_pub: NoisePublicKey, signing_pub: SigningPublicKey) -> bool {
-        let mut guard = self.pairing.lock().unwrap();
-        if let Some(ref window) = *guard {
-            if window.is_open() {
-                // For backwards compat: store in paired list on manifest if present,
-                // or just fire the callback. Full manifest-based pairing is in #26–#29.
-                let _ = (noise_pub, signing_pub); // used by future manifest wiring
-                (window.on_paired)(noise_pub);
-                *guard = None;
-                return true;
-            }
+        let window_open = {
+            let guard = self.pairing.lock().unwrap();
+            guard.as_ref().map(|w| w.is_open()).unwrap_or(false)
+        };
+        // Always clear the window.
+        *self.pairing.lock().unwrap() = None;
+
+        if !window_open {
+            return false;
         }
-        *guard = None;
-        false
+
+        // Build new manifest.
+        let new_member = ManifestMember {
+            noise_pub,
+            signing_pub,
+            name: device_name(&signing_pub.0),
+        };
+
+        let ks = self.keys.lock().unwrap();
+        let self_noise = ks.noise_pub;
+        let self_signing = ks.signing_pub;
+        let signing_key = SigningKey::from_bytes(&ks.signing_priv);
+        drop(ks);
+
+        let new_manifest = {
+            let guard = self.manifest.lock().unwrap();
+            match &*guard {
+                None => {
+                    // Genesis: version 1, self + new member.
+                    GroupManifest::new(
+                        new_group_id(),
+                        1,
+                        vec![
+                            ManifestMember {
+                                noise_pub: self_noise,
+                                signing_pub: self_signing,
+                                name: device_name(&self_signing.0),
+                            },
+                            new_member,
+                        ],
+                        &signing_key,
+                    )
+                }
+                Some(current) => {
+                    // Extend existing manifest.
+                    let mut members = current.members.clone();
+                    members.push(new_member);
+                    GroupManifest::new(current.group_id, current.version + 1, members, &signing_key)
+                }
+            }
+        };
+
+        // Determine who to notify: all existing members except self + the new member.
+        let notify: Vec<NoisePublicKey> = {
+            let guard = self.manifest.lock().unwrap();
+            let existing = guard
+                .as_ref()
+                .map(|m| {
+                    m.members
+                        .iter()
+                        .filter(|mb| mb.noise_pub != self_noise)
+                        .map(|mb| mb.noise_pub)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            existing
+        };
+
+        // Store the new manifest.
+        *self.manifest.lock().unwrap() = Some(new_manifest.clone());
+
+        // Push GroupManifest to all existing members (excluding self).
+        let msg = Message::GroupManifest {
+            manifest: new_manifest,
+        };
+        for peer in &notify {
+            let _ = self.push_message(&msg, *peer);
+        }
+        // Push to the new member.
+        let _ = self.push_message(&msg, noise_pub);
+
+        true
     }
 
     pub fn cancel_pairing(&self) {
