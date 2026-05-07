@@ -60,12 +60,6 @@ pub trait MessageCallback: Send + Sync {
     fn on_message(&self, blob: Vec<u8>, sender_noise_pub: Vec<u8>);
 }
 
-/// Fired after a successful pairing — `noise_pub` is the new peer's 32-byte X25519 key.
-#[uniffi::export(callback_interface)]
-pub trait PairedCallback: Send + Sync {
-    fn on_paired(&self, noise_pub: Vec<u8>);
-}
-
 /// Fired after this device's keypair is rotated (revocation).
 /// `keypair_bytes` is `noise_priv (32) || signing_priv (32)` — 64 bytes total.
 /// The caller must persist this to replace the stored keypair.
@@ -158,12 +152,11 @@ impl HushFfiSession {
         Ok(Arc::new(Self { inner }))
     }
 
-    /// Returns a 64-byte pairing payload for QR-code display.
-    /// Opens a 60-second pairing window; `on_paired` fires on successful `accept_pair`.
-    pub fn start_pairing(&self, on_paired: Box<dyn PairedCallback>) -> Vec<u8> {
-        self.inner.start_pairing(move |noise_pub| {
-            on_paired.on_paired(noise_pub.0.to_vec());
-        })
+    /// Opens a 60-second pairing window and returns an opaque base64url token.
+    /// The token encodes `noise_pub || signing_pub || device_name` — pass it to
+    /// the peer's `join_group(token)` call.  Single-use; expires with the window.
+    pub fn pairing_token(&self) -> String {
+        self.inner.pairing_token()
     }
 
     /// Admit a device identified by its noise (32 B) and signing (32 B) public keys.

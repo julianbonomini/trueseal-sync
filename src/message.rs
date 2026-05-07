@@ -119,6 +119,120 @@ pub fn decode_pairing_payload(bytes: &[u8]) -> Result<([u8; 32], [u8; 32]), Mess
     Ok((noise_pub, signing_pub))
 }
 
+/// Generate a deterministic, human-readable device name from a signing public key.
+/// Format: first 4 bytes of the key hex-encoded (e.g. `"ab12cd34"`).
+pub fn device_name(signing_pub: &[u8; 32]) -> String {
+    let hex_chars: Vec<char> = "0123456789abcdef".chars().collect();
+    let mut name = String::with_capacity(8);
+    for b in &signing_pub[..4] {
+        name.push(hex_chars[(b >> 4) as usize]);
+        name.push(hex_chars[(b & 0xf) as usize]);
+    }
+    name
+}
+
+/// Encode a pairing token as a base64url string.
+/// Format: `base64url(noise_pub[32] || signing_pub[32] || name_utf8_bytes)`
+pub fn pairing_token(noise_pub: &[u8; 32], signing_pub: &[u8; 32]) -> String {
+    let name = device_name(signing_pub);
+    let mut raw = Vec::with_capacity(64 + name.len());
+    raw.extend_from_slice(noise_pub);
+    raw.extend_from_slice(signing_pub);
+    raw.extend_from_slice(name.as_bytes());
+    base64url_encode(&raw)
+}
+
+/// Decode a pairing token produced by `pairing_token`.
+/// Returns `(noise_pub, signing_pub, name)`.
+pub fn decode_pairing_token(token: &str) -> Result<([u8; 32], [u8; 32], String), MessageError> {
+    let raw = base64url_decode(token).ok_or(MessageError::InvalidPairingPayload)?;
+    if raw.len() < 64 {
+        return Err(MessageError::InvalidPairingPayload);
+    }
+    let noise_pub: [u8; 32] = raw[0..32].try_into().unwrap();
+    let signing_pub: [u8; 32] = raw[32..64].try_into().unwrap();
+    let name =
+        String::from_utf8(raw[64..].to_vec()).map_err(|_| MessageError::InvalidPairingPayload)?;
+    Ok((noise_pub, signing_pub, name))
+}
+
+// ── base64url helpers (no external crate) ─────────────────────────────────────
+
+const B64_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+fn base64url_encode(input: &[u8]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i + 3 <= input.len() {
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
+        out.push(B64_CHARS[((n >> 18) & 0x3f) as usize] as char);
+        out.push(B64_CHARS[((n >> 12) & 0x3f) as usize] as char);
+        out.push(B64_CHARS[((n >> 6) & 0x3f) as usize] as char);
+        out.push(B64_CHARS[(n & 0x3f) as usize] as char);
+        i += 3;
+    }
+    let rem = input.len() - i;
+    if rem == 1 {
+        let n = (input[i] as u32) << 16;
+        out.push(B64_CHARS[((n >> 18) & 0x3f) as usize] as char);
+        out.push(B64_CHARS[((n >> 12) & 0x3f) as usize] as char);
+    } else if rem == 2 {
+        let n = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8);
+        out.push(B64_CHARS[((n >> 18) & 0x3f) as usize] as char);
+        out.push(B64_CHARS[((n >> 12) & 0x3f) as usize] as char);
+        out.push(B64_CHARS[((n >> 6) & 0x3f) as usize] as char);
+    }
+    out
+}
+
+fn base64url_decode(input: &str) -> Option<Vec<u8>> {
+    let mut table = [0xffu8; 256];
+    for (i, &c) in B64_CHARS.iter().enumerate() {
+        table[c as usize] = i as u8;
+    }
+    let bytes: Vec<u8> = input.bytes().collect();
+    let len = bytes.len();
+    let mut out = Vec::with_capacity(len * 3 / 4);
+    let mut i = 0;
+    while i + 4 <= len {
+        let a = table[bytes[i] as usize];
+        let b = table[bytes[i + 1] as usize];
+        let c = table[bytes[i + 2] as usize];
+        let d = table[bytes[i + 3] as usize];
+        if a == 0xff || b == 0xff || c == 0xff || d == 0xff {
+            return None;
+        }
+        let n = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | (d as u32);
+        out.push((n >> 16) as u8);
+        out.push((n >> 8) as u8);
+        out.push(n as u8);
+        i += 4;
+    }
+    let rem = len - i;
+    if rem == 2 {
+        let a = table[bytes[i] as usize];
+        let b = table[bytes[i + 1] as usize];
+        if a == 0xff || b == 0xff {
+            return None;
+        }
+        let n = ((a as u32) << 18) | ((b as u32) << 12);
+        out.push((n >> 16) as u8);
+    } else if rem == 3 {
+        let a = table[bytes[i] as usize];
+        let b = table[bytes[i + 1] as usize];
+        let c = table[bytes[i + 2] as usize];
+        if a == 0xff || b == 0xff || c == 0xff {
+            return None;
+        }
+        let n = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6);
+        out.push((n >> 16) as u8);
+        out.push((n >> 8) as u8);
+    } else if rem != 0 {
+        return None;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,10 +341,19 @@ mod tests {
         assert_eq!(s, signing_pub);
     }
 
-    /// A truncated pairing payload returns an error.
+    /// pairing_token encodes and decodes recovering noise_pub, signing_pub, and name.
     #[test]
-    fn truncated_pairing_payload_returns_error() {
-        let short = vec![0u8; 32]; // only 32 bytes, needs 64
-        assert!(decode_pairing_payload(&short).is_err());
+    fn pairing_token_encodes_and_decodes() {
+        let noise_pub = [5u8; 32];
+        let signing_pub = [6u8; 32];
+        let token = pairing_token(&noise_pub, &signing_pub);
+        // token must be a non-empty string
+        assert!(!token.is_empty());
+        let (n, s, name) = decode_pairing_token(&token).expect("should decode");
+        assert_eq!(n, noise_pub);
+        assert_eq!(s, signing_pub);
+        // name is deterministic from signing_pub
+        assert!(!name.is_empty());
+        assert_eq!(name, device_name(&signing_pub));
     }
 }

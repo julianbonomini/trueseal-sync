@@ -393,11 +393,32 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
     // ── Pairing ───────────────────────────────────────────────────────────────
 
-    pub fn start_pairing(&self, on_paired: impl Fn(NoisePublicKey) + Send + 'static) -> Vec<u8> {
+    /// Opens a pairing window and returns a base64url token encoding
+    /// `noise_pub || signing_pub || device_name`.
+    /// The token is single-use and expires when the window closes.
+    pub fn pairing_token(&self) -> String {
+        self.pairing_token_with_duration(DEFAULT_PAIRING_WINDOW)
+    }
+
+    pub fn pairing_token_with_duration(&self, duration: Duration) -> String {
+        *self.pairing.lock().unwrap() = Some(PairingWindow {
+            deadline: Instant::now() + duration,
+            on_paired: Box::new(|_| {}),
+        });
+        let ks = self.keys.lock().unwrap();
+        crate::message::pairing_token(&ks.noise_pub.0, &ks.signing_pub.0)
+    }
+
+    /// Opens a pairing window and returns the raw 64-byte payload (noise_pub || signing_pub).
+    /// Kept for internal use by session tests.
+    pub(crate) fn start_pairing(
+        &self,
+        on_paired: impl Fn(NoisePublicKey) + Send + 'static,
+    ) -> Vec<u8> {
         self.start_pairing_with_duration(DEFAULT_PAIRING_WINDOW, on_paired)
     }
 
-    pub fn start_pairing_with_duration(
+    pub(crate) fn start_pairing_with_duration(
         &self,
         duration: Duration,
         on_paired: impl Fn(NoisePublicKey) + Send + 'static,
