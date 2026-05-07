@@ -3,6 +3,7 @@ use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ed25519_dalek::SigningKey;
 use hush_noise::keypair::Keypair as NoiseKeypair;
 use thiserror::Error;
 
@@ -10,10 +11,13 @@ use crate::device::DeviceKeypair;
 use crate::envelope::SigningKeypair;
 use crate::keys::NoisePublicKey;
 use crate::message::{pairing_payload, Message};
+use crate::operation_log::{MemLog, OperationLog};
 use crate::relay::RelayClient;
 
 /// Default pairing window duration (60 seconds, per ADR-0002).
 const DEFAULT_PAIRING_WINDOW: Duration = Duration::from_secs(60);
+/// Default reconnect backoff cap (ADR-0010).
+const DEFAULT_RECONNECT_CAP: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -45,68 +49,157 @@ impl PairingWindow {
 ///
 /// Transport-generic so tests can inject in-memory pipes.
 pub struct HushSession<T: Read + Write + Send + 'static> {
-    client: RelayClient<T>,
+    /// Current relay client — swapped under lock on reconnect.
+    client: Arc<Mutex<RelayClient<T>>>,
     signing: SigningKeypair,
-    noise_pub: NoisePublicKey,
+    /// Raw noise private key bytes — used to reconstruct NoiseKeypair on reconnect.
+    noise_priv: [u8; 32],
+    noise_pub_key: [u8; 32],
+    /// Raw signing key bytes — used to reconstruct SigningKeypair on reconnect.
+    signing_priv: [u8; 32],
+    pub noise_pub: NoisePublicKey,
     signing_pub: crate::keys::SigningPublicKey,
     sequence: Arc<Mutex<u64>>,
     pairing: Arc<Mutex<Option<PairingWindow>>>,
+    pub op_log: Arc<Mutex<Box<dyn OperationLog>>>,
 }
 
 impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// Connect to a relay over `transport` and start the session.
     ///
     /// `on_message` fires for every decrypted, verified Message delivered to this device.
-    /// When a `Message::Pair` arrives, call `accept_pair(noise_pub)` to admit the device
-    /// (only valid inside an open pairing window opened by `start_pairing()`).
     pub fn connect(
         transport: T,
         relay_pub: NoisePublicKey,
         keypair: DeviceKeypair,
         on_message: impl Fn(Message) + Send + 'static,
     ) -> Result<Self, SessionError> {
+        Self::connect_with_log(
+            transport,
+            relay_pub,
+            keypair,
+            on_message,
+            Box::new(MemLog::new()),
+        )
+    }
+
+    /// Connect with an explicit OperationLog for outbox persistence.
+    pub fn connect_with_log(
+        transport: T,
+        relay_pub: NoisePublicKey,
+        keypair: DeviceKeypair,
+        on_message: impl Fn(Message) + Send + 'static,
+        op_log: Box<dyn OperationLog>,
+    ) -> Result<Self, SessionError> {
+        let noise_priv = keypair.noise.private();
+        let noise_pub_key = keypair.noise.public_key;
+        let signing_priv = keypair.signing.to_bytes();
         let signing = keypair.signing_keypair();
         let noise_pub = keypair.public_key();
         let signing_pub = keypair.signing_public_key();
-        let noise_kp = NoiseKeypair::new(keypair.noise.private(), keypair.noise.public_key);
+        let noise_kp = NoiseKeypair::new(noise_priv, noise_pub_key);
         let client = RelayClient::connect(transport, relay_pub, noise_kp)
             .map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
-
         client.subscribe(on_message);
-
         Ok(Self {
-            client,
+            client: Arc::new(Mutex::new(client)),
             signing,
+            noise_priv,
+            noise_pub_key,
+            signing_priv,
             noise_pub,
             signing_pub,
             sequence: Arc::new(Mutex::new(0)),
             pairing: Arc::new(Mutex::new(None)),
+            op_log: Arc::new(Mutex::new(op_log)),
         })
     }
 
+    /// Connect with outbox + automatic reconnect.
+    /// `transport_factory` is called each time a reconnect is needed.
+    /// `reconnect_cap` caps the exponential backoff (default 30s if None).
+    pub fn connect_with_reconnect(
+        transport: T,
+        relay_pub: NoisePublicKey,
+        keypair: DeviceKeypair,
+        on_message: impl Fn(Message) + Send + 'static + Clone,
+        op_log: Box<dyn OperationLog>,
+        transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
+        reconnect_cap: Option<Duration>,
+    ) -> Result<Self, SessionError> {
+        let session =
+            Self::connect_with_log(transport, relay_pub, keypair, on_message.clone(), op_log)?;
+        let client_arc = session.client.clone();
+        let op_log_arc = session.op_log.clone();
+        let noise_priv = session.noise_priv;
+        let noise_pub_key = session.noise_pub_key;
+        let signing_priv = session.signing_priv;
+        let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
+        std::thread::spawn(move || {
+            reconnect_loop(
+                client_arc,
+                op_log_arc,
+                relay_pub,
+                noise_priv,
+                noise_pub_key,
+                signing_priv,
+                on_message,
+                Arc::new(transport_factory),
+                cap,
+            );
+        });
+        Ok(session)
+    }
+
     /// Encrypt `blob` and push it to `recipient_pub` as a Sync message.
-    /// Sequence counter increments monotonically per push.
+    /// Appends to the outbox before pushing; marks delivered on success.
+    /// If the relay is disconnected, the entry stays in the outbox for replay on reconnect.
     pub fn push_sync(
         &self,
         recipient_pub: NoisePublicKey,
         blob: Vec<u8>,
     ) -> Result<(), SessionError> {
-        let msg = Message::Sync { body: blob };
-        self.push_message(&msg, recipient_pub)
+        let msg = Message::Sync { body: blob.clone() };
+        let seq = {
+            let mut s = self.sequence.lock().unwrap();
+            let v = *s;
+            *s += 1;
+            v
+        };
+        let oid = recipient_pub.0;
+        self.op_log.lock().unwrap().append(&oid, seq, blob);
+
+        // Gate on connection: if disconnected, leave in outbox and return error.
+        let connected = self.client.lock().unwrap().is_connected();
+        if !connected {
+            return Err(SessionError::PushFailed("relay disconnected".into()));
+        }
+
+        let result =
+            self.client
+                .lock()
+                .unwrap()
+                .push(&msg, recipient_pub, seq, vec![], &self.signing);
+        if result.is_ok() {
+            self.op_log.lock().unwrap().mark_delivered(&oid, seq);
+        }
+        result.map_err(|e| SessionError::PushFailed(e.to_string()))
     }
 
-    fn push_message(
+    pub(crate) fn push_message(
         &self,
         msg: &Message,
         recipient_pub: NoisePublicKey,
     ) -> Result<(), SessionError> {
         let seq = {
             let mut s = self.sequence.lock().unwrap();
-            let current = *s;
+            let v = *s;
             *s += 1;
-            current
+            v
         };
         self.client
+            .lock()
+            .unwrap()
             .push(msg, recipient_pub, seq, vec![], &self.signing)
             .map_err(|e| SessionError::PushFailed(e.to_string()))
     }
@@ -163,6 +256,69 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     }
 }
 
+// ── Reconnect loop ────────────────────────────────────────────────────────────
+
+/// Polls for relay disconnect, backs off, reconnects, and replays the outbox.
+/// Runs in a background thread spawned by `connect_with_reconnect`.
+fn reconnect_loop<T: Read + Write + Send + 'static>(
+    client: Arc<Mutex<RelayClient<T>>>,
+    op_log: Arc<Mutex<Box<dyn OperationLog>>>,
+    relay_pub: NoisePublicKey,
+    noise_priv: [u8; 32],
+    noise_pub_key: [u8; 32],
+    signing_priv: [u8; 32],
+    on_message: impl Fn(Message) + Send + 'static + Clone,
+    factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
+    cap: Duration,
+) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let connected = client.lock().unwrap().is_connected();
+        if connected {
+            backoff = Duration::from_secs(1);
+            continue;
+        }
+        // Disconnected — apply backoff then attempt reconnect.
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(cap);
+
+        let transport = match (factory)() {
+            Ok(t) => t,
+            Err(_) => {
+                continue;
+            }
+        };
+        let noise_kp = NoiseKeypair::new(noise_priv, noise_pub_key);
+        let new_client = match RelayClient::connect(transport, relay_pub, noise_kp) {
+            Ok(c) => c,
+            Err(_) => {
+                continue;
+            }
+        };
+        new_client.subscribe(on_message.clone());
+        *client.lock().unwrap() = new_client;
+        backoff = Duration::from_secs(1);
+
+        // Replay undelivered outbox in ascending sequence order.
+        let signing = SigningKeypair::from_signing_key(SigningKey::from_bytes(&signing_priv));
+        let entries = op_log.lock().unwrap().undelivered_entries();
+        for entry in entries {
+            let oid = entry.object_id;
+            let recipient_pub = NoisePublicKey(oid);
+            let msg = Message::Sync { body: entry.blob };
+            let result =
+                client
+                    .lock()
+                    .unwrap()
+                    .push(&msg, recipient_pub, entry.sequence, vec![], &signing);
+            if result.is_ok() {
+                op_log.lock().unwrap().mark_delivered(&oid, entry.sequence);
+            }
+        }
+    }
+}
+
 // ── Concrete TCP constructor ──────────────────────────────────────────────────
 
 impl HushSession<TcpStream> {
@@ -186,6 +342,7 @@ mod tests {
     use crate::envelope::Envelope;
     use crate::keys::NoisePublicKey;
     use crate::message::Message;
+    use crate::operation_log::MemLog;
     use crate::relay::{frame, parse, MsgType};
     use hush_noise::{
         keypair::{generate_keypair, Keypair},
@@ -199,19 +356,30 @@ mod tests {
     struct MemPipe {
         read_buf: Arc<Mutex<Vec<u8>>>,
         write_buf: Arc<Mutex<Vec<u8>>>,
+        /// Set to true when the remote side is dropped — signals EOF on read.
+        closed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for MemPipe {
+        fn drop(&mut self) {
+            self.closed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     impl Read for MemPipe {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             let mut rb = self.read_buf.lock().unwrap();
-            if rb.is_empty() {
-                // Return WouldBlock so Session releases conn mutex before retrying.
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "buffer empty"));
+            if !rb.is_empty() {
+                let n = buf.len().min(rb.len());
+                buf[..n].copy_from_slice(&rb[..n]);
+                rb.drain(..n);
+                return Ok(n);
             }
-            let n = buf.len().min(rb.len());
-            buf[..n].copy_from_slice(&rb[..n]);
-            rb.drain(..n);
-            Ok(n)
+            if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(0); // EOF
+            }
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "buffer empty"))
         }
     }
 
@@ -228,15 +396,48 @@ mod tests {
     fn mem_pipe_pair() -> (MemPipe, MemPipe) {
         let ab = Arc::new(Mutex::new(Vec::new()));
         let ba = Arc::new(Mutex::new(Vec::new()));
+        let a_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let b_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         (
             MemPipe {
                 read_buf: ba.clone(),
                 write_buf: ab.clone(),
+                closed: b_closed.clone(),
             },
             MemPipe {
                 read_buf: ab.clone(),
                 write_buf: ba.clone(),
+                closed: a_closed.clone(),
             },
+        )
+    }
+
+    /// Like mem_pipe_pair but also returns handles to close each side explicitly.
+    /// Calling `close_a()` / `close_b()` signals EOF to the reader on the other side,
+    /// regardless of when the MemPipe itself is dropped.
+    fn mem_pipe_pair_with_close() -> (
+        MemPipe,
+        MemPipe,
+        Arc<std::sync::atomic::AtomicBool>, // close_a: set true to make pipe_b see EOF
+        Arc<std::sync::atomic::AtomicBool>, // close_b: set true to make pipe_a see EOF
+    ) {
+        let ab = Arc::new(Mutex::new(Vec::new()));
+        let ba = Arc::new(Mutex::new(Vec::new()));
+        let a_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let b_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            MemPipe {
+                read_buf: ba.clone(),
+                write_buf: ab.clone(),
+                closed: b_closed.clone(),
+            },
+            MemPipe {
+                read_buf: ab.clone(),
+                write_buf: ba.clone(),
+                closed: a_closed.clone(),
+            },
+            a_closed,
+            b_closed,
         )
     }
 
@@ -514,5 +715,139 @@ mod tests {
             !*on_paired_fired.lock().unwrap(),
             "on_paired must not fire after window timeout"
         );
+    }
+
+    /// push_sync appends to op_log and marks delivered on success.
+    #[test]
+    fn push_sync_appends_and_marks_delivered() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let (pipe_client, pipe_relay) = mem_pipe_pair();
+        {
+            let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+            std::thread::spawn(move || {
+                let s = accept(pipe_relay, relay_kp2).unwrap();
+                loop {
+                    if s.receive().is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        let device = DeviceKeypair::generate();
+        let recipient = DeviceKeypair::generate();
+        let session = HushSession::connect_with_log(
+            pipe_client,
+            relay_pub,
+            device,
+            |_| {},
+            Box::new(MemLog::new()),
+        )
+        .expect("should connect");
+
+        session
+            .push_sync(recipient.public_key(), b"hello".to_vec())
+            .expect("push");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let undelivered = session.op_log.lock().unwrap().undelivered_entries();
+        assert!(
+            undelivered.is_empty(),
+            "entry should be marked delivered after successful push"
+        );
+    }
+
+    /// Blobs pushed while relay is down are replayed after reconnect, in sequence order.
+    #[test]
+    fn undelivered_entries_replayed_after_reconnect() {
+        use std::sync::atomic::Ordering;
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+
+        // pipe1: first relay — accepts handshake; we'll close it explicitly after blobs are staged.
+        let (pipe1_client, pipe1_relay, _close_pipe1_relay_reader, close_pipe1_client_reader) =
+            mem_pipe_pair_with_close();
+        {
+            let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+            std::thread::spawn(move || {
+                let _s = accept(pipe1_relay, relay_kp2).unwrap();
+                // Keep alive until EOF.
+                std::thread::sleep(Duration::from_secs(10));
+            });
+        }
+
+        // pipe2: second relay — stays up and records received envelopes.
+        let (pipe2_client, pipe2_relay) = mem_pipe_pair();
+        let received_envs: Arc<Mutex<Vec<Envelope>>> = Arc::new(Mutex::new(Vec::new()));
+        let received_clone = received_envs.clone();
+        {
+            let relay_kp3 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+            std::thread::spawn(move || {
+                let s = accept(pipe2_relay, relay_kp3).unwrap();
+                loop {
+                    match s.receive() {
+                        Ok(raw) => {
+                            if let Some((MsgType::Push, body)) = parse(&raw) {
+                                if let Ok(env) = Envelope::decode(body) {
+                                    received_clone.lock().unwrap().push(env);
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+
+        // Factory yields pipe2_client exactly once.
+        let pipe2_slot: Arc<Mutex<Option<MemPipe>>> = Arc::new(Mutex::new(Some(pipe2_client)));
+        let pipe2_slot2 = pipe2_slot.clone();
+
+        let device = DeviceKeypair::generate();
+        let recipient = DeviceKeypair::generate();
+
+        let session = HushSession::connect_with_reconnect(
+            pipe1_client,
+            relay_pub,
+            device,
+            |_| {},
+            Box::new(MemLog::new()),
+            move || {
+                pipe2_slot2
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| "exhausted".to_string())
+            },
+            Some(Duration::from_millis(50)),
+        )
+        .expect("initial connect");
+
+        // Close pipe1 from the client side — this makes the client's recv thread see EOF,
+        // causing run_loop to exit and is_connected() to return false.
+        close_pipe1_client_reader.store(true, Ordering::Release);
+
+        // Wait for the run_loop to detect EOF and exit (recv thread → dispatch → exit).
+        std::thread::sleep(Duration::from_millis(300));
+
+        // Push 3 blobs — relay is now gone (send channel closed) so they sit in outbox.
+        let _r1 = session.push_sync(recipient.public_key(), b"blob1".to_vec());
+        let _r2 = session.push_sync(recipient.public_key(), b"blob2".to_vec());
+        let _r3 = session.push_sync(recipient.public_key(), b"blob3".to_vec());
+
+        // Wait for: disconnect detection (50ms poll) + backoff (1s) + relay round trip.
+        std::thread::sleep(Duration::from_millis(1500));
+
+        let envs = received_envs.lock().unwrap();
+        assert_eq!(
+            envs.len(),
+            3,
+            "all 3 blobs should be replayed after reconnect"
+        );
+        assert!(
+            envs[0].sequence < envs[1].sequence,
+            "must be in ascending sequence order"
+        );
+        assert!(envs[1].sequence < envs[2].sequence);
     }
 }

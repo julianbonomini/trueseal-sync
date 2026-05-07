@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -81,6 +82,8 @@ pub struct RelayClient<T: Read + Write + Send + 'static> {
     /// Channel for sending pre-encoded push frames to the run thread.
     push_tx: mpsc::SyncSender<PushBytes>,
     callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message) + Send + 'static>>>>,
+    /// True while the background run loop is alive; set to false when relay disconnects.
+    is_connected: Arc<AtomicBool>,
     _transport: PhantomData<T>,
 }
 
@@ -107,14 +110,24 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
             Arc::new(Mutex::new(Vec::new()));
         let callbacks_clone = callbacks.clone();
 
+        let is_connected = Arc::new(AtomicBool::new(true));
+        let is_connected_clone = is_connected.clone();
+
         // run() thread owns the Session exclusively — no shared lock needed.
         std::thread::spawn(move || {
-            run_loop(session, push_rx, callbacks_clone, my_noise_priv);
+            run_loop(
+                session,
+                push_rx,
+                callbacks_clone,
+                my_noise_priv,
+                is_connected_clone,
+            );
         });
 
         Ok(Self {
             push_tx,
             callbacks,
+            is_connected,
             _transport: PhantomData,
         })
     }
@@ -144,6 +157,12 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         self.callbacks.lock().unwrap().push(Box::new(callback));
     }
 
+    /// Returns true while the background run loop is alive (relay connected).
+    /// Becomes false when the relay disconnects or the transport fails.
+    pub fn is_connected(&self) -> bool {
+        self.is_connected.load(Ordering::Acquire)
+    }
+
     /// Blocking receive loop — now a no-op since run() is started automatically in connect().
     /// Kept for API compatibility; returns immediately.
     ///
@@ -163,6 +182,7 @@ fn run_loop<T: Read + Write + Send + 'static>(
     push_rx: mpsc::Receiver<PushBytes>,
     callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message) + Send + 'static>>>>,
     my_noise_priv: [u8; 32],
+    is_connected: Arc<AtomicBool>,
 ) {
     // We need to interleave: check for pending pushes, then do one receive.
     // Since receive() blocks until a message arrives, we wrap the session in a
@@ -230,6 +250,8 @@ fn run_loop<T: Read + Write + Send + 'static>(
             }
         }
     }
+    // Signal that the relay connection has been lost.
+    is_connected.store(false, Ordering::Release);
 }
 
 // ── Convenience constructor for TCP connections ──────────────────────────────
@@ -268,20 +290,29 @@ mod tests {
     struct MemPipe {
         read_buf: Arc<Mutex<Vec<u8>>>,
         write_buf: Arc<Mutex<Vec<u8>>>,
+        closed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for MemPipe {
+        fn drop(&mut self) {
+            self.closed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     impl Read for MemPipe {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             let mut rb = self.read_buf.lock().unwrap();
-            if rb.is_empty() {
-                // Return WouldBlock so Session releases conn mutex before retrying.
-                // This prevents deadlock when concurrent send() and receive() share conn.
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "buffer empty"));
+            if !rb.is_empty() {
+                let n = buf.len().min(rb.len());
+                buf[..n].copy_from_slice(&rb[..n]);
+                rb.drain(..n);
+                return Ok(n);
             }
-            let n = buf.len().min(rb.len());
-            buf[..n].copy_from_slice(&rb[..n]);
-            rb.drain(..n);
-            Ok(n)
+            if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Ok(0); // EOF
+            }
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "buffer empty"))
         }
     }
 
@@ -298,14 +329,18 @@ mod tests {
     fn mem_pipe_pair() -> (MemPipe, MemPipe) {
         let ab = Arc::new(Mutex::new(Vec::new()));
         let ba = Arc::new(Mutex::new(Vec::new()));
+        let a_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let b_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         (
             MemPipe {
                 read_buf: ba.clone(),
                 write_buf: ab.clone(),
+                closed: b_closed.clone(),
             },
             MemPipe {
                 read_buf: ab.clone(),
                 write_buf: ba.clone(),
+                closed: a_closed.clone(),
             },
         )
     }
