@@ -1,0 +1,9 @@
+wing: hush
+rooms:
+- name: hush_sync
+  description: Files from hush-sync/
+  keywords:
+  - hush_sync
+  - hush-sync
+  - sync engine
+  - pairing

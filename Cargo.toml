@@ -1,0 +1,24 @@
+[package]
+name = "hush-sync"
+version = "0.1.0"
+edition = "2021"
+description = "E2EE sync engine built on hush-noise"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+thiserror = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+prost = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"
+protox = "0.7"

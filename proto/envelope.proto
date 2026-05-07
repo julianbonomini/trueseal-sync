@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package hush.sync.v0;
+
+// Envelope is the wire format for all sync traffic in hush-sync.
+// It is the only thing the Relay ever sees. The Relay uses recipient_pub
+// for routing and sequence for ordering. All other fields are forwarded
+// blindly — the Relay never decrypts or interprets them.
+//
+// Callers embed object identity, type, schema version, and any other
+// application-level metadata inside the encrypted payload. The Relay
+// has no knowledge of any of it.
+message Envelope {
+  // Device-scoped monotonic counter. Used by the Relay to order Envelopes
+  // within a recipient's Inbox.
+  uint64 sequence = 1;
+
+  // Hashes (SHA-256) of parent Envelopes in the Operation Log.
+  // Empty for the root Envelope. Exactly one entry in v0.
+  // Multiple entries are valid in v1 to express DAG merge points (ADR-0004).
+  repeated bytes parents = 2;
+
+  // X25519 public key of the recipient Device. The Relay routes to the
+  // Inbox identified by this key. 32 bytes.
+  bytes recipient_pub = 3;
+
+  // X25519 public key of the sending Device. Recipients use this to
+  // verify the signature. Never used by the Relay (ADR-0007). 32 bytes.
+  bytes author_pub = 4;
+
+  // Ed25519 signature over the canonical encoding of:
+  //   sequence || parents || recipient_pub || author_pub
+  // Signed by the author's Ed25519 private key.
+  // Verified by recipients only — the Relay forwards this blindly (ADR-0007).
+  // 64 bytes.
+  bytes signature = 5;
+
+  // Addressed-encrypted payload. Encrypted with crypto::encrypt(recipient_pub, plaintext).
+  // Opaque to the Relay. Callers embed object identity, type, and schema
+  // version inside the plaintext before encrypting.
+  bytes payload = 6;
+}
