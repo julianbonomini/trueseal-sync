@@ -5,30 +5,27 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use hush_noise::keypair::Keypair as NoiseKeypair;
 
+use crate::device::DeviceKeypair;
 use crate::envelope::SigningKeypair;
 use crate::keys::NoisePublicKey;
+use crate::manifest::GroupManifest;
 use crate::message::Message;
 use crate::operation_log::OperationLog;
 use crate::relay::RelayClient;
-use crate::revocation::{handle_revoke_by_signing_pub, PairedList};
 
 use super::KeyState;
 
 /// Polls for relay disconnect, backs off, reconnects, and replays the outbox.
 /// Runs in a background thread spawned by `connect_with_reconnect`.
-///
-/// `paired` and `on_keypair_rotated` are passed so that after each reconnect
-/// the full revocation-aware subscription (identical to `connect_with_log`) is
-/// reinstalled.  Without this, a `Message::Revoke` arriving after a reconnect
-/// would bypass the revocation handler and be forwarded raw to the caller.
 pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     client: Arc<Mutex<RelayClient<T>>>,
     op_log: Arc<Mutex<Box<dyn OperationLog>>>,
     relay_pub: NoisePublicKey,
     keys: Arc<Mutex<KeyState>>,
-    paired: Arc<Mutex<PairedList>>,
+    manifest: Arc<Mutex<Option<GroupManifest>>>,
     on_message: impl Fn(Message, [u8; 32]) + Send + 'static + Clone,
     on_keypair_rotated: Arc<dyn Fn([u8; 64]) + Send + Sync + 'static>,
+    on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
 ) {
@@ -60,26 +57,66 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             Err(_) => continue,
         };
 
-        // Reinstall the full revocation-aware subscription — mirrors connect_with_log.
+        // Reinstall the full manifest-aware subscription — mirrors connect_full.
         {
             let keys_cb = keys.clone();
-            let paired_cb = paired.clone();
+            let manifest_cb = manifest.clone();
             let on_kpr_cb = on_keypair_rotated.clone();
+            let on_rfg_cb = on_removed_from_group.clone();
             let on_message = on_message.clone();
             new_client.subscribe(move |msg, author_signing_pub| {
+                // Manifest-based inbound filtering.
+                {
+                    let guard = manifest_cb.lock().unwrap();
+                    if let Some(ref m) = *guard {
+                        if !m.contains_signing_pub(&author_signing_pub) {
+                            return;
+                        }
+                    }
+                }
+
                 if let Message::Revoke = &msg {
-                    if let Some(new_kp) = handle_revoke_by_signing_pub(
-                        &mut paired_cb.lock().unwrap(),
-                        &author_signing_pub,
-                    ) {
+                    let maybe_kp = {
+                        let guard = manifest_cb.lock().unwrap();
+                        if let Some(ref m) = *guard {
+                            if m.contains_signing_pub(&author_signing_pub) {
+                                Some(DeviceKeypair::generate())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(new_kp) = maybe_kp {
+                        *manifest_cb.lock().unwrap() = None;
                         let mut rotated = [0u8; 64];
                         rotated[..32].copy_from_slice(&new_kp.noise.private());
                         rotated[32..].copy_from_slice(&new_kp.signing.to_bytes());
                         *keys_cb.lock().unwrap() = KeyState::from_keypair(&new_kp);
                         (on_kpr_cb)(rotated);
                     }
-                    return; // never forward Revoke to caller
+                    return;
                 }
+
+                if let Message::GroupManifest { manifest: incoming } = &msg {
+                    let local_signing_pub = keys_cb.lock().unwrap().signing_pub.0;
+                    let mut guard = manifest_cb.lock().unwrap();
+                    let accept = match *guard {
+                        None => incoming.verify(None).is_ok(),
+                        Some(ref current) => incoming.verify(Some(current)).is_ok(),
+                    };
+                    if accept {
+                        let excluded = !incoming.contains_signing_pub(&local_signing_pub);
+                        *guard = Some(incoming.clone());
+                        drop(guard);
+                        if excluded {
+                            (on_rfg_cb)();
+                        }
+                    }
+                    return;
+                }
+
                 on_message(msg, author_signing_pub);
             });
         }

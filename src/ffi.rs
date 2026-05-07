@@ -108,13 +108,13 @@ impl HushFfiSession {
             .map_err(|e| SessionError::ConnectionFailed { msg: e.to_string() })?;
 
         // Late-bind slot: filled after the session is built so the on_message
-        // closure can look up sender noise pub from the session's paired list.
-        let paired_slot: Arc<Mutex<Option<Arc<Mutex<crate::revocation::PairedList>>>>> =
+        // closure can look up sender noise pub from the session's manifest.
+        let manifest_slot: Arc<Mutex<Option<Arc<Mutex<Option<crate::manifest::GroupManifest>>>>>> =
             Arc::new(Mutex::new(None));
         // Wrap callbacks in Arc so the on_message closure can be Clone
         // (required by connect_with_reconnect for the reconnect loop).
         let on_message = Arc::new(on_message);
-        let paired_slot_cb = paired_slot.clone();
+        let manifest_slot_cb = manifest_slot.clone();
 
         let relay_addr_factory = relay_addr.clone();
         let inner = HushSession::connect_with_reconnect(
@@ -123,12 +123,19 @@ impl HushFfiSession {
             keypair,
             move |msg, author_signing_pub| {
                 if let Message::Sync { body } = msg {
-                    let sender_noise_pub = paired_slot_cb
+                    let sender_noise_pub = manifest_slot_cb
                         .lock()
                         .unwrap()
                         .as_ref()
-                        .and_then(|p| p.lock().unwrap().noise_pub_for_signing(&author_signing_pub))
-                        .map(|k| k.0.to_vec())
+                        .and_then(|m| {
+                            m.lock()
+                                .unwrap()
+                                .as_ref()
+                                .and_then(|manifest| {
+                                    manifest.noise_pub_for_signing(&author_signing_pub)
+                                })
+                                .map(|k| k.0.to_vec())
+                        })
                         .unwrap_or_default();
                     on_message.on_message(body, sender_noise_pub);
                 }
@@ -142,8 +149,8 @@ impl HushFfiSession {
         )
         .map_err(SessionError::from)?;
 
-        // Wire the paired list into the closure's slot now that the session exists.
-        *paired_slot.lock().unwrap() = Some(inner.paired.clone());
+        // Wire the manifest arc into the closure's slot now that the session exists.
+        *manifest_slot.lock().unwrap() = Some(inner.manifest.clone());
 
         Ok(Arc::new(Self { inner }))
     }

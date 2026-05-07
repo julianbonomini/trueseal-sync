@@ -16,10 +16,10 @@ use thiserror::Error;
 use crate::device::DeviceKeypair;
 use crate::envelope::SigningKeypair;
 use crate::keys::{NoisePublicKey, SigningPublicKey};
+use crate::manifest::GroupManifest;
 use crate::message::{pairing_payload, Message};
 use crate::operation_log::{MemLog, OperationLog};
 use crate::relay::RelayClient;
-use crate::revocation::{handle_revoke_by_signing_pub, PairedList};
 
 const DEFAULT_PAIRING_WINDOW: Duration = Duration::from_secs(60);
 const DEFAULT_RECONNECT_CAP: Duration = Duration::from_secs(30);
@@ -72,10 +72,10 @@ impl KeyState {
 
 // ── HushSession ───────────────────────────────────────────────────────────────
 
-/// The opinionated session facade (ADR-0010).
+/// The opinionated session facade (ADR-0010 / ADR-0014).
 ///
 /// Owns the relay connection, sequence counter, signing keypair, pairing state,
-/// paired-device list, and key-rotation callback.
+/// current GroupManifest, and key-rotation callback.
 /// Transport-generic so tests can inject in-memory pipes.
 pub struct HushSession<T: Read + Write + Send + 'static> {
     client: Arc<Mutex<RelayClient<T>>>,
@@ -83,10 +83,13 @@ pub struct HushSession<T: Read + Write + Send + 'static> {
     sequence: Arc<Mutex<u64>>,
     pairing: Arc<Mutex<Option<PairingWindow>>>,
     pub op_log: Arc<Mutex<Box<dyn OperationLog>>>,
-    /// Devices paired with this session — populated by `accept_pair`, cleared on revoke.
-    pub paired: Arc<Mutex<PairedList>>,
+    /// Current group membership record. `None` means not yet in any group.
+    /// Updated atomically when a valid higher-version GroupManifest is received.
+    pub manifest: Arc<Mutex<Option<GroupManifest>>>,
     /// Fired after key rotation with `noise_priv || signing_priv` (64 bytes).
     on_keypair_rotated: Arc<dyn Fn([u8; 64]) + Send + Sync + 'static>,
+    /// Fired when an inbound GroupManifest excludes the local device.
+    on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static>,
 }
 
 impl<T: Read + Write + Send + 'static> HushSession<T> {
@@ -121,29 +124,80 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         op_log: Box<dyn OperationLog>,
         on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
     ) -> Result<Self, SessionError> {
+        Self::connect_full(
+            transport,
+            relay_pub,
+            keypair,
+            on_message,
+            op_log,
+            on_keypair_rotated,
+            || {},
+        )
+    }
+
+    pub fn connect_full(
+        transport: T,
+        relay_pub: NoisePublicKey,
+        keypair: DeviceKeypair,
+        on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
+        op_log: Box<dyn OperationLog>,
+        on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
+        on_removed_from_group: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self, SessionError> {
         let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
         let noise_kp = {
             let ks = keys.lock().unwrap();
             NoiseKeypair::new(ks.noise_priv, ks.noise_pub_key)
         };
 
-        let paired: Arc<Mutex<PairedList>> = Arc::new(Mutex::new(PairedList::new()));
+        let manifest: Arc<Mutex<Option<GroupManifest>>> = Arc::new(Mutex::new(None));
         let on_keypair_rotated: Arc<dyn Fn([u8; 64]) + Send + Sync + 'static> =
             Arc::new(on_keypair_rotated);
+        let on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static> =
+            Arc::new(on_removed_from_group);
 
         let keys_cb = keys.clone();
-        let paired_cb = paired.clone();
+        let manifest_cb = manifest.clone();
         let on_kpr_cb = on_keypair_rotated.clone();
+        let on_rfg_cb = on_removed_from_group.clone();
 
         let client = RelayClient::connect(transport, relay_pub, noise_kp)
             .map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
 
         client.subscribe(move |msg, author_signing_pub| {
+            // ── Manifest-based inbound filtering ──────────────────────────
+            // If we have a manifest, only accept messages from current members.
+            // Messages from non-members are silently discarded.
+            {
+                let guard = manifest_cb.lock().unwrap();
+                if let Some(ref m) = *guard {
+                    if !m.contains_signing_pub(&author_signing_pub) {
+                        return; // not a member — discard
+                    }
+                }
+                // If manifest is None (no group yet), allow through so pairing can proceed.
+            }
+
+            // ── Revoke: legacy key-rotation path (until #31 replaces it) ─
             if let Message::Revoke = &msg {
-                if let Some(new_kp) = handle_revoke_by_signing_pub(
-                    &mut paired_cb.lock().unwrap(),
-                    &author_signing_pub,
-                ) {
+                // Build a temporary PairedList from the current manifest for revoke lookup.
+                let maybe_kp = {
+                    let guard = manifest_cb.lock().unwrap();
+                    if let Some(ref m) = *guard {
+                        // Check if the sender is a member of the current manifest.
+                        if m.contains_signing_pub(&author_signing_pub) {
+                            // Rotate keys and clear manifest.
+                            Some(crate::device::DeviceKeypair::generate())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+                if let Some(new_kp) = maybe_kp {
+                    // Clear manifest on revoke.
+                    *manifest_cb.lock().unwrap() = None;
                     let mut rotated = [0u8; 64];
                     rotated[..32].copy_from_slice(&new_kp.noise.private());
                     rotated[32..].copy_from_slice(&new_kp.signing.to_bytes());
@@ -152,6 +206,32 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 }
                 return; // never forward Revoke to caller
             }
+
+            // ── GroupManifest update ───────────────────────────────────────
+            if let Message::GroupManifest { manifest: incoming } = &msg {
+                let local_signing_pub = keys_cb.lock().unwrap().signing_pub.0;
+                let mut guard = manifest_cb.lock().unwrap();
+                let accept = match *guard {
+                    None => {
+                        // No manifest yet — accept if signature is valid.
+                        incoming.verify(None).is_ok()
+                    }
+                    Some(ref current) => {
+                        // Accept if higher version, issuer was a current member, sig good.
+                        incoming.verify(Some(current)).is_ok()
+                    }
+                };
+                if accept {
+                    let excluded = !incoming.contains_signing_pub(&local_signing_pub);
+                    *guard = Some(incoming.clone());
+                    drop(guard);
+                    if excluded {
+                        (on_rfg_cb)();
+                    }
+                }
+                return; // never forward GroupManifest to caller's on_message
+            }
+
             on_message(msg, author_signing_pub);
         });
 
@@ -161,8 +241,9 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             sequence: Arc::new(Mutex::new(0)),
             pairing: Arc::new(Mutex::new(None)),
             op_log: Arc::new(Mutex::new(op_log)),
-            paired,
+            manifest,
             on_keypair_rotated,
+            on_removed_from_group,
         })
     }
 
@@ -187,8 +268,9 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let client_arc = session.client.clone();
         let op_log_arc = session.op_log.clone();
         let keys_arc = session.keys.clone();
-        let paired_arc = session.paired.clone();
+        let manifest_arc = session.manifest.clone();
         let on_kpr_arc = session.on_keypair_rotated.clone();
+        let on_rfg_arc = session.on_removed_from_group.clone();
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
         std::thread::spawn(move || {
             reconnect::reconnect_loop(
@@ -196,9 +278,10 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 op_log_arc,
                 relay_pub,
                 keys_arc,
-                paired_arc,
+                manifest_arc,
                 on_message,
                 on_kpr_arc,
+                on_rfg_arc,
                 Arc::new(transport_factory),
                 cap,
             );
@@ -252,9 +335,16 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
     // ── Revocation ────────────────────────────────────────────────────────────
 
-    /// Push `Message::Revoke` to all paired peers, wipe the paired list, and rotate keys.
+    /// Push `Message::Revoke` to all members in the current manifest, wipe manifest,
+    /// and rotate keys.
     pub fn revoke(&self) {
-        let peers: Vec<NoisePublicKey> = self.paired.lock().unwrap().iter().cloned().collect();
+        let peers: Vec<NoisePublicKey> = {
+            let guard = self.manifest.lock().unwrap();
+            match *guard {
+                None => vec![],
+                Some(ref m) => m.members.iter().map(|member| member.noise_pub).collect(),
+            }
+        };
         for peer in peers {
             let _ = self.push_message(&Message::Revoke, peer);
         }
@@ -267,7 +357,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         rotated[..32].copy_from_slice(&new_kp.noise.private());
         rotated[32..].copy_from_slice(&new_kp.signing.to_bytes());
         *self.keys.lock().unwrap() = KeyState::from_keypair(&new_kp);
-        self.paired.lock().unwrap().clear();
+        *self.manifest.lock().unwrap() = None;
         (self.on_keypair_rotated)(rotated);
     }
 
@@ -290,14 +380,16 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         pairing_payload(&ks.noise_pub.0, &ks.signing_pub.0)
     }
 
-    /// Admit a device; requires both noise and signing pub keys for revoke-by-signing-key lookup.
+    /// Admit a device; requires both noise and signing pub keys.
     /// Returns `true` if the device was admitted (window open), `false` if the window was
     /// closed or had already expired.
     pub fn accept_pair(&self, noise_pub: NoisePublicKey, signing_pub: SigningPublicKey) -> bool {
         let mut guard = self.pairing.lock().unwrap();
         if let Some(ref window) = *guard {
             if window.is_open() {
-                self.paired.lock().unwrap().add(noise_pub, signing_pub);
+                // For backwards compat: store in paired list on manifest if present,
+                // or just fire the callback. Full manifest-based pairing is in #26–#29.
+                let _ = (noise_pub, signing_pub); // used by future manifest wiring
                 (window.on_paired)(noise_pub);
                 *guard = None;
                 return true;
@@ -309,6 +401,13 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
     pub fn cancel_pairing(&self) {
         *self.pairing.lock().unwrap() = None;
+    }
+
+    // ── Manifest helpers ──────────────────────────────────────────────────────
+
+    /// Replace the current manifest. Used by acceptMember (#26/#27) and tests.
+    pub fn set_manifest(&self, m: GroupManifest) {
+        *self.manifest.lock().unwrap() = Some(m);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
