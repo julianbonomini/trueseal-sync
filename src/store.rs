@@ -1,6 +1,8 @@
 use std::path::Path;
 use thiserror::Error;
 
+use crate::operation_log::{LogEntry, OperationLog};
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlite error: {0}")]
@@ -41,8 +43,11 @@ impl Store {
                  data    BLOB NOT NULL
              );
              CREATE TABLE IF NOT EXISTS outbox (
-                 seq     INTEGER PRIMARY KEY AUTOINCREMENT,
-                 payload BLOB NOT NULL
+                 object_id  BLOB    NOT NULL,
+                 sequence   INTEGER NOT NULL,
+                 blob       BLOB    NOT NULL,
+                 delivered  INTEGER NOT NULL DEFAULT 0,
+                 UNIQUE(object_id, sequence) ON CONFLICT IGNORE
              );
              COMMIT;",
         )?;
@@ -140,36 +145,94 @@ impl Store {
             Err(e) => Err(e.into()),
         }
     }
+}
 
-    // --- outbox ---
+// ── PersistentLog ─────────────────────────────────────────────────────────────
 
-    /// Append a payload to the outbox. Returns the assigned sequence number.
-    pub fn push_outbox(&self, payload: &[u8]) -> Result<i64, StoreError> {
-        self.conn.execute(
-            "INSERT INTO outbox (payload) VALUES (?1)",
-            rusqlite::params![payload],
-        )?;
-        Ok(self.conn.last_insert_rowid())
+/// SQLite-backed `OperationLog`. Wraps a `Store` and persists all outbox
+/// entries across process restarts.
+pub struct PersistentLog {
+    store: Store,
+}
+
+impl PersistentLog {
+    pub fn new(store: Store) -> Self {
+        Self { store }
+    }
+}
+
+impl OperationLog for PersistentLog {
+    fn append(&mut self, object_id: &[u8; 32], sequence: u64, blob: Vec<u8>) {
+        // UNIQUE(object_id, sequence) ON CONFLICT IGNORE — duplicate is a no-op.
+        let _ = self.store.conn.execute(
+            "INSERT INTO outbox (object_id, sequence, blob, delivered)
+             VALUES (?1, ?2, ?3, 0)",
+            rusqlite::params![object_id.as_slice(), sequence as i64, blob.as_slice()],
+        );
     }
 
-    /// Return all outbox entries in insertion order as `(seq, payload)` pairs.
-    pub fn drain_outbox(&self) -> Result<Vec<(i64, Vec<u8>)>, StoreError> {
+    fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64) {
+        let _ = self.store.conn.execute(
+            "UPDATE outbox SET delivered = 1
+             WHERE object_id = ?1 AND sequence = ?2",
+            rusqlite::params![object_id.as_slice(), sequence as i64],
+        );
+    }
+
+    fn undelivered_entries(&self) -> Vec<LogEntry> {
         let mut stmt = self
+            .store
             .conn
-            .prepare("SELECT seq, payload FROM outbox ORDER BY seq ASC")?;
-        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
+            .prepare(
+                "SELECT object_id, sequence, blob FROM outbox
+                 WHERE delivered = 0 ORDER BY sequence ASC",
+            )
+            .expect("prepare undelivered");
+        let rows = stmt
+            .query_map([], |row| {
+                let oid: Vec<u8> = row.get(0)?;
+                let seq: i64 = row.get(1)?;
+                let blob: Vec<u8> = row.get(2)?;
+                Ok((oid, seq as u64, blob))
+            })
+            .expect("query undelivered");
+        rows.filter_map(|r| r.ok())
+            .filter_map(|(oid, sequence, blob)| {
+                let object_id: [u8; 32] = oid.try_into().ok()?;
+                Some(LogEntry {
+                    object_id,
+                    sequence,
+                    blob,
+                })
+            })
+            .collect()
     }
 
-    /// Remove a single outbox entry by sequence number (after successful delivery).
-    pub fn remove_outbox_entry(&self, seq: i64) -> Result<(), StoreError> {
-        self.conn
-            .execute("DELETE FROM outbox WHERE seq = ?1", rusqlite::params![seq])?;
-        Ok(())
+    fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<LogEntry> {
+        let mut stmt = self
+            .store
+            .conn
+            .prepare(
+                "SELECT sequence, blob FROM outbox
+                 WHERE object_id = ?1 AND sequence >= ?2
+                 ORDER BY sequence ASC",
+            )
+            .expect("prepare entries_from");
+        let oid_slice: &[u8] = object_id.as_slice();
+        let rows = stmt
+            .query_map(rusqlite::params![oid_slice, sequence as i64], |row| {
+                let seq: i64 = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((seq as u64, blob))
+            })
+            .expect("query entries_from");
+        rows.filter_map(|r| r.ok())
+            .map(|(seq, blob)| LogEntry {
+                object_id: *object_id,
+                sequence: seq,
+                blob,
+            })
+            .collect()
     }
 }
 
@@ -208,13 +271,20 @@ mod tests {
         s.save_identity(&[1u8; 32], &[2u8; 32]).expect("save id");
         s.save_manifest(b"some manifest bytes")
             .expect("save manifest");
-        s.push_outbox(b"msg1").expect("push");
+        // Add an outbox entry via PersistentLog
+        let s2 = Store::open(dir.path(), "ns").expect("open2");
+        let mut log = PersistentLog::new(s2);
+        log.append(&[0u8; 32], 0, b"msg1".to_vec());
+        drop(log);
 
         s.wipe().expect("wipe");
 
         assert!(s.load_identity().expect("load id").is_none());
         assert!(s.load_manifest().expect("load manifest").is_none());
-        assert!(s.drain_outbox().expect("drain").is_empty());
+        // Reopen and check outbox is empty
+        let s3 = Store::open(dir.path(), "ns").expect("open3");
+        let log2 = PersistentLog::new(s3);
+        assert!(log2.undelivered_entries().is_empty());
     }
 
     /// Identity round-trips through save and load.
@@ -259,35 +329,160 @@ mod tests {
     fn outbox_preserves_insertion_order() {
         let dir = tmp_dir();
         let s = Store::open(dir.path(), "ns").expect("open");
-        s.push_outbox(b"first").expect("push 1");
-        s.push_outbox(b"second").expect("push 2");
-        s.push_outbox(b"third").expect("push 3");
-        let entries = s.drain_outbox().expect("drain");
+        let mut log = PersistentLog::new(s);
+        log.append(&[1u8; 32], 0, b"first".to_vec());
+        log.append(&[1u8; 32], 1, b"second".to_vec());
+        log.append(&[1u8; 32], 2, b"third".to_vec());
+        let entries = log.undelivered_entries();
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].1, b"first");
-        assert_eq!(entries[1].1, b"second");
-        assert_eq!(entries[2].1, b"third");
+        assert_eq!(entries[0].blob, b"first");
+        assert_eq!(entries[1].blob, b"second");
+        assert_eq!(entries[2].blob, b"third");
     }
 
-    /// Removing an outbox entry by seq leaves the rest intact.
+    /// Marking an entry delivered removes it from undelivered but keeps it in entries_from.
     #[test]
     fn remove_outbox_entry_leaves_others() {
         let dir = tmp_dir();
         let s = Store::open(dir.path(), "ns").expect("open");
-        let seq1 = s.push_outbox(b"keep").expect("push");
-        let seq2 = s.push_outbox(b"remove").expect("push");
-        s.remove_outbox_entry(seq2).expect("remove");
-        let entries = s.drain_outbox().expect("drain");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, seq1);
-        assert_eq!(entries[0].1, b"keep");
+        let mut log = PersistentLog::new(s);
+        log.append(&[1u8; 32], 0, b"keep".to_vec());
+        log.append(&[1u8; 32], 1, b"deliver".to_vec());
+        log.mark_delivered(&[1u8; 32], 1);
+        let undelivered = log.undelivered_entries();
+        assert_eq!(undelivered.len(), 1);
+        assert_eq!(undelivered[0].blob, b"keep");
+        // entries_from still returns both
+        let all = log.entries_from(&[1u8; 32], 0);
+        assert_eq!(all.len(), 2);
     }
 
-    /// drain_outbox on an empty store returns an empty vec.
+    /// undelivered_entries on an empty store returns an empty vec.
     #[test]
     fn drain_empty_outbox_returns_empty() {
         let dir = tmp_dir();
         let s = Store::open(dir.path(), "ns").expect("open");
-        assert!(s.drain_outbox().expect("drain").is_empty());
+        let log = PersistentLog::new(s);
+        assert!(log.undelivered_entries().is_empty());
+    }
+
+    // ── PersistentLog tests ────────────────────────────────────────────────────
+
+    use crate::operation_log::OperationLog;
+
+    fn oid(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    /// Tracer bullet: append one entry and retrieve it via entries_from.
+    #[test]
+    fn persistent_log_append_and_retrieve() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.append(&oid(1), 0, b"hello".to_vec());
+        let entries = log.entries_from(&oid(1), 0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].sequence, 0);
+        assert_eq!(entries[0].blob, b"hello");
+        assert_eq!(entries[0].object_id, oid(1));
+    }
+
+    /// Duplicate (object_id, sequence) append is silently ignored — first-write wins.
+    #[test]
+    fn persistent_log_duplicate_sequence_ignored() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.append(&oid(1), 5, b"original".to_vec());
+        log.append(&oid(1), 5, b"overwrite attempt".to_vec());
+        let entries = log.entries_from(&oid(1), 5);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].blob, b"original");
+    }
+
+    /// Freshly appended entries appear in undelivered_entries.
+    #[test]
+    fn persistent_log_appended_entries_are_undelivered() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.append(&oid(1), 0, b"a".to_vec());
+        log.append(&oid(2), 1, b"b".to_vec());
+        let undelivered = log.undelivered_entries();
+        assert_eq!(undelivered.len(), 2);
+    }
+
+    /// undelivered_entries are sorted by global sequence ascending.
+    #[test]
+    fn persistent_log_undelivered_sorted_by_sequence() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.append(&oid(1), 3, b"c".to_vec());
+        log.append(&oid(2), 1, b"a".to_vec());
+        log.append(&oid(1), 2, b"b".to_vec());
+        let seqs: Vec<u64> = log
+            .undelivered_entries()
+            .iter()
+            .map(|e| e.sequence)
+            .collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    /// mark_delivered removes an entry from undelivered_entries.
+    #[test]
+    fn persistent_log_mark_delivered_clears_from_outbox() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.append(&oid(1), 0, b"msg".to_vec());
+        log.mark_delivered(&oid(1), 0);
+        assert!(log.undelivered_entries().is_empty());
+    }
+
+    /// mark_delivered does not remove entry from entries_from.
+    #[test]
+    fn persistent_log_mark_delivered_does_not_affect_entries_from() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.append(&oid(1), 0, b"msg".to_vec());
+        log.mark_delivered(&oid(1), 0);
+        let entries = log.entries_from(&oid(1), 0);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].blob, b"msg");
+    }
+
+    /// entries_from filters by sequence >= given value.
+    #[test]
+    fn persistent_log_entries_from_filters_by_sequence() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.append(&oid(1), 0, b"first".to_vec());
+        log.append(&oid(1), 1, b"second".to_vec());
+        log.append(&oid(1), 2, b"third".to_vec());
+        let entries = log.entries_from(&oid(1), 1);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
+    }
+
+    /// Undelivered entries survive a Store reopen (persistence across restarts).
+    #[test]
+    fn persistent_log_survives_reopen() {
+        let dir = tmp_dir();
+        {
+            let s = Store::open(dir.path(), "ns").expect("open");
+            let mut log = PersistentLog::new(s);
+            log.append(&oid(1), 0, b"persisted".to_vec());
+            // log + store drop here
+        }
+        let s2 = Store::open(dir.path(), "ns").expect("reopen");
+        let log2 = PersistentLog::new(s2);
+        let undelivered = log2.undelivered_entries();
+        assert_eq!(undelivered.len(), 1);
+        assert_eq!(undelivered[0].blob, b"persisted");
     }
 }
