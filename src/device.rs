@@ -24,7 +24,18 @@ impl DeviceKeypair {
         }
     }
 
-    /// The device's X25519 public key — its identity on the relay.
+    /// Reconstruct a DeviceKeypair from raw private key bytes.
+    /// `noise_priv` is 32 bytes (X25519 scalar); `signing_priv` is 32 bytes (Ed25519 seed).
+    /// Returns an error if the bytes are invalid.
+    pub fn from_bytes(noise_priv: [u8; 32], signing_priv: [u8; 32]) -> Result<Self, &'static str> {
+        use hush_noise::keypair::Keypair as NoiseKeypair;
+        // Derive the X25519 public key from the private scalar.
+        let noise_pub =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(noise_priv));
+        let noise = NoiseKeypair::new(noise_priv, noise_pub.to_bytes());
+        let signing = SigningKey::from_bytes(&signing_priv);
+        Ok(Self { noise, signing })
+    }
     pub fn public_key(&self) -> NoisePublicKey {
         NoisePublicKey(self.noise.public_key)
     }

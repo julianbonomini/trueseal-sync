@@ -1,215 +1,258 @@
-// FFI bindings for Swift and Kotlin via UniFFI.
+// FFI surface for Swift and Kotlin via UniFFI (proc-macro mode).
 //
-// Exposes a thin facade over hush-sync internals. Complex generics (RelayClient<T>)
-// are not exposed here — those require a platform-specific transport adapter.
-//
-// All exported types are wrapped in Arc<> as required by UniFFI for object types.
+// Exposes a single `HushFfiSession` object over TCP transport.
+// All key material crosses the boundary as `Vec<u8>`; wrong-length inputs
+// return `SessionError` — no silent failures.
 
-use std::sync::{Arc, Mutex};
+use std::net::TcpStream;
+use std::sync::Arc;
 
 use crate::device::DeviceKeypair;
-use crate::keys::NoisePublicKey;
-use crate::message;
-use crate::revocation::{self, PairedList};
+use crate::keys::{NoisePublicKey, SigningPublicKey};
+use crate::message::Message;
+use crate::session::{HushSession, SessionError as CoreSessionError};
 
-// uniffi::setup_scaffolding!() is called in lib.rs (crate root).
-
-// ── Errors ────────────────────────────────────────────────────────────────────
+// ── Error ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
-pub enum FfiError {
-    #[error("invalid pairing payload: {msg}")]
-    InvalidPairingPayload { msg: String },
+pub enum SessionError {
+    #[error("invalid key length: expected {expected} bytes, got {got}")]
+    InvalidKeyLength { expected: u32, got: u32 },
+    #[error("connection failed: {msg}")]
+    ConnectionFailed { msg: String },
+    #[error("push failed: {msg}")]
+    PushFailed { msg: String },
 }
 
-// ── HushDevice ────────────────────────────────────────────────────────────────
+impl From<CoreSessionError> for SessionError {
+    fn from(e: CoreSessionError) -> Self {
+        match e {
+            CoreSessionError::ConnectionFailed(msg) => SessionError::ConnectionFailed { msg },
+            CoreSessionError::PushFailed(msg) => SessionError::PushFailed { msg },
+            CoreSessionError::InvalidKeypairBytes => SessionError::InvalidKeyLength {
+                expected: 64,
+                got: 0,
+            },
+        }
+    }
+}
 
-/// A device's complete keypair identity.
-/// Generated once per device install; persist the raw bytes and reconstruct via
-/// `HushDevice::from_bytes` (not yet exposed — add when persistence is needed).
+// ── Callback interfaces ───────────────────────────────────────────────────────
+
+/// Fired when a `Sync` message is delivered to this device.
+/// `blob` is the raw application payload; `sender_noise_pub` is the sender's 32-byte X25519 key.
+#[uniffi::export(callback_interface)]
+pub trait MessageCallback: Send + Sync {
+    fn on_message(&self, blob: Vec<u8>, sender_noise_pub: Vec<u8>);
+}
+
+/// Fired after a successful pairing — `noise_pub` is the new peer's 32-byte X25519 key.
+#[uniffi::export(callback_interface)]
+pub trait PairedCallback: Send + Sync {
+    fn on_paired(&self, noise_pub: Vec<u8>);
+}
+
+/// Fired after this device's keypair is rotated (revocation).
+/// `keypair_bytes` is `noise_priv (32) || signing_priv (32)` — 64 bytes total.
+/// The caller must persist this to replace the stored keypair.
+#[uniffi::export(callback_interface)]
+pub trait KeypairRotatedCallback: Send + Sync {
+    fn on_keypair_rotated(&self, keypair_bytes: Vec<u8>);
+}
+
+// ── HushFfiSession ────────────────────────────────────────────────────────────
+
+/// A connected hush-sync session over TCP.
+///
+/// Create via `HushFfiSession.create(...)`.  All key arguments are raw bytes.
 #[derive(uniffi::Object)]
-pub struct HushDevice {
-    inner: DeviceKeypair,
+pub struct HushFfiSession {
+    inner: HushSession<TcpStream>,
 }
 
 #[uniffi::export]
-impl HushDevice {
-    /// Generate a fresh device keypair.
+impl HushFfiSession {
+    /// Connect to a relay and start the session.
+    ///
+    /// - `keypair_bytes`: 64 bytes — `noise_priv (32) || signing_priv (32)`
+    /// - `relay_addr`: TCP address, e.g. `"relay.example.com:4433"`
+    /// - `relay_pub`: 32-byte X25519 relay public key
+    /// - `on_message`: called for every inbound `Sync` message
+    /// - `on_keypair_rotated`: called after key rotation; persist the new bytes
     #[uniffi::constructor]
-    pub fn generate() -> Arc<Self> {
-        Arc::new(Self {
-            inner: DeviceKeypair::generate(),
+    pub fn create(
+        keypair_bytes: Vec<u8>,
+        relay_addr: String,
+        relay_pub: Vec<u8>,
+        on_message: Box<dyn MessageCallback>,
+        on_keypair_rotated: Box<dyn KeypairRotatedCallback>,
+    ) -> Result<Arc<Self>, SessionError> {
+        let keypair = keypair_from_bytes(&keypair_bytes)?;
+        let relay_pub = noise_pub_from_bytes(&relay_pub)?;
+
+        let stream = TcpStream::connect(&relay_addr)
+            .map_err(|e| SessionError::ConnectionFailed { msg: e.to_string() })?;
+
+        let inner = HushSession::connect_with_log(
+            stream,
+            relay_pub,
+            keypair,
+            move |msg| {
+                if let Message::Sync { body } = msg {
+                    on_message.on_message(body, vec![]);
+                }
+            },
+            Box::new(crate::operation_log::MemLog::new()),
+            move |bytes| {
+                on_keypair_rotated.on_keypair_rotated(bytes.to_vec());
+            },
+        )
+        .map_err(SessionError::from)?;
+
+        Ok(Arc::new(Self { inner }))
+    }
+
+    /// Returns a 64-byte pairing payload for QR-code display.
+    /// Opens a 60-second pairing window; `on_paired` fires on successful `accept_pair`.
+    pub fn start_pairing(&self, on_paired: Box<dyn PairedCallback>) -> Vec<u8> {
+        self.inner.start_pairing(move |noise_pub| {
+            on_paired.on_paired(noise_pub.0.to_vec());
         })
     }
 
-    /// X25519 noise public key (32 bytes) — the device's relay identity.
-    pub fn noise_public_key(&self) -> Vec<u8> {
-        self.inner.public_key().0.to_vec()
+    /// Admit a device identified by its noise (32 B) and signing (32 B) public keys.
+    /// No-op if no pairing window is open or it has timed out.
+    pub fn accept_pair(
+        &self,
+        noise_pub: Vec<u8>,
+        signing_pub: Vec<u8>,
+    ) -> Result<(), SessionError> {
+        let noise = noise_pub_from_bytes(&noise_pub)?;
+        let signing = signing_pub_from_bytes(&signing_pub)?;
+        self.inner.accept_pair(noise, signing);
+        Ok(())
     }
 
-    /// Ed25519 signing public key (32 bytes) — embedded in Envelopes.
-    pub fn signing_public_key(&self) -> Vec<u8> {
-        self.inner.signing_public_key().0.to_vec()
+    /// Close the pairing window without admitting any device.
+    pub fn cancel_pairing(&self) {
+        self.inner.cancel_pairing();
     }
 
-    /// Produce a pairing payload (64 bytes) suitable for encoding as a QR code.
-    /// The caller is responsible for QR encoding/decoding.
-    pub fn pairing_payload(&self) -> Vec<u8> {
-        message::pairing_payload(
-            &self.inner.public_key().0,
-            &self.inner.signing_public_key().0,
-        )
+    /// Encrypt `blob` and push it to `recipient_noise_pub` (32 bytes).
+    pub fn push_sync(
+        &self,
+        recipient_noise_pub: Vec<u8>,
+        blob: Vec<u8>,
+    ) -> Result<(), SessionError> {
+        let recipient = noise_pub_from_bytes(&recipient_noise_pub)?;
+        self.inner
+            .push_sync(recipient, blob)
+            .map_err(SessionError::from)
+    }
+
+    /// Send `Message::Revoke` to all paired peers and rotate this device's keypair.
+    /// `on_keypair_rotated` fires with the new 64-byte keypair bytes.
+    pub fn revoke(&self) {
+        self.inner.revoke();
+    }
+
+    /// This session's current noise public key (32 bytes).
+    pub fn noise_pub(&self) -> Vec<u8> {
+        self.inner.noise_pub().0.to_vec()
     }
 }
 
-// ── Pairing ───────────────────────────────────────────────────────────────────
+// ── Key parsing helpers ───────────────────────────────────────────────────────
 
-/// The public keys extracted from a scanned pairing payload.
-#[derive(uniffi::Record)]
-pub struct PairingInfo {
-    pub noise_pub: Vec<u8>,
-    pub signing_pub: Vec<u8>,
+fn noise_pub_from_bytes(bytes: &[u8]) -> Result<NoisePublicKey, SessionError> {
+    bytes
+        .try_into()
+        .map(NoisePublicKey)
+        .map_err(|_| SessionError::InvalidKeyLength {
+            expected: 32,
+            got: bytes.len() as u32,
+        })
 }
 
-/// Decode a pairing payload (from a scanned QR code) into the remote device's keys.
-#[uniffi::export]
-pub fn decode_pairing_payload(bytes: Vec<u8>) -> Result<PairingInfo, FfiError> {
-    let (noise_pub, signing_pub) = message::decode_pairing_payload(&bytes)
-        .map_err(|e| FfiError::InvalidPairingPayload { msg: e.to_string() })?;
-    Ok(PairingInfo {
-        noise_pub: noise_pub.to_vec(),
-        signing_pub: signing_pub.to_vec(),
+fn signing_pub_from_bytes(bytes: &[u8]) -> Result<SigningPublicKey, SessionError> {
+    bytes
+        .try_into()
+        .map(SigningPublicKey)
+        .map_err(|_| SessionError::InvalidKeyLength {
+            expected: 32,
+            got: bytes.len() as u32,
+        })
+}
+
+fn keypair_from_bytes(bytes: &[u8]) -> Result<DeviceKeypair, SessionError> {
+    if bytes.len() != 64 {
+        return Err(SessionError::InvalidKeyLength {
+            expected: 64,
+            got: bytes.len() as u32,
+        });
+    }
+    let noise_priv: [u8; 32] = bytes[..32].try_into().unwrap();
+    let signing_priv: [u8; 32] = bytes[32..].try_into().unwrap();
+    DeviceKeypair::from_bytes(noise_priv, signing_priv).map_err(|_| {
+        SessionError::InvalidKeyLength {
+            expected: 64,
+            got: 64,
+        }
     })
 }
 
-// ── HushPairedList ────────────────────────────────────────────────────────────
-
-/// Thread-safe paired device list. Callers update this when pairing or revoking.
-#[derive(uniffi::Object)]
-pub struct HushPairedList {
-    inner: Mutex<PairedList>,
-}
-
-#[uniffi::export]
-impl HushPairedList {
-    #[uniffi::constructor]
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(PairedList::new()),
-        })
-    }
-
-    /// Add a device's noise public key (32 bytes) to the trusted list.
-    pub fn add(&self, noise_pub: Vec<u8>) {
-        if let Ok(key) = noise_pub.as_slice().try_into() as Result<[u8; 32], _> {
-            // FFI surface: signing pub not available here; pass zeroed placeholder.
-            // This path will be replaced when issue #16 lands.
-            self.inner.lock().unwrap().add(
-                NoisePublicKey(key),
-                crate::keys::SigningPublicKey([0u8; 32]),
-            );
-        }
-    }
-
-    /// Whether `noise_pub` is in the trusted list.
-    pub fn contains(&self, noise_pub: Vec<u8>) -> bool {
-        if let Ok(key) = noise_pub.as_slice().try_into() as Result<[u8; 32], _> {
-            return self.inner.lock().unwrap().contains(&NoisePublicKey(key));
-        }
-        false
-    }
-
-    /// Number of paired devices.
-    pub fn len(&self) -> u64 {
-        self.inner.lock().unwrap().len() as u64
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().is_empty()
-    }
-}
-
-// ── Revocation ────────────────────────────────────────────────────────────────
-
-/// Process an incoming Revoke from `sender_noise_pub` (32 bytes).
-/// If the sender is trusted, clears `list` and returns a fresh `HushDevice`.
-/// If the sender is unknown, returns None and leaves `list` unchanged.
-#[uniffi::export]
-pub fn handle_revoke(
-    list: Arc<HushPairedList>,
-    sender_noise_pub: Vec<u8>,
-) -> Option<Arc<HushDevice>> {
-    let key: [u8; 32] = sender_noise_pub.as_slice().try_into().ok()?;
-    let new_kp = revocation::handle_revoke(&mut list.inner.lock().unwrap(), &NoisePublicKey(key))?;
-    Some(Arc::new(HushDevice { inner: new_kp }))
-}
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// HushDevice::generate produces distinct keypairs.
+    /// Wrong-length relay_pub returns SessionError::InvalidKeyLength.
     #[test]
-    fn generate_produces_unique_devices() {
-        let a = HushDevice::generate();
-        let b = HushDevice::generate();
-        assert_ne!(a.noise_public_key(), b.noise_public_key());
+    fn short_relay_pub_returns_error() {
+        let result = noise_pub_from_bytes(&[0u8; 10]);
+        assert!(matches!(
+            result,
+            Err(SessionError::InvalidKeyLength {
+                expected: 32,
+                got: 10
+            })
+        ));
     }
 
-    /// Pairing payload round-trips through the FFI layer.
+    /// Wrong-length keypair_bytes returns SessionError::InvalidKeyLength.
     #[test]
-    fn pairing_payload_ffi_round_trips() {
-        let device = HushDevice::generate();
-        let payload = device.pairing_payload();
-        let info = decode_pairing_payload(payload).expect("should decode");
-        assert_eq!(info.noise_pub, device.noise_public_key());
-        assert_eq!(info.signing_pub, device.signing_public_key());
+    fn short_keypair_bytes_returns_error() {
+        let result = keypair_from_bytes(&[0u8; 10]);
+        assert!(matches!(
+            result,
+            Err(SessionError::InvalidKeyLength {
+                expected: 64,
+                got: 10
+            })
+        ));
     }
 
-    /// decode_pairing_payload returns error on short input.
+    /// Wrong-length signing pub returns SessionError::InvalidKeyLength.
     #[test]
-    fn decode_pairing_payload_rejects_short_input() {
-        let result = decode_pairing_payload(vec![0u8; 10]);
-        assert!(result.is_err());
+    fn short_signing_pub_returns_error() {
+        let result = signing_pub_from_bytes(&[0u8; 5]);
+        assert!(matches!(
+            result,
+            Err(SessionError::InvalidKeyLength {
+                expected: 32,
+                got: 5
+            })
+        ));
     }
 
-    /// HushPairedList add/contains/len work correctly.
+    /// Correct 64-byte keypair parses without error.
     #[test]
-    fn paired_list_ffi_operations() {
-        let list = HushPairedList::new();
-        let device = HushDevice::generate();
-        let key = device.noise_public_key();
-
-        assert!(!list.contains(key.clone()));
-        list.add(key.clone());
-        assert!(list.contains(key.clone()));
-        assert_eq!(list.len(), 1);
-    }
-
-    /// handle_revoke via FFI clears the list and returns a fresh device.
-    #[test]
-    fn handle_revoke_ffi_clears_list() {
-        let device = HushDevice::generate();
-        let list = HushPairedList::new();
-        list.add(device.noise_public_key());
-
-        let new_device =
-            handle_revoke(list.clone(), device.noise_public_key()).expect("revoke should succeed");
-
-        assert!(list.is_empty());
-        assert_ne!(new_device.noise_public_key(), device.noise_public_key());
-    }
-
-    /// handle_revoke from unknown sender returns None.
-    #[test]
-    fn handle_revoke_ffi_ignores_unknown_sender() {
-        let trusted = HushDevice::generate();
-        let stranger = HushDevice::generate();
-        let list = HushPairedList::new();
-        list.add(trusted.noise_public_key());
-
-        let result = handle_revoke(list.clone(), stranger.noise_public_key());
-        assert!(result.is_none());
-        assert_eq!(list.len(), 1);
+    fn valid_keypair_bytes_parse() {
+        let kp = DeviceKeypair::generate();
+        let mut bytes = [0u8; 64];
+        bytes[..32].copy_from_slice(&kp.noise.private());
+        bytes[32..].copy_from_slice(&kp.signing.to_bytes());
+        assert!(keypair_from_bytes(&bytes).is_ok());
     }
 }
