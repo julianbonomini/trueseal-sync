@@ -21,6 +21,10 @@ prost = "0.13"
 tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "io-util"] }
 hush-noise = { path = "../hush-noise/rust" }
 uniffi = { version = "0.28", features = ["tokio", "cli"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [build-dependencies]
 prost-build = "0.13"
