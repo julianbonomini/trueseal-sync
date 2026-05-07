@@ -1,5 +1,6 @@
-mod outbox;
+mod fanout;
 mod manifest_filter;
+mod outbox;
 mod pairing;
 mod push;
 mod revocation;
@@ -20,8 +21,16 @@ pub(super) fn make_two_member_manifest(
         new_group_id(),
         1,
         vec![
-            ManifestMember { noise_pub: a_noise, signing_pub: a_signing, name: "DeviceA".into() },
-            ManifestMember { noise_pub: b_noise, signing_pub: b_signing, name: "DeviceB".into() },
+            ManifestMember {
+                noise_pub: a_noise,
+                signing_pub: a_signing,
+                name: "DeviceA".into(),
+            },
+            ManifestMember {
+                noise_pub: b_noise,
+                signing_pub: b_signing,
+                name: "DeviceB".into(),
+            },
         ],
         a_signing_key,
     )
@@ -35,7 +44,11 @@ pub(super) fn make_one_member_manifest(
     GroupManifest::new(
         new_group_id(),
         1,
-        vec![ManifestMember { noise_pub: noise, signing_pub: signing, name: "DeviceA".into() }],
+        vec![ManifestMember {
+            noise_pub: noise,
+            signing_pub: signing,
+            name: "DeviceA".into(),
+        }],
         signing_key,
     )
 }

@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
 use hush_noise::{keypair::Keypair, session::accept};
 
 use crate::device::DeviceKeypair;
@@ -10,6 +11,7 @@ use crate::relay::{parse, MsgType};
 
 use super::super::test_helpers::*;
 use super::super::HushSession;
+use super::make_two_member_manifest;
 
 #[test]
 fn push_sync_appends_and_marks_delivered() {
@@ -30,6 +32,11 @@ fn push_sync_appends_and_marks_delivered() {
 
     let device = DeviceKeypair::generate();
     let recipient = DeviceKeypair::generate();
+    let d_noise = device.public_key();
+    let d_signing = device.signing_public_key();
+    let d_sk = SigningKey::from_bytes(&device.signing.to_bytes());
+    let r_noise = recipient.public_key();
+    let r_signing = recipient.signing_public_key();
     let session = HushSession::connect_with_log(
         pipe_client,
         relay_pub,
@@ -39,10 +46,11 @@ fn push_sync_appends_and_marks_delivered() {
         |_| {},
     )
     .expect("connect");
+    session.set_manifest(make_two_member_manifest(
+        d_noise, d_signing, &d_sk, r_noise, r_signing,
+    ));
 
-    session
-        .push_sync(recipient.public_key(), b"hello".to_vec())
-        .expect("push");
+    session.push_sync(b"hello".to_vec()).expect("push");
     std::thread::sleep(Duration::from_millis(50));
 
     let undelivered = session.op_log.lock().unwrap().undelivered_entries();
@@ -92,6 +100,11 @@ fn undelivered_entries_replayed_after_reconnect() {
 
     let device = DeviceKeypair::generate();
     let recipient = DeviceKeypair::generate();
+    let d_noise = device.public_key();
+    let d_signing = device.signing_public_key();
+    let d_sk = SigningKey::from_bytes(&device.signing.to_bytes());
+    let r_noise = recipient.public_key();
+    let r_signing = recipient.signing_public_key();
     let session = HushSession::connect_with_reconnect(
         pipe1_client,
         relay_pub,
@@ -109,13 +122,16 @@ fn undelivered_entries_replayed_after_reconnect() {
         Some(Duration::from_millis(50)),
     )
     .expect("initial connect");
+    session.set_manifest(make_two_member_manifest(
+        d_noise, d_signing, &d_sk, r_noise, r_signing,
+    ));
 
     close_client_reader.store(true, Ordering::Release);
     std::thread::sleep(Duration::from_millis(300));
 
-    let _r1 = session.push_sync(recipient.public_key(), b"blob1".to_vec());
-    let _r2 = session.push_sync(recipient.public_key(), b"blob2".to_vec());
-    let _r3 = session.push_sync(recipient.public_key(), b"blob3".to_vec());
+    let _r1 = session.push_sync(b"blob1".to_vec());
+    let _r2 = session.push_sync(b"blob2".to_vec());
+    let _r3 = session.push_sync(b"blob3".to_vec());
 
     std::thread::sleep(Duration::from_millis(1500));
 
@@ -147,6 +163,11 @@ fn push_sync_while_disconnected_returns_error_and_stays_in_outbox() {
 
     let device = DeviceKeypair::generate();
     let recipient = DeviceKeypair::generate();
+    let d_noise = device.public_key();
+    let d_signing = device.signing_public_key();
+    let d_sk = SigningKey::from_bytes(&device.signing.to_bytes());
+    let r_noise = recipient.public_key();
+    let r_signing = recipient.signing_public_key();
     let session = HushSession::connect_with_log(
         pipe_client,
         relay_pub,
@@ -156,11 +177,14 @@ fn push_sync_while_disconnected_returns_error_and_stays_in_outbox() {
         |_| {},
     )
     .expect("connect");
+    session.set_manifest(make_two_member_manifest(
+        d_noise, d_signing, &d_sk, r_noise, r_signing,
+    ));
 
     close_client.store(true, Ordering::Release);
     std::thread::sleep(Duration::from_millis(100));
 
-    let result = session.push_sync(recipient.public_key(), b"orphaned".to_vec());
+    let result = session.push_sync(b"orphaned".to_vec());
     assert!(
         matches!(result, Err(super::super::SessionError::PushFailed(_))),
         "should return PushFailed when disconnected"

@@ -40,6 +40,9 @@ impl From<CoreSessionError> for SessionError {
         match e {
             CoreSessionError::ConnectionFailed(msg) => SessionError::ConnectionFailed { msg },
             CoreSessionError::PushFailed(msg) => SessionError::PushFailed { msg },
+            CoreSessionError::NotInGroup => SessionError::PushFailed {
+                msg: "not in group".into(),
+            },
             CoreSessionError::InvalidKeypairBytes => SessionError::InvalidKeyLength {
                 expected: 64,
                 got: 0,
@@ -181,16 +184,10 @@ impl HushFfiSession {
         self.inner.cancel_pairing();
     }
 
-    /// Encrypt `blob` and push it to `recipient_noise_pub` (32 bytes).
-    pub fn push_sync(
-        &self,
-        recipient_noise_pub: Vec<u8>,
-        blob: Vec<u8>,
-    ) -> Result<(), SessionError> {
-        let recipient = noise_pub_from_bytes(&recipient_noise_pub)?;
-        self.inner
-            .push_sync(recipient, blob)
-            .map_err(SessionError::from)
+    /// Encrypt `blob` and fan out to all group members.
+    /// Returns an error if the session has no manifest (not in any group).
+    pub fn push_sync(&self, blob: Vec<u8>) -> Result<(), SessionError> {
+        self.inner.push_sync(blob).map_err(SessionError::from)
     }
 
     /// Send `Message::Revoke` to all paired peers and rotate this device's keypair.

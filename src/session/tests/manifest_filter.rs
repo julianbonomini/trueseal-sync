@@ -40,7 +40,12 @@ fn message_from_non_member_is_discarded() {
     session_a.set_manifest(make_one_member_manifest(a_noise, a_signing, &a_sk));
 
     session_stranger
-        .push_sync(a_noise, b"should be dropped".to_vec())
+        .push_message(
+            &crate::message::Message::Sync {
+                body: b"should be dropped".to_vec(),
+            },
+            a_noise,
+        )
         .expect("push");
 
     std::thread::sleep(Duration::from_millis(100));
@@ -81,7 +86,12 @@ fn message_from_member_is_delivered() {
     ));
 
     session_b
-        .push_sync(a_noise, b"hello from B".to_vec())
+        .push_message(
+            &crate::message::Message::Sync {
+                body: b"hello from B".to_vec(),
+            },
+            a_noise,
+        )
         .expect("push");
 
     std::thread::sleep(Duration::from_millis(100));

@@ -34,6 +34,8 @@ pub enum SessionError {
     ConnectionFailed(String),
     #[error("push failed: {0}")]
     PushFailed(String),
+    #[error("not in any group — set a manifest first")]
+    NotInGroup,
 }
 
 // ── Internal types ────────────────────────────────────────────────────────────
@@ -291,32 +293,60 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
     // ── Push ──────────────────────────────────────────────────────────────────
 
-    /// Encrypt `blob` as a Sync message and push to `recipient_pub`.
-    /// Appended to the outbox first; marked delivered on success.
-    pub fn push_sync(
-        &self,
-        recipient_pub: NoisePublicKey,
-        blob: Vec<u8>,
-    ) -> Result<(), SessionError> {
-        let msg = Message::Sync { body: blob.clone() };
-        let seq = self.next_seq();
-        let oid = recipient_pub.0;
-        self.op_log.lock().unwrap().append(&oid, seq, blob);
+    /// Encrypt `blob` as a Sync message and fan out to every manifest member except self.
+    /// One sequence number is consumed per call regardless of member count.
+    /// Returns `SessionError::NotInGroup` if no manifest is set.
+    pub fn push_sync(&self, blob: Vec<u8>) -> Result<(), SessionError> {
+        let recipients: Vec<NoisePublicKey> = {
+            let guard = self.manifest.lock().unwrap();
+            match *guard {
+                None => return Err(SessionError::NotInGroup),
+                Some(ref m) => {
+                    let self_noise = self.keys.lock().unwrap().noise_pub;
+                    m.members
+                        .iter()
+                        .filter(|member| member.noise_pub != self_noise)
+                        .map(|member| member.noise_pub)
+                        .collect()
+                }
+            }
+        };
 
         if !self.client.lock().unwrap().is_connected() {
+            // Still append to outbox for each recipient so reconnect can replay.
+            let seq = self.next_seq();
+            for r in &recipients {
+                self.op_log.lock().unwrap().append(&r.0, seq, blob.clone());
+            }
             return Err(SessionError::PushFailed("relay disconnected".into()));
         }
 
+        let msg = Message::Sync { body: blob.clone() };
+        let seq = self.next_seq();
         let signing = self.signing();
-        let result = self
-            .client
-            .lock()
-            .unwrap()
-            .push(&msg, recipient_pub, seq, vec![], &signing);
-        if result.is_ok() {
-            self.op_log.lock().unwrap().mark_delivered(&oid, seq);
+
+        let mut last_err: Option<String> = None;
+        for recipient_pub in recipients {
+            let oid = recipient_pub.0;
+            self.op_log.lock().unwrap().append(&oid, seq, blob.clone());
+            let result =
+                self.client
+                    .lock()
+                    .unwrap()
+                    .push(&msg, recipient_pub, seq, vec![], &signing);
+            match result {
+                Ok(()) => {
+                    self.op_log.lock().unwrap().mark_delivered(&oid, seq);
+                }
+                Err(e) => {
+                    last_err = Some(e.to_string());
+                }
+            }
         }
-        result.map_err(|e| SessionError::PushFailed(e.to_string()))
+        match last_err {
+            None => Ok(()),
+            Some(e) => Err(SessionError::PushFailed(e)),
+        }
     }
 
     pub(crate) fn push_message(

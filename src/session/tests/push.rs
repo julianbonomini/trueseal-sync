@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
 use hush_noise::{keypair::Keypair, session::accept};
 
 use crate::device::DeviceKeypair;
@@ -10,6 +11,7 @@ use crate::relay::{parse, MsgType};
 
 use super::super::test_helpers::*;
 use super::super::HushSession;
+use super::make_two_member_manifest;
 
 #[test]
 fn two_sessions_can_exchange_sync_message() {
@@ -21,10 +23,17 @@ fn two_sessions_can_exchange_sync_message() {
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
-    let b_pub = device_b.public_key();
+    let a_noise = device_a.public_key();
+    let a_signing = device_a.signing_public_key();
+    let a_sk = SigningKey::from_bytes(&device_a.signing.to_bytes());
+    let b_noise = device_b.public_key();
+    let b_signing = device_b.signing_public_key();
 
     let session_a =
         HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+    session_a.set_manifest(make_two_member_manifest(
+        a_noise, a_signing, &a_sk, b_noise, b_signing,
+    ));
 
     let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx = received.clone();
@@ -34,7 +43,7 @@ fn two_sessions_can_exchange_sync_message() {
     .expect("session B");
 
     session_a
-        .push_sync(b_pub, b"hello from A".to_vec())
+        .push_sync(b"hello from A".to_vec())
         .expect("push_sync");
     std::thread::sleep(Duration::from_millis(100));
 
@@ -50,6 +59,9 @@ fn two_sessions_can_exchange_sync_message() {
 
 #[test]
 fn push_sync_increments_sequence() {
+    use crate::keys::{NoisePublicKey, SigningPublicKey};
+    use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
+
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
@@ -75,15 +87,35 @@ fn push_sync_increments_sequence() {
     }
 
     let device = DeviceKeypair::generate();
-    let recipient = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
+    let noise = device.public_key();
+    let signing = device.signing_public_key();
+    let sk = SigningKey::from_bytes(&device.signing.to_bytes());
+    // One peer so push_sync sends one message.
+    let peer_noise = NoisePublicKey([0xCCu8; 32]);
+    let peer_signing = SigningPublicKey([0xDDu8; 32]);
+    let manifest = GroupManifest::new(
+        new_group_id(),
+        1,
+        vec![
+            ManifestMember {
+                noise_pub: noise,
+                signing_pub: signing,
+                name: "Self".into(),
+            },
+            ManifestMember {
+                noise_pub: peer_noise,
+                signing_pub: peer_signing,
+                name: "Peer".into(),
+            },
+        ],
+        &sk,
+    );
 
-    session
-        .push_sync(recipient.public_key(), b"first".to_vec())
-        .expect("first");
-    session
-        .push_sync(recipient.public_key(), b"second".to_vec())
-        .expect("second");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
+    session.set_manifest(manifest);
+
+    session.push_sync(b"first".to_vec()).expect("first");
+    session.push_sync(b"second".to_vec()).expect("second");
     std::thread::sleep(Duration::from_millis(200));
 
     let envs = received_envs.lock().unwrap();
@@ -103,11 +135,21 @@ fn on_message_receives_sender_signing_pub() {
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
+    let a_noise = device_a.public_key();
     let a_signing_pub = device_a.signing_public_key();
-    let b_pub = device_b.public_key();
+    let a_sk = SigningKey::from_bytes(&device_a.signing.to_bytes());
+    let b_noise = device_b.public_key();
+    let b_signing = device_b.signing_public_key();
 
     let session_a =
         HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+    session_a.set_manifest(make_two_member_manifest(
+        a_noise,
+        a_signing_pub,
+        &a_sk,
+        b_noise,
+        b_signing,
+    ));
 
     let received: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
     let rx = received.clone();
@@ -121,7 +163,7 @@ fn on_message_receives_sender_signing_pub() {
     )
     .expect("session B");
 
-    session_a.push_sync(b_pub, b"hello".to_vec()).expect("push");
+    session_a.push_sync(b"hello".to_vec()).expect("push");
     std::thread::sleep(Duration::from_millis(100));
 
     let got = received.lock().unwrap();
