@@ -82,6 +82,30 @@ impl Envelope {
         }
     }
 
+    /// Compute SHA-256 of this Envelope's encoded bytes — used as a parent hash.
+    pub fn hash(&self) -> [u8; 32] {
+        Sha256::digest(self.encode()).into()
+    }
+
+    /// Build a new Envelope chained to `parent`.
+    /// Sets `sequence = parent.sequence + 1` and `parents = [parent.hash()]`.
+    /// For the standard v0 linear chain; use `Envelope::build` for DAG merges
+    /// with multiple parents or root envelopes with sequence 0.
+    pub fn build_chained(
+        parent: &Envelope,
+        recipient_pub: NoisePublicKey,
+        author_keypair: &SigningKeypair,
+        payload: Vec<u8>,
+    ) -> Self {
+        Self::build(
+            parent.sequence + 1,
+            vec![parent.hash()],
+            recipient_pub,
+            author_keypair,
+            payload,
+        )
+    }
+
     /// Verify the author signature over the envelope's signed fields.
     /// Called by recipients — never by the Relay.
     pub fn verify(&self) -> Result<(), EnvelopeError> {
@@ -179,6 +203,10 @@ fn sign(
 }
 
 /// Compute SHA-256 of an Envelope's encoded bytes — used as a parent hash.
+///
+/// # Deprecated
+/// Use `envelope.hash()` instead.
+#[deprecated(since = "0.1.0", note = "Use Envelope::hash() instead")]
 pub fn envelope_hash(encoded: &[u8]) -> [u8; 32] {
     Sha256::digest(encoded).into()
 }
@@ -252,7 +280,46 @@ mod tests {
         assert!(result.is_err(), "empty input should return an error");
     }
 
-    /// parents accepts 0 entries (root Envelope), 1 (v0 standard), and N (v1 DAG).
+    /// Tracer bullet for #11: build_chained sets sequence and parent hash correctly.
+    #[test]
+    fn build_chained_links_to_parent() {
+        let author = SigningKeypair::generate();
+        let recipient_pub = NoisePublicKey(SigningKeypair::generate().public_key_bytes());
+
+        let root = Envelope::build(0, vec![], recipient_pub, &author, b"root".to_vec());
+        let child = Envelope::build_chained(&root, recipient_pub, &author, b"child".to_vec());
+
+        assert_eq!(child.sequence, 1, "sequence should be parent.sequence + 1");
+        assert_eq!(child.parents.len(), 1, "child should have one parent");
+        assert_eq!(
+            child.parents[0],
+            root.hash(),
+            "parent hash should match root.hash()"
+        );
+        assert!(
+            child.verify().is_ok(),
+            "child should have a valid signature"
+        );
+    }
+
+    /// A chain of 3 envelopes built with build_chained has correct sequence numbers.
+    #[test]
+    fn build_chained_three_deep_has_correct_sequences() {
+        let author = SigningKeypair::generate();
+        let recipient_pub = NoisePublicKey(SigningKeypair::generate().public_key_bytes());
+
+        let e0 = Envelope::build(0, vec![], recipient_pub, &author, b"0".to_vec());
+        let e1 = Envelope::build_chained(&e0, recipient_pub, &author, b"1".to_vec());
+        let e2 = Envelope::build_chained(&e1, recipient_pub, &author, b"2".to_vec());
+
+        assert_eq!(e0.sequence, 0);
+        assert_eq!(e1.sequence, 1);
+        assert_eq!(e2.sequence, 2);
+        assert_eq!(e2.parents[0], e1.hash());
+        assert!(e0.verify().is_ok());
+        assert!(e1.verify().is_ok());
+        assert!(e2.verify().is_ok());
+    }
     #[test]
     fn parents_accepts_zero_one_and_many() {
         let author = SigningKeypair::generate();
@@ -262,16 +329,15 @@ mod tests {
         let root = Envelope::build(0, vec![], recipient_pub, &author, vec![]);
         assert!(root.verify().is_ok());
 
-        // v0 standard: one parent
-        let parent_hash = envelope_hash(&root.encode());
-        let child = Envelope::build(1, vec![parent_hash], recipient_pub, &author, vec![]);
+        // v0 standard: one parent (use build_chained)
+        let child = Envelope::build_chained(&root, recipient_pub, &author, vec![]);
         assert!(child.verify().is_ok());
 
-        // v1 DAG: two parents (merge point)
-        let other_hash = envelope_hash(&child.encode());
+        // v1 DAG: two parents (merge point) — use build directly
+        let other_hash = child.hash();
         let merge = Envelope::build(
             2,
-            vec![parent_hash, other_hash],
+            vec![root.hash(), other_hash],
             recipient_pub,
             &author,
             vec![],
