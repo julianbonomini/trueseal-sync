@@ -5,12 +5,14 @@
 // return `SessionError` — no silent failures.
 
 use std::net::TcpStream;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::device::{DeviceKeypair, KeypairError};
+use crate::device::DeviceKeypair;
 use crate::keys::{NoisePublicKey, SigningPublicKey};
 use crate::message::Message;
 use crate::session::{HushSession, SessionError as CoreSessionError};
+use crate::store::{PersistentLog, Store};
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -22,17 +24,6 @@ pub enum SessionError {
     ConnectionFailed { msg: String },
     #[error("push failed: {msg}")]
     PushFailed { msg: String },
-}
-
-impl From<KeypairError> for SessionError {
-    fn from(e: KeypairError) -> Self {
-        match e {
-            KeypairError::InvalidLength { expected, got } => SessionError::InvalidKeyLength {
-                expected: expected as u32,
-                got: got as u32,
-            },
-        }
-    }
 }
 
 impl From<CoreSessionError> for SessionError {
@@ -82,23 +73,31 @@ pub struct HushFfiSession {
 impl HushFfiSession {
     /// Connect to a relay and start the session.
     ///
-    /// - `keypair_bytes`: 64 bytes — `noise_priv (32) || signing_priv (32)`
+    /// - `base_dir`: directory where the SQLite database is stored
+    /// - `namespace`: scopes the database file; one session per namespace
     /// - `relay_addr`: TCP address, e.g. `"relay.example.com:4433"`
     /// - `relay_pub`: 32-byte X25519 relay public key
     /// - `on_message`: called for every inbound `Sync` message
-    /// - `on_keypair_rotated`: called after key rotation; persist the new bytes
+    /// - `on_keypair_rotated`: called after key rotation (Destroy Group)
     ///
+    /// The identity keypair is loaded from SQLite or auto-generated on first launch.
     /// Automatically reconnects on relay disconnects using an exponential backoff
     /// capped at 30 seconds.
     #[uniffi::constructor]
     pub fn create(
-        keypair_bytes: Vec<u8>,
+        base_dir: String,
+        namespace: String,
         relay_addr: String,
         relay_pub: Vec<u8>,
         on_message: Box<dyn MessageCallback>,
         on_keypair_rotated: Box<dyn KeypairRotatedCallback>,
     ) -> Result<Arc<Self>, SessionError> {
-        let keypair = keypair_from_bytes(&keypair_bytes)?;
+        let store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
+            SessionError::ConnectionFailed {
+                msg: format!("store: {e}"),
+            }
+        })?;
+        let keypair = load_or_generate_keypair(&store)?;
         let relay_pub_key = noise_pub_from_bytes(&relay_pub)?;
 
         let stream = TcpStream::connect(&relay_addr)
@@ -112,6 +111,13 @@ impl HushFfiSession {
         // (required by connect_with_reconnect for the reconnect loop).
         let on_message = Arc::new(on_message);
         let manifest_slot_cb = manifest_slot.clone();
+
+        // Open a second store handle for PersistentLog (same DB file, separate connection).
+        let log_store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
+            SessionError::ConnectionFailed {
+                msg: format!("store: {e}"),
+            }
+        })?;
 
         let relay_addr_factory = relay_addr.clone();
         let inner = HushSession::connect_with_reconnect(
@@ -137,7 +143,7 @@ impl HushFfiSession {
                     on_message.on_message(body, sender_noise_pub);
                 }
             },
-            Box::new(crate::operation_log::MemLog::new()),
+            Box::new(PersistentLog::new(log_store)),
             move |bytes| {
                 on_keypair_rotated.on_keypair_rotated(bytes.to_vec());
             },
@@ -195,6 +201,27 @@ impl HushFfiSession {
     }
 }
 
+// ── Storage helpers ───────────────────────────────────────────────────────────
+
+/// Load the identity keypair from `store`, or generate and persist a fresh one.
+fn load_or_generate_keypair(store: &Store) -> Result<DeviceKeypair, SessionError> {
+    match store.load_keypair() {
+        Ok(Some(kp)) => Ok(kp),
+        Ok(None) => {
+            let kp = DeviceKeypair::generate();
+            store
+                .save_keypair(&kp)
+                .map_err(|e| SessionError::ConnectionFailed {
+                    msg: format!("store: {e}"),
+                })?;
+            Ok(kp)
+        }
+        Err(e) => Err(SessionError::ConnectionFailed {
+            msg: format!("store: {e}"),
+        }),
+    }
+}
+
 // ── Key parsing helpers ───────────────────────────────────────────────────────
 
 fn noise_pub_from_bytes(bytes: &[u8]) -> Result<NoisePublicKey, SessionError> {
@@ -217,18 +244,6 @@ fn signing_pub_from_bytes(bytes: &[u8]) -> Result<SigningPublicKey, SessionError
         })
 }
 
-fn keypair_from_bytes(bytes: &[u8]) -> Result<DeviceKeypair, SessionError> {
-    if bytes.len() != 64 {
-        return Err(SessionError::InvalidKeyLength {
-            expected: 64,
-            got: bytes.len() as u32,
-        });
-    }
-    let noise_priv: [u8; 32] = bytes[..32].try_into().unwrap();
-    let signing_priv: [u8; 32] = bytes[32..].try_into().unwrap();
-    DeviceKeypair::from_bytes(noise_priv, signing_priv).map_err(SessionError::from)
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -248,17 +263,19 @@ mod tests {
         ));
     }
 
-    /// Wrong-length keypair_bytes returns SessionError::InvalidKeyLength.
+    /// Store::load_or_generate round-trips the same keypair on second call.
     #[test]
-    fn short_keypair_bytes_returns_error() {
-        let result = keypair_from_bytes(&[0u8; 10]);
-        assert!(matches!(
-            result,
-            Err(SessionError::InvalidKeyLength {
-                expected: 64,
-                got: 10
-            })
-        ));
+    fn store_load_or_generate_is_stable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s1 = crate::store::Store::open(dir.path(), "test").expect("open");
+        let kp1 = load_or_generate_keypair(&s1).expect("first");
+        let s2 = crate::store::Store::open(dir.path(), "test").expect("reopen");
+        let kp2 = load_or_generate_keypair(&s2).expect("second");
+        assert_eq!(
+            kp1.public_key(),
+            kp2.public_key(),
+            "same keypair after reopen"
+        );
     }
 
     /// Wrong-length signing pub returns SessionError::InvalidKeyLength.
@@ -272,15 +289,5 @@ mod tests {
                 got: 5
             })
         ));
-    }
-
-    /// Correct 64-byte keypair parses without error.
-    #[test]
-    fn valid_keypair_bytes_parse() {
-        let kp = DeviceKeypair::generate();
-        let mut bytes = [0u8; 64];
-        bytes[..32].copy_from_slice(&kp.noise.private());
-        bytes[32..].copy_from_slice(&kp.signing.to_bytes());
-        assert!(keypair_from_bytes(&bytes).is_ok());
     }
 }

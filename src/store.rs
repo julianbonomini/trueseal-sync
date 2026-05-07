@@ -1,6 +1,7 @@
 use std::path::Path;
 use thiserror::Error;
 
+use crate::device::DeviceKeypair;
 use crate::operation_log::{LogEntry, OperationLog};
 
 #[derive(Debug, Error)]
@@ -117,6 +118,32 @@ impl Store {
             }
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e.into()),
+        }
+    }
+
+    // --- keypair (typed) ---
+
+    /// Persist a `DeviceKeypair`. Overwrites any existing entry (singleton row).
+    pub fn save_keypair(&self, kp: &DeviceKeypair) -> Result<(), StoreError> {
+        let noise_priv: [u8; 32] = kp.noise.private().try_into().unwrap();
+        let signing_priv: [u8; 32] = kp.signing.to_bytes();
+        self.save_identity(&noise_priv, &signing_priv)
+    }
+
+    /// Load the `DeviceKeypair`. Returns `None` if no identity has been saved yet.
+    pub fn load_keypair(&self) -> Result<Option<DeviceKeypair>, StoreError> {
+        match self.load_identity()? {
+            None => Ok(None),
+            Some((noise_priv, signing_priv)) => {
+                let kp = DeviceKeypair::from_bytes(noise_priv, signing_priv).map_err(|_| {
+                    rusqlite::Error::InvalidColumnType(
+                        0,
+                        "identity".into(),
+                        rusqlite::types::Type::Blob,
+                    )
+                })?;
+                Ok(Some(kp))
+            }
         }
     }
 
@@ -484,5 +511,27 @@ mod tests {
         let undelivered = log2.undelivered_entries();
         assert_eq!(undelivered.len(), 1);
         assert_eq!(undelivered[0].blob, b"persisted");
+    }
+
+    // ── Keypair (typed) tests ──────────────────────────────────────────────────
+
+    /// Keypair round-trips through typed save/load.
+    #[test]
+    fn keypair_save_and_load_round_trips() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let kp = crate::device::DeviceKeypair::generate();
+        let noise_pub = kp.public_key();
+        s.save_keypair(&kp).expect("save");
+        let loaded = s.load_keypair().expect("load").expect("should exist");
+        assert_eq!(loaded.public_key(), noise_pub, "keypair must round-trip");
+    }
+
+    /// No keypair on first open returns None.
+    #[test]
+    fn keypair_absent_on_fresh_store() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        assert!(s.load_keypair().expect("load").is_none());
     }
 }
