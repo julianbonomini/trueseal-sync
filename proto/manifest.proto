@@ -1,0 +1,38 @@
+syntax = "proto3";
+
+package hush.sync.v0;
+
+// GroupManifest is the authoritative, signed membership record for a Sync Group.
+// Every Device in the group holds the current version locally.
+// Any current member may issue a new version — authority derives from membership,
+// not from a special group key (ADR-0014).
+message GroupManifest {
+  // Stable random identifier generated at group creation. Never changes.
+  bytes group_id = 1;
+
+  // Monotonically increasing version counter scoped to this group_id.
+  // Last-version-wins when concurrent updates occur.
+  uint64 version = 2;
+
+  // Ordered list of current group members.
+  repeated ManifestMember members = 3;
+
+  // signing_pub of the member who issued this version. 32 bytes.
+  bytes issued_by = 4;
+
+  // Ed25519 signature over: group_id || version(8 bytes LE) || encoded members.
+  // Signed by issued_by's Ed25519 private key. 64 bytes.
+  bytes signature = 5;
+}
+
+message ManifestMember {
+  // X25519 public key of the member Device. 32 bytes.
+  bytes noise_pub = 1;
+
+  // Ed25519 public key of the member Device. 32 bytes.
+  bytes signing_pub = 2;
+
+  // Auto-generated human-readable name derived from signing_pub.
+  // Deterministic — same signing_pub always produces the same name.
+  string name = 3;
+}
