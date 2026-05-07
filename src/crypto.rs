@@ -7,6 +7,8 @@ use sha2::Sha256;
 use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
 
+use crate::keys::NoisePublicKey;
+
 #[derive(Debug, Error)]
 pub enum CryptoError {
     #[error("decryption failed")]
@@ -18,13 +20,13 @@ const EPH_PUB_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const OVERHEAD: usize = EPH_PUB_LEN + NONCE_LEN;
 
-pub fn encrypt(recipient_pub: [u8; 32], plaintext: &[u8]) -> Vec<u8> {
+pub fn encrypt(recipient_pub: NoisePublicKey, plaintext: &[u8]) -> Vec<u8> {
     // Generate ephemeral keypair
     let eph_secret = StaticSecret::random_from_rng(rand::thread_rng());
     let eph_public = PublicKey::from(&eph_secret);
 
     // DH: eph_priv * recipient_pub
-    let shared = eph_secret.diffie_hellman(&PublicKey::from(recipient_pub));
+    let shared = eph_secret.diffie_hellman(&PublicKey::from(recipient_pub.0));
 
     // Derive symmetric key via HKDF-SHA256
     let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
@@ -50,6 +52,8 @@ pub fn encrypt(recipient_pub: [u8; 32], plaintext: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The private key counterpart — raw bytes kept as `[u8; 32]` since
+/// `NoisePublicKey` is the public-facing type; private keys are never shared.
 pub fn decrypt(my_priv: [u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if ciphertext.len() < OVERHEAD {
         return Err(CryptoError::DecryptionFailed);
@@ -81,12 +85,13 @@ pub fn decrypt(my_priv: [u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::NoisePublicKey;
     use x25519_dalek::{PublicKey, StaticSecret};
 
-    fn generate_keypair() -> ([u8; 32], [u8; 32]) {
+    fn generate_keypair() -> ([u8; 32], NoisePublicKey) {
         let secret = StaticSecret::random_from_rng(rand::thread_rng());
         let public = PublicKey::from(&secret);
-        (*secret.as_bytes(), *public.as_bytes())
+        (*secret.as_bytes(), NoisePublicKey(*public.as_bytes()))
     }
 
     /// Tracer bullet: a blob encrypted to a recipient can be decrypted by that recipient.

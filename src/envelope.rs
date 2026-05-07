@@ -3,6 +3,8 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::keys::{NoisePublicKey, SigningPublicKey};
+
 // Include the prost-generated types from proto/envelope.proto
 mod proto {
     include!(concat!(env!("OUT_DIR"), "/hush.sync.v0.rs"));
@@ -34,6 +36,11 @@ impl SigningKeypair {
     pub fn public_key_bytes(&self) -> [u8; 32] {
         self.0.verifying_key().to_bytes()
     }
+
+    /// Returns the Ed25519 verifying key as a typed `SigningPublicKey`.
+    pub fn public_key(&self) -> SigningPublicKey {
+        SigningPublicKey(self.0.verifying_key().to_bytes())
+    }
 }
 
 /// An Envelope is the wire unit of sync. Wraps an encrypted payload with
@@ -53,7 +60,7 @@ impl Envelope {
     pub fn build(
         sequence: u64,
         parents: Vec<[u8; 32]>,
-        recipient_pub: [u8; 32],
+        recipient_pub: NoisePublicKey,
         author_keypair: &SigningKeypair,
         payload: Vec<u8>,
     ) -> Self {
@@ -62,13 +69,13 @@ impl Envelope {
             &author_keypair.0,
             sequence,
             &parents,
-            &recipient_pub,
+            &recipient_pub.0,
             &author_pub,
         );
         Self {
             sequence,
             parents,
-            recipient_pub,
+            recipient_pub: recipient_pub.0,
             author_pub,
             signature: sig_bytes,
             payload,
@@ -179,10 +186,12 @@ pub fn envelope_hash(encoded: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keys::NoisePublicKey;
 
     fn make_envelope() -> (Envelope, SigningKeypair) {
         let author = SigningKeypair::generate();
-        let recipient_pub = SigningKeypair::generate().public_key_bytes();
+        // Use an arbitrary 32-byte value as a fake noise public key for tests
+        let recipient_pub = NoisePublicKey(SigningKeypair::generate().public_key_bytes());
         let payload = b"hello".to_vec();
         let env = Envelope::build(1, vec![], recipient_pub, &author, payload);
         (env, author)
@@ -247,7 +256,7 @@ mod tests {
     #[test]
     fn parents_accepts_zero_one_and_many() {
         let author = SigningKeypair::generate();
-        let recipient_pub = SigningKeypair::generate().public_key_bytes();
+        let recipient_pub = NoisePublicKey(SigningKeypair::generate().public_key_bytes());
 
         // Root: no parents
         let root = Envelope::build(0, vec![], recipient_pub, &author, vec![]);

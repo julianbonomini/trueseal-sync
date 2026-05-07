@@ -9,6 +9,7 @@ use thiserror::Error;
 
 use crate::crypto;
 use crate::envelope::Envelope;
+use crate::keys::NoisePublicKey;
 use crate::message::Message;
 
 #[derive(Debug, Error)]
@@ -81,13 +82,13 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
     /// Perform a Noise XX handshake over `transport` and verify the relay's identity.
     pub fn connect(
         transport: T,
-        relay_pub: [u8; 32],
+        relay_pub: NoisePublicKey,
         my_keypair: NoiseKeypair,
     ) -> Result<Self, RelayError> {
         let my_noise_priv = my_keypair.private();
         let session = dial(transport, my_keypair).map_err(RelayError::HandshakeFailed)?;
 
-        if session.remote_public_key() != relay_pub {
+        if session.remote_public_key() != relay_pub.0 {
             return Err(RelayError::HandshakeFailed(
                 "relay public key mismatch".into(),
             ));
@@ -104,7 +105,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
     pub fn push(
         &self,
         message: &Message,
-        recipient_pub: [u8; 32],
+        recipient_pub: NoisePublicKey,
         sequence: u64,
         parents: Vec<[u8; 32]>,
         author_signing: &crate::envelope::SigningKeypair,
@@ -156,7 +157,7 @@ impl RelayClient<TcpStream> {
     /// Connect to a relay over TCP at `addr`.
     pub fn connect_tcp(
         addr: &str,
-        relay_pub: [u8; 32],
+        relay_pub: NoisePublicKey,
         my_keypair: NoiseKeypair,
     ) -> Result<Self, RelayError> {
         let stream =
@@ -170,6 +171,7 @@ mod tests {
     use super::*;
     use crate::device::DeviceKeypair;
     use crate::envelope::SigningKeypair;
+    use crate::keys::NoisePublicKey;
     use crate::message::Message;
     use hush_noise::{
         keypair::{generate_keypair, Keypair},
@@ -252,7 +254,7 @@ mod tests {
     /// Helper: connect a device client to a fake relay, return (client, received_envelopes)
     fn connect_device(
         device: &DeviceKeypair,
-        relay_pub: [u8; 32],
+        relay_pub: NoisePublicKey,
         client_pipe: MemPipe,
     ) -> RelayClient<MemPipe> {
         RelayClient::connect(
@@ -267,7 +269,7 @@ mod tests {
     #[test]
     fn device_can_push_sync_message_to_relay() {
         let relay_kp = generate_keypair();
-        let relay_pub = relay_kp.public_key;
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
 
         let (client_pipe, relay_pipe) = mem_pipe_pair();
@@ -283,7 +285,7 @@ mod tests {
         client
             .push(
                 &msg,
-                recipient.noise.public_key,
+                recipient.public_key(),
                 1,
                 vec![],
                 &sender.signing_keypair(),
@@ -301,7 +303,7 @@ mod tests {
     fn wrong_relay_key_is_rejected() {
         let relay_kp = generate_keypair();
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
-        let wrong_pub = generate_keypair().public_key;
+        let wrong_pub = NoisePublicKey(generate_keypair().public_key);
 
         let (client_pipe, relay_pipe) = mem_pipe_pair();
         std::thread::spawn(move || {
@@ -326,7 +328,7 @@ mod tests {
     #[test]
     fn subscribe_callback_receives_decoded_message() {
         let relay_kp = generate_keypair();
-        let relay_pub = relay_kp.public_key;
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
 
         let (client_pipe, relay_pipe) = mem_pipe_pair();
@@ -339,7 +341,7 @@ mod tests {
 
         // Fake relay: deliver one envelope to the client after handshake
         {
-            let recipient_pub = recipient.noise.public_key;
+            let recipient_pub = recipient.public_key();
             let plaintext = msg_to_deliver.encode();
             let payload = crate::crypto::encrypt(recipient_pub, &plaintext);
             let env = Envelope::build(1, vec![], recipient_pub, &sender_signing, payload);
@@ -384,7 +386,7 @@ mod tests {
 
         // ── Relay setup: two pipes (A↔relay, B↔relay) ──────────────────────
         let relay_kp = generate_keypair();
-        let relay_pub = relay_kp.public_key;
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
 
         // Two pipe pairs — one per device
         let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
@@ -418,7 +420,7 @@ mod tests {
 
         // A generates its pairing payload (would be encoded as QR in real life)
         let payload_bytes =
-            pairing_payload(&device_a.noise.public_key, &device_a.signing_public_key());
+            pairing_payload(&device_a.public_key().0, &device_a.signing_public_key().0);
 
         // B decodes A's pairing payload and obtains A's public keys
         let (a_noise_pub, _a_signing_pub) =
@@ -440,13 +442,13 @@ mod tests {
         // B connects and pushes a Pair message addressed to A
         let client_b = connect_device(&device_b, relay_pub, pipe_b_client);
         let pair_msg = Message::Pair {
-            noise_pub: device_b.noise.public_key,
-            signing_pub: device_b.signing_public_key(),
+            noise_pub: device_b.public_key().0,
+            signing_pub: device_b.signing_public_key().0,
         };
         client_b
             .push(
                 &pair_msg,
-                a_noise_pub,
+                NoisePublicKey(a_noise_pub),
                 1,
                 vec![],
                 &device_b.signing_keypair(),
@@ -461,8 +463,8 @@ mod tests {
         assert_eq!(
             got[0],
             Message::Pair {
-                noise_pub: device_b.noise.public_key,
-                signing_pub: device_b.signing_public_key(),
+                noise_pub: device_b.public_key().0,
+                signing_pub: device_b.signing_public_key().0,
             },
             "A should receive B's Pair message with B's public keys"
         );

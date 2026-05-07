@@ -1,10 +1,11 @@
 use crate::device::DeviceKeypair;
+use crate::keys::NoisePublicKey;
 
 /// The set of devices this device trusts — i.e. devices it has paired with.
 /// Stored as their noise public keys (X25519). The signing key is used to
 /// verify envelope authorship (in RelayClient), so it is not needed here.
 pub struct PairedList {
-    entries: Vec<[u8; 32]>,
+    entries: Vec<NoisePublicKey>,
 }
 
 impl PairedList {
@@ -15,14 +16,14 @@ impl PairedList {
     }
 
     /// Add a device's noise public key to the trusted list.
-    pub fn add(&mut self, noise_pub: [u8; 32]) {
+    pub fn add(&mut self, noise_pub: NoisePublicKey) {
         if !self.entries.contains(&noise_pub) {
             self.entries.push(noise_pub);
         }
     }
 
     /// Whether `noise_pub` is in the trusted list.
-    pub fn contains(&self, noise_pub: &[u8; 32]) -> bool {
+    pub fn contains(&self, noise_pub: &NoisePublicKey) -> bool {
         self.entries.contains(noise_pub)
     }
 
@@ -36,8 +37,13 @@ impl PairedList {
     }
 
     /// Clear all entries — called on revocation.
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    /// Iterator over all noise public keys in the list.
+    pub fn iter(&self) -> impl Iterator<Item = &NoisePublicKey> {
+        self.entries.iter()
     }
 }
 
@@ -53,7 +59,10 @@ impl Default for PairedList {
 ///
 /// Both sides must call this after a revoke cycle: the sender calls it on
 /// itself after pushing `Message::Revoke` to all paired devices.
-pub fn handle_revoke(list: &mut PairedList, sender_noise_pub: &[u8; 32]) -> Option<DeviceKeypair> {
+pub fn handle_revoke(
+    list: &mut PairedList,
+    sender_noise_pub: &NoisePublicKey,
+) -> Option<DeviceKeypair> {
     if !list.contains(sender_noise_pub) {
         return None;
     }
@@ -70,15 +79,16 @@ mod tests {
     fn revoke_from_trusted_sender_clears_list_and_rotates_keypair() {
         let sender = DeviceKeypair::generate();
         let mut list = PairedList::new();
-        list.add(sender.noise.public_key);
+        list.add(sender.public_key());
 
-        let old_pub = sender.noise.public_key;
+        let old_pub = sender.public_key();
         let new_kp =
             handle_revoke(&mut list, &old_pub).expect("revoke from trusted sender should succeed");
 
         assert!(list.is_empty(), "list should be cleared after revoke");
         assert_ne!(
-            new_kp.noise.public_key, old_pub,
+            new_kp.public_key(),
+            old_pub,
             "new keypair should differ from the sender's key"
         );
     }
@@ -89,9 +99,9 @@ mod tests {
         let trusted = DeviceKeypair::generate();
         let stranger = DeviceKeypair::generate();
         let mut list = PairedList::new();
-        list.add(trusted.noise.public_key);
+        list.add(trusted.public_key());
 
-        let result = handle_revoke(&mut list, &stranger.noise.public_key);
+        let result = handle_revoke(&mut list, &stranger.public_key());
 
         assert!(result.is_none(), "revoke from stranger should be ignored");
         assert_eq!(list.len(), 1, "list should be unchanged");
@@ -103,10 +113,10 @@ mod tests {
     fn second_revoke_from_same_sender_is_ignored() {
         let sender = DeviceKeypair::generate();
         let mut list = PairedList::new();
-        list.add(sender.noise.public_key);
+        list.add(sender.public_key());
 
-        let _ = handle_revoke(&mut list, &sender.noise.public_key);
-        let result = handle_revoke(&mut list, &sender.noise.public_key);
+        let _ = handle_revoke(&mut list, &sender.public_key());
+        let result = handle_revoke(&mut list, &sender.public_key());
 
         assert!(result.is_none(), "second revoke should be ignored");
         assert!(list.is_empty());
@@ -123,15 +133,15 @@ mod tests {
         // Both are paired with each other
         let mut a_list = PairedList::new();
         let mut b_list = PairedList::new();
-        a_list.add(device_b.noise.public_key);
-        b_list.add(device_a.noise.public_key);
+        a_list.add(device_b.public_key());
+        b_list.add(device_a.public_key());
 
         // A initiates revoke: A clears its own list and rotates
-        let new_a = handle_revoke(&mut a_list, &device_b.noise.public_key)
+        let new_a = handle_revoke(&mut a_list, &device_b.public_key())
             .expect("A should revoke using B's key as authorization signal");
 
         // B receives the Revoke message (from A) and processes it
-        let new_b = handle_revoke(&mut b_list, &device_a.noise.public_key)
+        let new_b = handle_revoke(&mut b_list, &device_a.public_key())
             .expect("B should process revoke from A");
 
         // Both lists are now empty — both devices are isolated
@@ -139,7 +149,7 @@ mod tests {
         assert!(b_list.is_empty(), "B's list should be empty");
 
         // Both have fresh keypairs distinct from the originals
-        assert_ne!(new_a.noise.public_key, device_a.noise.public_key);
-        assert_ne!(new_b.noise.public_key, device_b.noise.public_key);
+        assert_ne!(new_a.public_key(), device_a.public_key());
+        assert_ne!(new_b.public_key(), device_b.public_key());
     }
 }

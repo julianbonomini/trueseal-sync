@@ -3,6 +3,7 @@ use hush_noise::keypair::{generate_keypair as noise_generate, Keypair as NoiseKe
 use rand::thread_rng;
 
 use crate::envelope::SigningKeypair;
+use crate::keys::{NoisePublicKey, SigningPublicKey};
 
 /// A device's complete identity — bundles the X25519 keypair (for Noise XX
 /// sessions and addressed encryption) with the Ed25519 keypair (for signing
@@ -24,13 +25,13 @@ impl DeviceKeypair {
     }
 
     /// The device's X25519 public key — its identity on the relay.
-    pub fn public_key(&self) -> [u8; 32] {
-        self.noise.public_key
+    pub fn public_key(&self) -> NoisePublicKey {
+        NoisePublicKey(self.noise.public_key)
     }
 
-    /// The device's Ed25519 verifying key bytes — embedded in Envelopes as author_pub.
-    pub fn signing_public_key(&self) -> [u8; 32] {
-        self.signing.verifying_key().to_bytes()
+    /// The device's Ed25519 verifying key — embedded in Envelopes as author_pub.
+    pub fn signing_public_key(&self) -> SigningPublicKey {
+        SigningPublicKey(self.signing.verifying_key().to_bytes())
     }
 
     /// Wrap the device's Ed25519 signing key as a `SigningKeypair` for use with `Envelope::build`.

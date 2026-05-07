@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::device::DeviceKeypair;
+use crate::keys::NoisePublicKey;
 use crate::message;
 use crate::revocation::{self, PairedList};
 
@@ -43,20 +44,20 @@ impl HushDevice {
 
     /// X25519 noise public key (32 bytes) — the device's relay identity.
     pub fn noise_public_key(&self) -> Vec<u8> {
-        self.inner.noise.public_key.to_vec()
+        self.inner.public_key().0.to_vec()
     }
 
     /// Ed25519 signing public key (32 bytes) — embedded in Envelopes.
     pub fn signing_public_key(&self) -> Vec<u8> {
-        self.inner.signing_public_key().to_vec()
+        self.inner.signing_public_key().0.to_vec()
     }
 
     /// Produce a pairing payload (64 bytes) suitable for encoding as a QR code.
     /// The caller is responsible for QR encoding/decoding.
     pub fn pairing_payload(&self) -> Vec<u8> {
         message::pairing_payload(
-            &self.inner.noise.public_key,
-            &self.inner.signing_public_key(),
+            &self.inner.public_key().0,
+            &self.inner.signing_public_key().0,
         )
     }
 }
@@ -101,14 +102,14 @@ impl HushPairedList {
     /// Add a device's noise public key (32 bytes) to the trusted list.
     pub fn add(&self, noise_pub: Vec<u8>) {
         if let Ok(key) = noise_pub.as_slice().try_into() as Result<[u8; 32], _> {
-            self.inner.lock().unwrap().add(key);
+            self.inner.lock().unwrap().add(NoisePublicKey(key));
         }
     }
 
     /// Whether `noise_pub` is in the trusted list.
     pub fn contains(&self, noise_pub: Vec<u8>) -> bool {
         if let Ok(key) = noise_pub.as_slice().try_into() as Result<[u8; 32], _> {
-            return self.inner.lock().unwrap().contains(&key);
+            return self.inner.lock().unwrap().contains(&NoisePublicKey(key));
         }
         false
     }
@@ -134,7 +135,7 @@ pub fn handle_revoke(
     sender_noise_pub: Vec<u8>,
 ) -> Option<Arc<HushDevice>> {
     let key: [u8; 32] = sender_noise_pub.as_slice().try_into().ok()?;
-    let new_kp = revocation::handle_revoke(&mut list.inner.lock().unwrap(), &key)?;
+    let new_kp = revocation::handle_revoke(&mut list.inner.lock().unwrap(), &NoisePublicKey(key))?;
     Some(Arc::new(HushDevice { inner: new_kp }))
 }
 
