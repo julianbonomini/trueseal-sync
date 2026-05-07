@@ -4,3 +4,4 @@ pub mod envelope;
 pub mod message;
 pub mod operation_log;
 pub mod relay;
+pub mod revocation;
