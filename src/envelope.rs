@@ -45,12 +45,13 @@ impl SigningKeypair {
 
 /// An Envelope is the wire unit of sync. Wraps an encrypted payload with
 /// routing metadata the Relay can read, plus a signature only recipients verify.
+/// author_pub is NOT in the clear header — it is embedded inside the encrypted
+/// payload so the relay learns no stable sender identity (ADR-0018 / #49).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Envelope {
     pub sequence: u64,
     pub parents: Vec<[u8; 32]>,
     pub recipient_pub: [u8; 32],
-    pub author_pub: [u8; 32],
     pub signature: [u8; 64],
     pub payload: Vec<u8>,
 }
@@ -64,20 +65,17 @@ impl Envelope {
         author_keypair: &SigningKeypair,
         payload: Vec<u8>,
     ) -> Self {
-        let author_pub = author_keypair.public_key_bytes();
         let sig_bytes = sign(
             &author_keypair.0,
             sequence,
             &parents,
             &recipient_pub.0,
-            &author_pub,
             &payload,
         );
         Self {
             sequence,
             parents,
             recipient_pub: recipient_pub.0,
-            author_pub,
             signature: sig_bytes,
             payload,
         }
@@ -107,16 +105,16 @@ impl Envelope {
         )
     }
 
-    /// Verify the author signature over the envelope's signed fields.
-    /// Called by recipients — never by the Relay.
-    pub fn verify(&self) -> Result<(), EnvelopeError> {
-        let vk = VerifyingKey::from_bytes(&self.author_pub)
+    /// Verify the author signature using the author_pub extracted from the
+    /// decrypted payload. Called by recipients after decryption — never by the Relay.
+    /// Signing message: sequence || parents || recipient_pub || ciphertext.
+    pub fn verify_with(&self, author_pub: [u8; 32]) -> Result<(), EnvelopeError> {
+        let vk = VerifyingKey::from_bytes(&author_pub)
             .map_err(|_| EnvelopeError::InvalidKeyLength)?;
         let msg = signing_message(
             self.sequence,
             &self.parents,
             &self.recipient_pub,
-            &self.author_pub,
             &self.payload,
         );
         let sig = ed25519_dalek::Signature::from_bytes(&self.signature);
@@ -130,7 +128,6 @@ impl Envelope {
             sequence: self.sequence,
             parents: self.parents.iter().map(|p| p.to_vec()).collect(),
             recipient_pub: self.recipient_pub.to_vec(),
-            author_pub: self.author_pub.to_vec(),
             signature: self.signature.to_vec(),
             payload: self.payload.clone(),
         };
@@ -146,10 +143,6 @@ impl Envelope {
             .recipient_pub
             .try_into()
             .map_err(|_| EnvelopeError::DecodeFailed("recipient_pub must be 32 bytes".into()))?;
-        let author_pub = proto
-            .author_pub
-            .try_into()
-            .map_err(|_| EnvelopeError::DecodeFailed("author_pub must be 32 bytes".into()))?;
         let signature = proto
             .signature
             .try_into()
@@ -168,7 +161,6 @@ impl Envelope {
             sequence: proto.sequence,
             parents,
             recipient_pub,
-            author_pub,
             signature,
             payload: proto.payload,
         })
@@ -176,12 +168,11 @@ impl Envelope {
 }
 
 /// The canonical message bytes that are signed/verified.
-/// sequence (8 LE) || each parent (32) || recipient_pub (32) || author_pub (32) || payload
+/// sequence (8 LE) || each parent (32) || recipient_pub (32) || ciphertext
 fn signing_message(
     sequence: u64,
     parents: &[[u8; 32]],
     recipient_pub: &[u8; 32],
-    author_pub: &[u8; 32],
     payload: &[u8],
 ) -> Vec<u8> {
     let mut msg = Vec::new();
@@ -190,7 +181,6 @@ fn signing_message(
         msg.extend_from_slice(p);
     }
     msg.extend_from_slice(recipient_pub);
-    msg.extend_from_slice(author_pub);
     msg.extend_from_slice(payload);
     msg
 }
@@ -200,10 +190,9 @@ fn sign(
     sequence: u64,
     parents: &[[u8; 32]],
     recipient_pub: &[u8; 32],
-    author_pub: &[u8; 32],
     payload: &[u8],
 ) -> [u8; 64] {
-    let msg = signing_message(sequence, parents, recipient_pub, author_pub, payload);
+    let msg = signing_message(sequence, parents, recipient_pub, payload);
     key.sign(&msg).to_bytes()
 }
 
@@ -242,32 +231,69 @@ mod tests {
     /// A freshly built Envelope has a valid signature.
     #[test]
     fn built_envelope_verifies() {
-        let (env, _) = make_envelope();
-        env.verify().expect("signature should be valid");
+        let (env, author) = make_envelope();
+        env.verify_with(author.public_key_bytes())
+            .expect("signature should be valid");
     }
 
     /// Tampering with any signed field (e.g. sequence) invalidates the signature.
-    /// This catches man-in-the-middle modification and messages from unknown senders.
     #[test]
     fn tampered_sequence_fails_verification() {
-        let (mut env, _) = make_envelope();
-        env.sequence += 1; // tamper with a signed field
+        let (mut env, author) = make_envelope();
+        env.sequence += 1;
         assert!(
-            env.verify().is_err(),
+            env.verify_with(author.public_key_bytes()).is_err(),
             "tampered envelope should fail verification"
         );
     }
 
-    /// Unknown author_pub fails verification —
-    /// the signature was made by a different key than claimed.
+    /// verify_with a wrong key fails — the signature was made by a different key.
     #[test]
-    fn unknown_author_fails_verification() {
-        let (mut env, _) = make_envelope();
+    fn wrong_author_key_fails_verification() {
+        let (env, _) = make_envelope();
         let impostor = SigningKeypair::generate();
-        env.author_pub = impostor.public_key_bytes();
         assert!(
-            env.verify().is_err(),
-            "unknown author should fail verification"
+            env.verify_with(impostor.public_key_bytes()).is_err(),
+            "wrong author key should fail verification"
+        );
+    }
+
+    /// Attribution forgery (#49): device B signs an envelope whose ciphertext encodes
+    /// author_pub = A. Recipient decrypts → gets author_pub = A → verifies B's sig
+    /// using A's key → FAILS. The relay cannot fake sender identity.
+    #[test]
+    fn attribution_forgery_is_rejected() {
+        use crate::crypto;
+        use x25519_dalek::{PublicKey, StaticSecret};
+
+        // Device A — the claimed sender
+        let author_a = SigningKeypair::generate();
+
+        // Device B — the actual signer (the forger)
+        let author_b = SigningKeypair::generate();
+
+        // Recipient noise keypair
+        let recv_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let recv_pub = NoisePublicKey(*PublicKey::from(&recv_secret).as_bytes());
+        let recv_priv = *recv_secret.as_bytes();
+
+        // B encrypts a payload that claims author_pub = A
+        let plaintext = b"forged message";
+        let payload = crypto::encrypt(recv_pub, author_a.public_key_bytes(), plaintext);
+
+        // B builds and signs the envelope over the ciphertext
+        let env = Envelope::build(1, vec![], recv_pub, &author_b, payload);
+
+        // Recipient decrypts → extracts author_pub = A
+        let (extracted_author, _msg) = crypto::decrypt(recv_priv, &env.payload)
+            .expect("decryption should succeed");
+        assert_eq!(extracted_author, author_a.public_key_bytes(),
+            "extracted author_pub should be A's key");
+
+        // Verify using A's key — must FAIL because B signed, not A
+        assert!(
+            env.verify_with(extracted_author).is_err(),
+            "B's signature must not verify under A's key"
         );
     }
 
@@ -302,7 +328,7 @@ mod tests {
             "parent hash should match root.hash()"
         );
         assert!(
-            child.verify().is_ok(),
+            child.verify_with(author.public_key_bytes()).is_ok(),
             "child should have a valid signature"
         );
     }
@@ -321,9 +347,9 @@ mod tests {
         assert_eq!(e1.sequence, 1);
         assert_eq!(e2.sequence, 2);
         assert_eq!(e2.parents[0], e1.hash());
-        assert!(e0.verify().is_ok());
-        assert!(e1.verify().is_ok());
-        assert!(e2.verify().is_ok());
+        assert!(e0.verify_with(author.public_key_bytes()).is_ok());
+        assert!(e1.verify_with(author.public_key_bytes()).is_ok());
+        assert!(e2.verify_with(author.public_key_bytes()).is_ok());
     }
     #[test]
     fn parents_accepts_zero_one_and_many() {
@@ -332,11 +358,11 @@ mod tests {
 
         // Root: no parents
         let root = Envelope::build(0, vec![], recipient_pub, &author, vec![]);
-        assert!(root.verify().is_ok());
+        assert!(root.verify_with(author.public_key_bytes()).is_ok());
 
         // v0 standard: one parent (use build_chained)
         let child = Envelope::build_chained(&root, recipient_pub, &author, vec![]);
-        assert!(child.verify().is_ok());
+        assert!(child.verify_with(author.public_key_bytes()).is_ok());
 
         // v1 DAG: two parents (merge point) — use build directly
         let other_hash = child.hash();
@@ -347,7 +373,7 @@ mod tests {
             &author,
             vec![],
         );
-        assert!(merge.verify().is_ok());
+        assert!(merge.verify_with(author.public_key_bytes()).is_ok());
 
         // All round-trip through encode/decode
         for env in [&root, &child, &merge] {
@@ -357,13 +383,12 @@ mod tests {
     }
 
     /// Tampering with the payload invalidates the signature — the relay is zero-trust.
-    /// Any party in transit who swaps the encrypted payload bytes is detected by the recipient.
     #[test]
     fn tampered_payload_fails_verification() {
-        let (mut env, _) = make_envelope();
+        let (mut env, author) = make_envelope();
         env.payload = b"swapped payload".to_vec();
         assert!(
-            env.verify().is_err(),
+            env.verify_with(author.public_key_bytes()).is_err(),
             "tampered payload should fail verification"
         );
     }

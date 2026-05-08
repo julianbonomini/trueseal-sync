@@ -133,7 +133,7 @@ fn accept_member_with_unknown_token_returns_false() {
     {
         let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session::accept(pipe_relay, kp);
+            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
         });
     }
     let device = DeviceKeypair::generate();

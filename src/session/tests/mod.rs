@@ -8,6 +8,7 @@ mod manifest_filter;
 mod manifest_persist;
 mod member_events;
 mod members;
+mod nk_push;
 mod offline;
 mod outbox;
 mod pairing;

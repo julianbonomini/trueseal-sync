@@ -1,13 +1,21 @@
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use hush_noise::{
     keypair::{generate_keypair, Keypair},
-    session::accept,
+    session_xx::accept,
 };
 
 use crate::keys::NoisePublicKey;
 use crate::relay::{frame, parse, MsgType};
+
+/// Type alias so test files can name the pipe type without knowing internals.
+pub(super) type MemPipeSimple = MemPipe;
+
+/// Like `mem_pipe_pair` but with a shorter name for NK-push tests.
+pub(super) fn mem_pipe_pair_simple() -> (MemPipeSimple, MemPipeSimple) {
+    mem_pipe_pair()
+}
 
 // ── In-memory bidirectional pipe ─────────────────────────────────────────────
 
@@ -269,7 +277,7 @@ pub(super) fn spawn_tripartite_relay(
         });
 
         // Reader threads: one per session, routes to the other two channels.
-        let make_reader = |src: Arc<hush_noise::session::Session<MemPipe>>,
+        let make_reader = |src: Arc<hush_noise::session_xx::Session<MemPipe>>,
                            out1: mpsc::Sender<Vec<u8>>,
                            out2: mpsc::Sender<Vec<u8>>| {
             std::thread::spawn(move || loop {
@@ -290,3 +298,4 @@ pub(super) fn spawn_tripartite_relay(
         make_reader(sess_c, tx_a.clone(), tx_b.clone());
     });
 }
+

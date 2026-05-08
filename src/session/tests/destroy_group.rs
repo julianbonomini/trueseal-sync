@@ -20,7 +20,7 @@ fn destroy_group_fires_on_group_destroyed_on_initiator() {
     {
         let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session::accept(pipe_relay, kp);
+            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
         });
     }
     let device = DeviceKeypair::generate();
@@ -117,7 +117,7 @@ fn push_sync_after_destroy_returns_group_destroyed() {
     {
         let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session::accept(pipe_relay, kp);
+            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
         });
     }
     let device = DeviceKeypair::generate();
@@ -207,7 +207,7 @@ fn on_group_destroyed_callback_wipes_store() {
     {
         let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session::accept(pipe_relay, kp);
+            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
         });
     }
 

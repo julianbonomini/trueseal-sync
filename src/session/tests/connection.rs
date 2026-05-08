@@ -18,7 +18,7 @@ fn connection_changed_fires_true_on_initial_connect() {
     {
         let relay_kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session::accept(pipe_relay, relay_kp2);
+            let _ = hush_noise::session_xx::accept(pipe_relay, relay_kp2);
         });
     }
 
@@ -71,7 +71,7 @@ fn connection_changed_fires_sequence_on_disconnect_and_reconnect() {
     {
         let relay_kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session::accept(pipe1_relay, relay_kp2);
+            let _ = hush_noise::session_xx::accept(pipe1_relay, relay_kp2);
         });
     }
 
@@ -80,7 +80,7 @@ fn connection_changed_fires_sequence_on_disconnect_and_reconnect() {
     {
         let relay_kp3 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session::accept(pipe2_relay, relay_kp3);
+            let _ = hush_noise::session_xx::accept(pipe2_relay, relay_kp3);
         });
     }
 

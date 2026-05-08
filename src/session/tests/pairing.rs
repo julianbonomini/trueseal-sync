@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hush_noise::{keypair::Keypair, session::accept};
+use hush_noise::{keypair::Keypair, session_xx::accept};
 
 use crate::device::DeviceKeypair;
 use crate::keys::NoisePublicKey;

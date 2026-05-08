@@ -109,7 +109,7 @@ fn accept_pair_without_window_returns_false() {
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay_kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
     std::thread::spawn(move || {
-        let _ = hush_noise::session::accept(pipe_relay, relay_kp2);
+        let _ = hush_noise::session_xx::accept(pipe_relay, relay_kp2);
     });
 
     let device = DeviceKeypair::generate();

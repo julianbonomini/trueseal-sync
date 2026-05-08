@@ -20,7 +20,16 @@ const EPH_PUB_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const OVERHEAD: usize = EPH_PUB_LEN + NONCE_LEN;
 
-pub fn encrypt(recipient_pub: NoisePublicKey, plaintext: &[u8]) -> Vec<u8> {
+pub fn encrypt(recipient_pub: NoisePublicKey, author_pub: [u8; 32], plaintext: &[u8]) -> Vec<u8> {
+    // Prepend author_pub to plaintext so the relay learns no stable sender identity.
+    // The recipient extracts it after decryption.
+    let mut inner = Vec::with_capacity(32 + plaintext.len());
+    inner.extend_from_slice(&author_pub);
+    inner.extend_from_slice(plaintext);
+    encrypt_raw(recipient_pub, &inner)
+}
+
+fn encrypt_raw(recipient_pub: NoisePublicKey, plaintext: &[u8]) -> Vec<u8> {
     // Generate ephemeral keypair
     let eph_secret = StaticSecret::random_from_rng(rand::thread_rng());
     let eph_public = PublicKey::from(&eph_secret);
@@ -52,9 +61,18 @@ pub fn encrypt(recipient_pub: NoisePublicKey, plaintext: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The private key counterpart — raw bytes kept as `[u8; 32]` since
-/// `NoisePublicKey` is the public-facing type; private keys are never shared.
-pub fn decrypt(my_priv: [u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+/// Returns `(author_pub, message_bytes)` on success.
+pub fn decrypt(my_priv: [u8; 32], ciphertext: &[u8]) -> Result<([u8; 32], Vec<u8>), CryptoError> {
+    let inner = decrypt_raw(my_priv, ciphertext)?;
+    if inner.len() < 32 {
+        return Err(CryptoError::DecryptionFailed);
+    }
+    let author_pub: [u8; 32] = inner[..32].try_into().unwrap();
+    let message = inner[32..].to_vec();
+    Ok((author_pub, message))
+}
+
+fn decrypt_raw(my_priv: [u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if ciphertext.len() < OVERHEAD {
         return Err(CryptoError::DecryptionFailed);
     }
@@ -94,14 +112,29 @@ mod tests {
         (*secret.as_bytes(), NoisePublicKey(*public.as_bytes()))
     }
 
+    /// Tracer bullet: encrypt with author_pub embedded; decrypt returns (author_pub, plaintext).
+    #[test]
+    fn encrypted_blob_with_author_pub_round_trips() {
+        let (priv_b, pub_b) = generate_keypair();
+        let author_pub = [0x42u8; 32];
+        let plaintext = b"hello hush-sync";
+
+        let ciphertext = encrypt(pub_b, author_pub, plaintext);
+        let (got_author, got_plain) = decrypt(priv_b, &ciphertext).expect("decryption should succeed");
+
+        assert_eq!(got_author, author_pub);
+        assert_eq!(got_plain, plaintext);
+    }
+
     /// Tracer bullet: a blob encrypted to a recipient can be decrypted by that recipient.
     #[test]
     fn encrypted_blob_round_trips() {
         let (priv_b, pub_b) = generate_keypair();
+        let author_pub = [0x01u8; 32];
         let plaintext = b"hello hush-sync";
 
-        let ciphertext = encrypt(pub_b, plaintext);
-        let recovered = decrypt(priv_b, &ciphertext).expect("decryption should succeed");
+        let ciphertext = encrypt(pub_b, author_pub, plaintext);
+        let (_, recovered) = decrypt(priv_b, &ciphertext).expect("decryption should succeed");
 
         assert_eq!(recovered, plaintext);
     }
@@ -110,10 +143,12 @@ mod tests {
     #[test]
     fn empty_plaintext_round_trips() {
         let (priv_b, pub_b) = generate_keypair();
+        let author_pub = [0x02u8; 32];
 
-        let ciphertext = encrypt(pub_b, b"");
-        let recovered = decrypt(priv_b, &ciphertext).expect("empty plaintext should decrypt");
+        let ciphertext = encrypt(pub_b, author_pub, b"");
+        let (got_author, recovered) = decrypt(priv_b, &ciphertext).expect("empty plaintext should decrypt");
 
+        assert_eq!(got_author, author_pub);
         assert_eq!(recovered, b"");
     }
 
@@ -121,10 +156,11 @@ mod tests {
     #[test]
     fn large_plaintext_round_trips() {
         let (priv_b, pub_b) = generate_keypair();
+        let author_pub = [0x03u8; 32];
         let plaintext = vec![0xabu8; 1024 * 1024];
 
-        let ciphertext = encrypt(pub_b, &plaintext);
-        let recovered = decrypt(priv_b, &ciphertext).expect("large plaintext should decrypt");
+        let ciphertext = encrypt(pub_b, author_pub, &plaintext);
+        let (_, recovered) = decrypt(priv_b, &ciphertext).expect("large plaintext should decrypt");
 
         assert_eq!(recovered, plaintext);
     }
@@ -135,7 +171,7 @@ mod tests {
         let (_priv_a, pub_b) = generate_keypair();
         let (priv_wrong, _pub_wrong) = generate_keypair();
 
-        let ciphertext = encrypt(pub_b, b"secret");
+        let ciphertext = encrypt(pub_b, [0x04u8; 32], b"secret");
         let result = decrypt(priv_wrong, &ciphertext);
 
         assert!(
@@ -148,7 +184,7 @@ mod tests {
     #[test]
     fn truncated_ciphertext_returns_error() {
         let (priv_b, pub_b) = generate_keypair();
-        let ciphertext = encrypt(pub_b, b"secret");
+        let ciphertext = encrypt(pub_b, [0x05u8; 32], b"secret");
         // Cut off all but the first 4 bytes (less than nonce+tag overhead).
         let truncated = &ciphertext[..4];
         let result = decrypt(priv_b, truncated);

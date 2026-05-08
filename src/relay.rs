@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use hush_noise::{
     keypair::Keypair as NoiseKeypair,
-    session::{dial, Session},
+    session_xx::{dial, Session},
 };
 use thiserror::Error;
 
@@ -143,7 +143,8 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         author_signing: &crate::envelope::SigningKeypair,
     ) -> Result<(), RelayError> {
         let plaintext = message.encode();
-        let payload = crypto::encrypt(recipient_pub, &plaintext);
+        let author_pub = author_signing.public_key_bytes();
+        let payload = crypto::encrypt(recipient_pub, author_pub, &plaintext);
         let envelope = Envelope::build(sequence, parents, recipient_pub, author_signing, payload);
         let body = envelope.encode();
         let framed = frame(MsgType::Push, &body);
@@ -253,14 +254,12 @@ fn run_loop<T: Read + Write + Send + 'static>(
             Ok(raw) => {
                 if let Some((MsgType::Deliver, body)) = parse(&raw) {
                     if let Ok(env) = Envelope::decode(body) {
-                        // Verify the author signature before decrypting — detect
-                        // tampered envelopes at the cheapest possible point (ADR-0005,
-                        // ADR-0013). A tampered ciphertext would also fail AEAD, but
-                        // verify-first is the cryptographically idiomatic ordering.
-                        if env.verify().is_ok() {
-                            if let Ok(plaintext) = crypto::decrypt(my_noise_priv, &env.payload) {
+                        // New flow (ADR-0018 / #49): decrypt first to extract
+                        // author_pub from the payload, then verify the signature
+                        // using that key. author_pub is no longer in the clear header.
+                        if let Ok((author_pub, plaintext)) = crypto::decrypt(my_noise_priv, &env.payload) {
+                            if env.verify_with(author_pub).is_ok() {
                                 if let Ok(msg) = Message::decode(&plaintext) {
-                                    let author_pub = env.author_pub;
                                     let cbs = callbacks.lock().unwrap();
                                     for cb in cbs.iter() {
                                         cb(msg.clone(), author_pub);
@@ -294,6 +293,28 @@ impl RelayClient<TcpStream> {
     }
 }
 
+/// Opens a fresh Noise NK push session, sends `blob` as a framed Push message,
+/// closes the session immediately, and returns the ephemeral public key used.
+///
+/// The relay sees this ephemeral key but cannot link it to the device's stable
+/// noise identity — a fresh keypair is generated on every call (ADR-0018 / #51).
+pub fn push_send<T: Read + Write + Send>(
+    transport: T,
+    relay_pub: [u8; 32],
+    blob: Vec<u8>,
+) -> Result<[u8; 32], RelayError> {
+    use hush_noise::keypair::generate_keypair;
+    let fresh_kp = generate_keypair();
+    let eph_pub = fresh_kp.public_key;
+    let session = hush_noise::session_nk::dial(transport, fresh_kp, relay_pub)
+        .map_err(|e| RelayError::HandshakeFailed(e))?;
+    session
+        .send(&blob)
+        .map_err(|e| RelayError::PushFailed(e))?;
+    session.close().ok();
+    Ok(eph_pub)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,7 +324,7 @@ mod tests {
     use crate::message::Message;
     use hush_noise::{
         keypair::{generate_keypair, Keypair},
-        session::accept,
+        session_xx::accept,
     };
     use std::io;
     use std::sync::{Arc, Mutex};
@@ -483,7 +504,7 @@ mod tests {
         {
             let recipient_pub = recipient.public_key();
             let plaintext = msg_to_deliver.encode();
-            let payload = crate::crypto::encrypt(recipient_pub, &plaintext);
+            let payload = crate::crypto::encrypt(recipient_pub, sender_signing.public_key_bytes(), &plaintext);
             let env = Envelope::build(1, vec![], recipient_pub, &sender_signing, payload);
             let env_bytes = env.encode();
 

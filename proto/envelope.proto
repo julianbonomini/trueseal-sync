@@ -24,19 +24,14 @@ message Envelope {
   // Inbox identified by this key. 32 bytes.
   bytes recipient_pub = 3;
 
-  // X25519 public key of the sending Device. Recipients use this to
-  // verify the signature. Never used by the Relay (ADR-0007). 32 bytes.
-  bytes author_pub = 4;
-
-  // Ed25519 signature over the canonical encoding of:
-  //   sequence || parents || recipient_pub || author_pub
+  // Ed25519 signature over: sequence || parents || recipient_pub || ciphertext.
+  // author_pub is inside the encrypted payload — the relay never sees it (ADR-0018).
   // Signed by the author's Ed25519 private key.
-  // Verified by recipients only — the Relay forwards this blindly (ADR-0007).
-  // 64 bytes.
+  // Verified by recipients after decryption. 64 bytes.
   bytes signature = 5;
 
-  // Addressed-encrypted payload. Encrypted with crypto::encrypt(recipient_pub, plaintext).
-  // Opaque to the Relay. Callers embed object identity, type, and schema
-  // version inside the plaintext before encrypting.
+  // Addressed-encrypted payload. Encrypted with crypto::encrypt(recipient_pub, author_pub, plaintext).
+  // First 32 bytes of the decrypted plaintext are author_pub (Ed25519 signing key).
+  // Opaque to the Relay.
   bytes payload = 6;
 }

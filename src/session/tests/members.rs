@@ -17,7 +17,7 @@ fn members_empty_when_no_manifest() {
     {
         let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session::accept(pipe_relay, kp);
+            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
         });
     }
     let device = DeviceKeypair::generate();
@@ -45,7 +45,7 @@ fn members_excludes_local_device() {
     {
         let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session::accept(pipe_relay, kp);
+            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
         });
     }
 
@@ -94,7 +94,7 @@ fn members_id_and_name_are_stable() {
     {
         let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session::accept(pipe_relay, kp);
+            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
         });
     }
 

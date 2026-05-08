@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use hush_noise::{keypair::Keypair, session::accept};
+use hush_noise::{keypair::Keypair, session_xx::accept};
 
 use crate::device::DeviceKeypair;
 use crate::message::Message;

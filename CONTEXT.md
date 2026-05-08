@@ -13,7 +13,7 @@ A long-term X25519 identity for a Device. Generated once per device, persisted l
 _Avoid_: credentials, identity key, key pair (two words)
 
 **Relay**:
-The infrastructure component that stores and forwards Blobs between Devices. Always in the path for remote sync. Zero-knowledge with respect to *content* — it never decrypts payloads and never learns Sync Group membership. In v0 the relay does observe sender identity: every Envelope carries an unencrypted `author_pub` field (the sender's Ed25519 signing key), so the relay can observe the sender↔recipient communication graph. This is a known gap documented in ADR-0018; moving `author_pub` inside the encrypted payload is deferred to v1. Holds Blobs addressed to offline recipients until they reconnect (30-day TTL), then deletes on delivery. Does not hold anything on behalf of offline senders — that is the sender's local responsibility.
+The infrastructure component that stores and forwards Blobs between Devices. Always in the path for remote sync. Zero-knowledge — it never decrypts content, never learns Sync Group membership, and cannot identify who sent any Blob. Push Sessions use ephemeral, unlinkable keypairs (ADR-0018), so the relay cannot associate a push with any Device. The relay learns exactly two things: which noise public keys are actively connected (to deliver Blobs on arrival), and `recipient_pub` per Envelope (required for routing). Holds Blobs addressed to offline recipients until they reconnect (30-day TTL), then deletes on delivery. Does not hold anything on behalf of offline senders — that is the sender's local responsibility.
 _Avoid_: server, TURN server, signaling server, hub
 
 **Blob**:
@@ -89,19 +89,27 @@ A monotonically increasing integer counter owned by a Device. Increments once pe
 _Avoid_: message number, event ID, offset, version (those imply per-object scoping)
 
 **Envelope**:
-The metadata wrapper around a Blob that the Relay can read without decrypting content. Contains: a per-device global sequence number, parent hashes (for DAG causality), recipient public key, author public key, signature, and an opaque encrypted payload. The object ID lives inside the encrypted payload — the Relay never sees it. The sequence counter belongs to the sending Device, not to any Object — it increments once per Envelope sent, across all Objects.
+The metadata wrapper around a Blob that the Relay can read without decrypting content. Contains: a per-device global sequence number, parent hashes (for DAG causality), recipient public key, signature, and an opaque encrypted payload. The author's signing public key (`author_pub`) is prepended to the message bytes inside the encrypted payload — invisible to the Relay. The object ID also lives inside the encrypted payload — the Relay never sees it. The sequence counter belongs to the sending Device, not to any Object — it increments once per Envelope sent, across all Objects.
 _Avoid_: header, wrapper, frame, message
 
 **Parent Hash**:
 A cryptographic hash of a preceding Envelope in the same Object's Operation Log. In v0 every Envelope has exactly one parent (or zero for the root). In v1 multiple parents express concurrent branches (DAG). The field exists in v0 envelopes to avoid a breaking wire format change when v1 is introduced.
 _Avoid_: previous, predecessor, pointer
 
+**Receive Session**:
+A long-lived, authenticated, forward-secret connection between a Device and the Relay, established via a Noise XX handshake using the Device's stable noise keypair. The relay maintains a `noise_pub → active connection` map and delivers inbound Blobs over this channel (push-on-arrival). Each Device holds exactly one Receive Session at a time. Distinct from blob encryption — a Session is a live channel, not a stored payload.
+_Avoid_: connection, socket, channel, stream
+
+**Push Session**:
+A short-lived, anonymous connection from a Device to the Relay used solely to send Blobs. Established via a Noise NK handshake with a fresh ephemeral X25519 keypair generated per push — the relay authenticates to the Device (Device verifies `relay_pub`) but learns no stable client identity. Closed immediately after the push completes. The relay cannot link a Push Session to any Device or Receive Session (ADR-0018).
+_Avoid_: connection, send session, upload session
+
 **Session**:
-A live, authenticated, forward-secret connection between a Device and the Relay, established via a Noise XX handshake over TCP. Used for push-on-arrival notifications and blob delivery. Distinct from blob encryption — a Session is a live channel, not a stored payload.
+Umbrella term for a Device's active relay connections: one Receive Session (long-lived, identified) and Push Sessions (short-lived, anonymous, opened on demand). Distinct from blob encryption — Sessions are live channels, not stored payloads.
 _Avoid_: connection, socket, channel, stream
 
 **Addressed Encryption**:
-The scheme used to encrypt Blob content for a specific recipient Device. Raw X25519 key agreement + ChaCha20-Poly1305 using the recipient's static public key. At-rest encryption — independent of any live Session. A Blob encrypted this way can be stored on the Relay and decrypted later by the recipient without an active Session.
+The scheme used to encrypt Blob content for a specific recipient Device. Raw X25519 key agreement + ChaCha20-Poly1305 using the recipient's static public key. At-rest encryption — independent of any live Session. The plaintext encrypted is `author_pub (32 bytes) || message_tag (1 byte) || message_body` — the sender's identity is bound inside the ciphertext and is invisible to the Relay. A Blob encrypted this way can be stored on the Relay and decrypted later by the recipient without an active Session.
 _Avoid_: Noise (Noise is for Sessions, not Blobs), asymmetric encryption (too generic)
 
 **Revocation**:
