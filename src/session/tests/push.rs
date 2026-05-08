@@ -173,3 +173,69 @@ fn on_message_receives_sender_signing_pub() {
         "B should receive A's signing public key"
     );
 }
+
+/// An envelope encrypted to B's noise key, mis-delivered to A's session,
+/// must be silently dropped — A's on_message must not fire.
+/// Zero-trust property: mis-routed or maliciously addressed blobs are garbage
+/// to the wrong recipient.
+#[test]
+fn envelope_addressed_to_wrong_key_is_silently_dropped() {
+    use hush_noise::session_xx::accept;
+
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+
+    // Two pipes: one for A, one for the sender.
+    let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
+    let (pipe_sender_client, pipe_sender_relay) = mem_pipe_pair();
+
+    // Raw relay: accepts sender first, A second. Routes ALL of sender's pushes to A.
+    {
+        let relay_kp_s = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let relay_kp_a = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        std::thread::spawn(move || {
+            let sess_sender = accept(pipe_sender_relay, relay_kp_s).unwrap();
+            let sess_a = accept(pipe_a_relay, relay_kp_a).unwrap();
+            loop {
+                let raw = match sess_sender.receive() {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                if let Some((MsgType::Push, body)) = parse(&raw) {
+                    let _ = sess_a.send(&crate::relay::frame(MsgType::Deliver, body));
+                }
+            }
+        });
+    }
+
+    let device_a = DeviceKeypair::generate();
+    let device_b = DeviceKeypair::generate(); // B is the intended recipient
+    let device_sender = DeviceKeypair::generate();
+    let b_noise = device_b.public_key(); // envelope will be encrypted for B
+
+    let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
+    let rx = received.clone();
+
+    // Sender connects first (relay accepts sender first).
+    let session_sender =
+        HushSession::connect(pipe_sender_client, relay_pub, device_sender, |_, _| {})
+            .expect("sender");
+    // A connects second.
+    let _session_a = HushSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _| {
+        rx.lock().unwrap().push(msg);
+    })
+    .expect("session A");
+
+    // Sender pushes a Sync message encrypted for B's noise_pub — wrong key for A.
+    session_sender
+        .push_message(&Message::Sync { body: b"misdirected".to_vec() }, b_noise)
+        .expect("push");
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    // A must not have received anything.
+    assert!(
+        received.lock().unwrap().is_empty(),
+        "A must not receive an envelope addressed to B"
+    );
+}
