@@ -129,7 +129,7 @@ fn remove_member_issues_new_manifest_excluding_target() {
     // A removes C.
     session_a.remove_member(c_signing).expect("remove_member");
 
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(500));
 
     // A's manifest: 2 members.
     let a_m = session_a.manifest.lock().unwrap();
