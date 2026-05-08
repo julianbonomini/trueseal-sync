@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -8,6 +8,7 @@ use crate::device::DeviceKeypair;
 use crate::envelope::Envelope;
 use crate::operation_log::MemLog;
 use crate::relay::{parse, MsgType};
+use crate::store::{PersistentLog, Store};
 
 use super::super::test_helpers::*;
 use super::super::HushSession;
@@ -196,4 +197,141 @@ fn push_sync_while_disconnected_queues_and_returns_ok() {
     // Exactly one outbox entry must exist (one recipient, not duplicated by retry).
     let undelivered = session.op_log.lock().unwrap().undelivered_entries();
     assert_eq!(undelivered.len(), 1, "entry should be queued in outbox");
+}
+
+/// End-to-end crash recovery: PersistentLog survives session drop and replays
+/// undelivered blobs when a new session connects to the relay.
+///
+/// Simulates: push offline → process crash (session drop) → reopen same DB →
+/// new session connects → outbox replayed → relay receives all blobs.
+#[test]
+fn outbox_survives_crash_and_replays_on_reconnect() {
+    // ── Step 1: first session, push blobs while offline ───────────────────────
+    let tmp = tempfile::TempDir::new().expect("tmp dir");
+    let store1 = Store::open(tmp.path(), "test").expect("open store");
+    let log1 = PersistentLog::new(store1);
+
+    let device = DeviceKeypair::generate();
+    let peer = DeviceKeypair::generate();
+    let d_noise = device.public_key();
+    let d_signing = device.signing_public_key();
+    let d_sk = SigningKey::from_bytes(&device.signing.to_bytes());
+    let p_noise = peer.public_key();
+    let p_signing = peer.signing_public_key();
+    // Save device bytes for reconstruction after simulated crash.
+    let device_noise_priv = device.noise.private();
+    let device_signing_priv = device.signing.to_bytes();
+
+    // Set up relay2 upfront — the factory provides it after "crash recovery".
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+
+    // Relay2 counts received pushes and signals when all arrive.
+    let relay2_received: Arc<(Mutex<u32>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
+    let rr = relay2_received.clone();
+    let (pipe2_client, pipe2_relay) = mem_pipe_pair();
+    {
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        std::thread::spawn(move || {
+            let s = accept(pipe2_relay, relay_kp2).unwrap();
+            loop {
+                match s.receive() {
+                    Ok(raw) => {
+                        if let Some((MsgType::Push, _)) = parse(&raw) {
+                            let (lock, cvar) = &*rr;
+                            *lock.lock().unwrap() += 1;
+                            cvar.notify_all();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Session 1: starts offline (connect_background), pushes 2 blobs to outbox.
+    let pipe2_slot: Arc<Mutex<Option<MemPipe>>> = Arc::new(Mutex::new(Some(pipe2_client)));
+    {
+        let pipe2_slot2 = pipe2_slot.clone();
+        let device1 = DeviceKeypair::from_bytes(device_noise_priv, device_signing_priv)
+            .expect("reconstruct device1");
+        let session1 = HushSession::connect_background(
+            relay_pub,
+            device1,
+            |_, _| {},
+            Box::new(log1),
+            || {},
+            |_| {},
+            || {},
+            move || {
+                pipe2_slot2
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| "exhausted".to_string())
+            },
+            Some(Duration::from_millis(50)),
+            None,
+        )
+        .expect("session1");
+
+        session1.set_manifest(make_two_member_manifest(
+            d_noise, d_signing, &d_sk, p_noise, p_signing,
+        ));
+
+        // Push while offline — queued to PersistentLog.
+        session1.push_sync(b"blob-1".to_vec()).expect("push 1");
+        session1.push_sync(b"blob-2".to_vec()).expect("push 2");
+
+        let undelivered = session1.op_log.lock().unwrap().undelivered_entries();
+        assert_eq!(undelivered.len(), 2, "2 entries in outbox before crash");
+
+        // session1 drops here — simulates process crash.
+    }
+
+    // ── Step 2: reopen DB, verify entries persisted ───────────────────────────
+    let store2 = Store::open(tmp.path(), "test").expect("reopen store");
+    let log2 = PersistentLog::new(store2);
+    {
+        use crate::operation_log::OperationLog;
+        let entries = log2.undelivered_entries();
+        assert_eq!(entries.len(), 2, "entries persist across session drop");
+    }
+
+    // ── Step 3: new session with same DB, reconnect loop replays outbox ───────
+    let device2 = DeviceKeypair::from_bytes(device_noise_priv, device_signing_priv)
+        .expect("reconstruct device");
+    let session2 = HushSession::connect_background(
+        relay_pub,
+        device2,
+        |_, _| {},
+        Box::new(log2),
+        || {},
+        |_| {},
+        || {},
+        move || {
+            pipe2_slot
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| "exhausted".to_string())
+        },
+        Some(Duration::from_millis(50)),
+        None,
+    )
+    .expect("session2");
+
+    // Wait until relay2 receives both replayed pushes (structural, not sleep).
+    {
+        let (lock, cvar) = &*relay2_received;
+        let result = cvar
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |n| *n < 2)
+            .unwrap();
+        assert!(!result.1.timed_out(), "relay must receive both replayed blobs within 5s");
+        assert_eq!(*result.0, 2, "relay received exactly 2 pushes");
+    }
+
+    // Outbox must be empty after replay.
+    let undelivered = session2.op_log.lock().unwrap().undelivered_entries();
+    assert!(undelivered.is_empty(), "outbox empty after replay");
 }
