@@ -10,7 +10,7 @@ use crate::operation_log::MemLog;
 use crate::relay::{frame, parse, MsgType};
 
 use super::super::test_helpers::*;
-use super::super::HushSession;
+use super::super::{HushSession, SessionError};
 use super::make_two_member_manifest;
 
 /// Regression: after B reconnects, A's destroy_group must still fire B's on_group_destroyed.
@@ -49,7 +49,6 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
             device_a,
             |_, _| {},
             Box::new(MemLog::new()),
-            |_| {},
             || {},
             |_| {},
             || {},
@@ -76,7 +75,6 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
             device_b,
             |_, _| {},
             Box::new(MemLog::new()),
-            |_| {},
             || {},
             |_| {},
             move || {
@@ -145,7 +143,6 @@ fn destroy_group_fires_on_group_destroyed_for_all_members() {
             device_a,
             |_, _| {},
             Box::new(MemLog::new()),
-            |_| {},
             || {},
             |_| {},
             move || {
@@ -164,7 +161,6 @@ fn destroy_group_fires_on_group_destroyed_for_all_members() {
             device_b,
             |_, _| {},
             Box::new(MemLog::new()),
-            |_| {},
             || {},
             |_| {},
             move || {
@@ -230,17 +226,19 @@ fn revoke_from_unknown_device_is_ignored() {
     let trusted_noise = device_trusted.public_key();
     let trusted_signing = device_trusted.signing_public_key();
 
-    let rotated: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-    let rc = rotated.clone();
+    let destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let dc = destroyed.clone();
     let session_a = Arc::new(
-        HushSession::connect_with_log(
+        HushSession::connect_full(
             pipe_a_client,
             relay_pub,
             device_a,
             |_, _| {},
             Box::new(MemLog::new()),
-            move |_| {
-                *rc.lock().unwrap() += 1;
+            || {},
+            |_| {},
+            move || {
+                *dc.lock().unwrap() += 1;
             },
         )
         .expect("session A"),
@@ -262,7 +260,11 @@ fn revoke_from_unknown_device_is_ignored() {
 
     std::thread::sleep(Duration::from_millis(100));
 
-    assert_eq!(*rotated.lock().unwrap(), 0, "no rotation from stranger");
+    assert_eq!(
+        *destroyed.lock().unwrap(),
+        0,
+        "no group_destroyed from stranger"
+    );
     assert_eq!(
         session_a
             .manifest
@@ -276,9 +278,9 @@ fn revoke_from_unknown_device_is_ignored() {
     );
 }
 
-/// revoke() with no manifest still rotates keys and fires on_keypair_rotated.
+/// destroy_group() with no manifest fires on_group_destroyed and sets terminal state.
 #[test]
-fn revoke_with_empty_manifest_still_rotates_keys() {
+fn destroy_group_with_no_manifest_fires_callback_and_is_terminal() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
@@ -290,33 +292,37 @@ fn revoke_with_empty_manifest_still_rotates_keys() {
     }
 
     let device = DeviceKeypair::generate();
-    let original_noise_pub = device.public_key();
 
-    let rotated: Arc<Mutex<Vec<[u8; 64]>>> = Arc::new(Mutex::new(Vec::new()));
-    let rc = rotated.clone();
-    let session = HushSession::connect_with_log(
+    let destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let dc = destroyed.clone();
+    let session = HushSession::connect_full(
         pipe_client,
         relay_pub,
         device,
         |_, _| {},
         Box::new(MemLog::new()),
-        move |bytes| {
-            rc.lock().unwrap().push(bytes);
+        || {},
+        |_| {},
+        move || {
+            *dc.lock().unwrap() += 1;
         },
     )
     .expect("connect");
 
     assert!(session.manifest.lock().unwrap().is_none());
-    session.revoke();
+    session.destroy_group();
 
     assert_eq!(
-        rotated.lock().unwrap().len(),
+        *destroyed.lock().unwrap(),
         1,
-        "on_keypair_rotated should fire"
+        "on_group_destroyed should fire"
     );
-    assert_ne!(
-        session.noise_pub(),
-        original_noise_pub,
-        "noise pub should change after revoke"
+    // Session is terminal.
+    assert!(
+        matches!(
+            session.push_sync(b"test".to_vec()),
+            Err(SessionError::GroupDestroyed)
+        ),
+        "session terminal after destroy_group"
     );
 }

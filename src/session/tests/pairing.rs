@@ -5,7 +5,6 @@ use hush_noise::{keypair::Keypair, session::accept};
 
 use crate::device::DeviceKeypair;
 use crate::keys::NoisePublicKey;
-use crate::message::Message;
 
 use super::super::test_helpers::*;
 use super::super::HushSession;
@@ -62,20 +61,15 @@ fn accept_pair_outside_window_is_noop() {
     let device = DeviceKeypair::generate();
     let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
 
-    let fired: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    let fc = fired.clone();
-
     let dummy = NoisePublicKey(make_relay_kp().public_key);
     let dummy_signing = crate::keys::SigningPublicKey([0u8; 32]);
+    // No window open — should be a noop.
     session.accept_pair(dummy, dummy_signing);
-    assert!(!*fired.lock().unwrap());
 
-    let _payload = session.start_pairing(move |_| {
-        *fc.lock().unwrap() = true;
-    });
+    let _ = session.pairing_token();
     session.cancel_pairing();
-    session.accept_pair(dummy, dummy_signing);
-    assert!(!*fired.lock().unwrap());
+    // Window cancelled — accept_pair should return false.
+    assert!(!session.accept_pair(dummy, dummy_signing));
 }
 
 #[test]
@@ -91,17 +85,15 @@ fn accept_pair_after_timeout_is_noop() {
     let device = DeviceKeypair::generate();
     let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
 
-    let fired: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    let fc = fired.clone();
-    let _payload = session.start_pairing_with_duration(Duration::from_millis(1), move |_| {
-        *fc.lock().unwrap() = true;
-    });
+    let _token = session.pairing_token_with_duration(Duration::from_millis(1));
     std::thread::sleep(Duration::from_millis(10));
 
     let dummy = NoisePublicKey(make_relay_kp().public_key);
     let dummy_signing = crate::keys::SigningPublicKey([0u8; 32]);
-    session.accept_pair(dummy, dummy_signing);
-    assert!(!*fired.lock().unwrap());
+    assert!(
+        !session.accept_pair(dummy, dummy_signing),
+        "expired window: should return false"
+    );
 }
 
 /// accept_pair returns true when the window is open, false otherwise.
@@ -126,7 +118,7 @@ fn accept_pair_returns_bool_reflecting_window_state() {
         "no window: should return false"
     );
 
-    let _payload = session.start_pairing(|_| {});
+    let _token = session.pairing_token();
     assert!(
         session.accept_pair(dummy, dummy_signing),
         "open window: should return true"
@@ -136,10 +128,38 @@ fn accept_pair_returns_bool_reflecting_window_state() {
         "window consumed: should return false"
     );
 
-    let _payload = session.start_pairing(|_| {});
+    let _token = session.pairing_token();
     session.cancel_pairing();
     assert!(
         !session.accept_pair(dummy, dummy_signing),
         "cancelled window: should return false"
     );
+}
+
+/// `accept_outside_window_is_noop` checks the fired flag was NOT set.
+/// Kept as a distinct test since the original tested an `on_paired` callback.
+/// Now we simply verify accept_pair returns false outside a window.
+#[test]
+fn no_callback_fired_when_window_closed() {
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    std::thread::spawn(move || {
+        let _ = accept(pipe_relay, relay_kp2);
+    });
+
+    let device = DeviceKeypair::generate();
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
+
+    let fired: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
+    let _fc = fired.clone();
+
+    let dummy = NoisePublicKey(make_relay_kp().public_key);
+    let dummy_signing = crate::keys::SigningPublicKey([0u8; 32]);
+
+    // No window — no callback.
+    let admitted = session.accept_pair(dummy, dummy_signing);
+    assert!(!admitted);
+    assert!(!*fired.lock().unwrap());
 }

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::device::DeviceKeypair;
-use crate::keys::{NoisePublicKey, SigningPublicKey};
+use crate::keys::NoisePublicKey;
 use crate::message::Message;
 use crate::session::{HushSession, SessionError as CoreSessionError};
 use crate::store::{PersistentLog, Store};
@@ -73,14 +73,6 @@ pub trait MessageCallback: Send + Sync {
     fn on_message(&self, blob: Vec<u8>, sender_noise_pub: Vec<u8>);
 }
 
-/// Fired after this device's keypair is rotated (revocation).
-/// `keypair_bytes` is `noise_priv (32) || signing_priv (32)` — 64 bytes total.
-/// The caller must persist this to replace the stored keypair.
-#[uniffi::export(callback_interface)]
-pub trait KeypairRotatedCallback: Send + Sync {
-    fn on_keypair_rotated(&self, keypair_bytes: Vec<u8>);
-}
-
 /// Fired when this device is excluded from an incoming `GroupManifest` update.
 /// Another group member has issued a Soft Removal of this device (ADR-0015).
 /// The session remains connected; the caller decides whether to wipe and re-pair.
@@ -135,7 +127,6 @@ impl HushFfiSession {
     /// - `relay_addr`: TCP address, e.g. `"relay.example.com:4433"`
     /// - `relay_pub`: 32-byte X25519 relay public key (wrong length → `InvalidRelayPublicKey`)
     /// - `on_message`: called for every inbound `Sync` message
-    /// - `on_keypair_rotated`: called after key rotation (legacy — will be removed in #48)
     ///
     /// The identity keypair is loaded from SQLite or auto-generated on first launch.
     /// Automatically reconnects on relay disconnects using an exponential backoff
@@ -147,7 +138,6 @@ impl HushFfiSession {
         relay_addr: String,
         relay_pub: Vec<u8>,
         on_message: Box<dyn MessageCallback>,
-        on_keypair_rotated: Box<dyn KeypairRotatedCallback>,
         on_removed_from_group: Box<dyn RemovedFromGroupCallback>,
         on_group_destroyed: Box<dyn GroupDestroyedCallback>,
     ) -> Result<Arc<Self>, SessionError> {
@@ -223,9 +213,6 @@ impl HushFfiSession {
                 }
             },
             Box::new(PersistentLog::new(log_store)),
-            move |bytes| {
-                on_keypair_rotated.on_keypair_rotated(bytes.to_vec());
-            },
             move || {
                 on_removed_from_group.on_removed_from_group();
             },
@@ -302,19 +289,6 @@ impl HushFfiSession {
         });
     }
 
-    /// Admit a device identified by its noise (32 B) and signing (32 B) public keys.
-    /// Returns `true` if admitted (window was open), `false` if the window was closed
-    /// or had already expired.  Returns an error only if the key bytes are invalid length.
-    pub fn accept_pair(
-        &self,
-        noise_pub: Vec<u8>,
-        signing_pub: Vec<u8>,
-    ) -> Result<bool, SessionError> {
-        let noise = noise_pub_from_bytes(&noise_pub)?;
-        let signing = signing_pub_from_bytes(&signing_pub)?;
-        Ok(self.inner.accept_pair(noise, signing))
-    }
-
     /// Close the pairing window without admitting any device.
     pub fn cancel_pairing(&self) {
         self.inner.cancel_pairing();
@@ -355,21 +329,10 @@ impl HushFfiSession {
         self.inner.push_sync(blob).map_err(SessionError::from)
     }
 
-    /// Send `Message::Revoke` to all paired peers and rotate this device's keypair.
-    /// `on_keypair_rotated` fires with the new 64-byte keypair bytes.
-    pub fn revoke(&self) {
-        self.inner.revoke();
-    }
-
     /// Destroy the group: push Revoke to all members, wipe local state, fire on_group_destroyed.
     /// Session becomes terminal — all subsequent `send()` calls return `GroupDestroyed`.
     pub fn destroy_group(&self) {
         self.inner.destroy_group();
-    }
-
-    /// This session's current noise public key (32 bytes).
-    pub fn noise_pub(&self) -> Vec<u8> {
-        self.inner.noise_pub().0.to_vec()
     }
 }
 
@@ -400,16 +363,6 @@ fn noise_pub_from_bytes(bytes: &[u8]) -> Result<NoisePublicKey, SessionError> {
     bytes
         .try_into()
         .map(NoisePublicKey)
-        .map_err(|_| SessionError::InvalidKeyLength {
-            expected: 32,
-            got: bytes.len() as u32,
-        })
-}
-
-fn signing_pub_from_bytes(bytes: &[u8]) -> Result<SigningPublicKey, SessionError> {
-    bytes
-        .try_into()
-        .map(SigningPublicKey)
         .map_err(|_| SessionError::InvalidKeyLength {
             expected: 32,
             got: bytes.len() as u32,
@@ -455,18 +408,5 @@ mod tests {
             kp2.public_key(),
             "same keypair after reopen"
         );
-    }
-
-    /// Wrong-length signing pub returns SessionError::InvalidKeyLength.
-    #[test]
-    fn short_signing_pub_returns_error() {
-        let result = signing_pub_from_bytes(&[0u8; 5]);
-        assert!(matches!(
-            result,
-            Err(SessionError::InvalidKeyLength {
-                expected: 32,
-                got: 5
-            })
-        ));
     }
 }

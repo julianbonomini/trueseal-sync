@@ -276,7 +276,6 @@ fn on_removed_from_group_fires_on_remove_member() {
         device_b,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
         move || {
             *rc.lock().unwrap() += 1;
         },
@@ -355,7 +354,6 @@ fn on_removed_from_group_does_not_fire_for_unaffected_member() {
         device_b,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
         move || {
             *brc.lock().unwrap() += 1;
         },

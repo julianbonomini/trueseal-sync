@@ -32,7 +32,6 @@ fn destroy_group_fires_on_group_destroyed_on_initiator() {
         device,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
         || {},
         |_| {},
         move || {
@@ -75,7 +74,6 @@ fn destroy_group_fires_on_group_destroyed_on_all_members() {
         device_a,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
         || {},
         |_| {},
         || {},
@@ -88,7 +86,6 @@ fn destroy_group_fires_on_group_destroyed_on_all_members() {
         device_b,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
         || {},
         |_| {},
         move || {
@@ -135,7 +132,6 @@ fn push_sync_after_destroy_returns_group_destroyed() {
         device,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
         || {},
         |_| {},
         || {},
@@ -249,7 +245,6 @@ fn on_group_destroyed_callback_wipes_store() {
         device,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
         || {},
         |_| {},
         move || {

@@ -54,7 +54,6 @@ fn manifest_persists_across_session_restart() {
         device_a,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
         || {},
         move |m| {
             let _ = store_a_cb.lock().unwrap().save_group_manifest(m);
@@ -70,7 +69,6 @@ fn manifest_persists_across_session_restart() {
         device_b,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
         || {},
         move |m| {
             let _ = store_b_cb.lock().unwrap().save_group_manifest(m);

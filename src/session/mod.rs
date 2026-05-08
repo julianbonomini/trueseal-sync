@@ -20,7 +20,7 @@ use crate::envelope::SigningKeypair;
 use crate::keys::{NoisePublicKey, SigningPublicKey};
 use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
 use crate::member::{member_id, member_name};
-use crate::message::{device_name, pairing_payload, Message};
+use crate::message::{device_name, Message};
 use crate::operation_log::{MemLog, OperationLog};
 use crate::relay::RelayClient;
 
@@ -62,7 +62,6 @@ pub enum SessionError {
 
 pub(super) struct PairingWindow {
     deadline: Instant,
-    on_paired: Box<dyn Fn(NoisePublicKey) + Send + 'static>,
 }
 
 impl PairingWindow {
@@ -96,8 +95,6 @@ impl KeyState {
 pub(super) struct PendingMember {
     pub noise_pub: NoisePublicKey,
     pub signing_pub: SigningPublicKey,
-    /// Auto-generated name derived from the signing pub.
-    pub name: String,
 }
 
 // ── HushSession ───────────────────────────────────────────────────────────────
@@ -105,7 +102,7 @@ pub(super) struct PendingMember {
 /// The opinionated session facade (ADR-0010 / ADR-0014).
 ///
 /// Owns the relay connection, sequence counter, signing keypair, pairing state,
-/// current GroupManifest, and key-rotation callback.
+/// and current GroupManifest.
 /// Transport-generic so tests can inject in-memory pipes.
 pub struct HushSession<T: Read + Write + Send + 'static> {
     client: Arc<Mutex<RelayClient<T>>>,
@@ -116,8 +113,6 @@ pub struct HushSession<T: Read + Write + Send + 'static> {
     /// Current group membership record. `None` means not yet in any group.
     /// Updated atomically when a valid higher-version GroupManifest is received.
     pub manifest: Arc<Mutex<Option<GroupManifest>>>,
-    /// Fired after key rotation with `noise_priv || signing_priv` (64 bytes).
-    on_keypair_rotated: Arc<dyn Fn([u8; 64]) + Send + Sync + 'static>,
     /// Fired when an inbound GroupManifest excludes the local device.
     on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static>,
     /// Fired whenever the local manifest changes (inbound update or accept_pair).
@@ -202,7 +197,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             keypair,
             on_message,
             Box::new(MemLog::new()),
-            |_| {},
         )
     }
 
@@ -212,7 +206,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         keypair: DeviceKeypair,
         on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
         op_log: Box<dyn OperationLog>,
-        on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
     ) -> Result<Self, SessionError> {
         Self::connect_full(
             transport,
@@ -220,7 +213,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             keypair,
             on_message,
             op_log,
-            on_keypair_rotated,
             || {},
             |_| {},
             || {},
@@ -233,7 +225,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         keypair: DeviceKeypair,
         on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
         op_log: Box<dyn OperationLog>,
-        on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
@@ -246,8 +237,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
         let manifest: Arc<Mutex<Option<GroupManifest>>> = Arc::new(Mutex::new(None));
         let pairing: Arc<Mutex<Option<PairingWindow>>> = Arc::new(Mutex::new(None));
-        let on_keypair_rotated: Arc<dyn Fn([u8; 64]) + Send + Sync + 'static> =
-            Arc::new(on_keypair_rotated);
         let on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static> =
             Arc::new(on_removed_from_group);
         let on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static> =
@@ -258,7 +247,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
         let keys_cb = keys.clone();
         let manifest_cb = manifest.clone();
-        let on_kpr_cb = on_keypair_rotated.clone();
         let on_rfg_cb = on_removed_from_group.clone();
         let on_mc_cb = on_manifest_changed.clone();
         let on_gd_cb = on_group_destroyed.clone();
@@ -304,7 +292,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                         PendingMember {
                             noise_pub: NoisePublicKey(*noise_pub),
                             signing_pub: SigningPublicKey(*signing_pub),
-                            name: name.clone(),
                         },
                     );
                     if let Some(cb) = on_mr_cb.lock().unwrap().as_ref() {
@@ -427,7 +414,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             pairing,
             op_log: Arc::new(Mutex::new(op_log)),
             manifest,
-            on_keypair_rotated,
             on_removed_from_group,
             on_manifest_changed,
             on_group_destroyed,
@@ -445,7 +431,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         keypair: DeviceKeypair,
         on_message: impl Fn(Message, [u8; 32]) + Send + 'static + Clone,
         op_log: Box<dyn OperationLog>,
-        on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
@@ -458,7 +443,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             keypair,
             on_message.clone(),
             op_log,
-            on_keypair_rotated,
             on_removed_from_group,
             on_manifest_changed,
             on_group_destroyed,
@@ -467,7 +451,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let op_log_arc = session.op_log.clone();
         let keys_arc = session.keys.clone();
         let manifest_arc = session.manifest.clone();
-        let on_kpr_arc = session.on_keypair_rotated.clone();
         let on_rfg_arc = session.on_removed_from_group.clone();
         let on_mc_arc = session.on_manifest_changed.clone();
         let on_gd_arc = session.on_group_destroyed.clone();
@@ -486,7 +469,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 keys_arc,
                 manifest_arc,
                 on_message,
-                on_kpr_arc,
                 on_rfg_arc,
                 on_mc_arc,
                 on_gd_arc,
@@ -516,7 +498,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         keypair: DeviceKeypair,
         on_message: impl Fn(Message, [u8; 32]) + Send + 'static + Clone,
         op_log: Box<dyn OperationLog>,
-        on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
@@ -527,8 +508,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
         let manifest: Arc<Mutex<Option<GroupManifest>>> = Arc::new(Mutex::new(None));
         let pairing: Arc<Mutex<Option<PairingWindow>>> = Arc::new(Mutex::new(None));
-        let on_keypair_rotated: Arc<dyn Fn([u8; 64]) + Send + Sync + 'static> =
-            Arc::new(on_keypair_rotated);
         let on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static> =
             Arc::new(on_removed_from_group);
         let on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static> =
@@ -556,7 +535,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             pairing: pairing.clone(),
             op_log: op_log_arc.clone(),
             manifest: manifest.clone(),
-            on_keypair_rotated: on_keypair_rotated.clone(),
             on_removed_from_group: on_removed_from_group.clone(),
             on_manifest_changed: on_manifest_changed.clone(),
             on_group_destroyed: on_group_destroyed.clone(),
@@ -576,7 +554,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 keys,
                 manifest,
                 on_message,
-                on_keypair_rotated,
                 on_removed_from_group,
                 on_manifest_changed,
                 on_group_destroyed,
@@ -668,34 +645,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             .map_err(|e| SessionError::PushFailed(e.to_string()))
     }
 
-    // ── Revocation ────────────────────────────────────────────────────────────
-
-    /// Push `Message::Revoke` to all members in the current manifest, wipe manifest,
-    /// and rotate keys.
-    pub fn revoke(&self) {
-        let peers: Vec<NoisePublicKey> = {
-            let guard = self.manifest.lock().unwrap();
-            match *guard {
-                None => vec![],
-                Some(ref m) => m.members.iter().map(|member| member.noise_pub).collect(),
-            }
-        };
-        for peer in peers {
-            let _ = self.push_message(&Message::Revoke, peer);
-        }
-        self.execute_rotation();
-    }
-
-    fn execute_rotation(&self) {
-        let new_kp = DeviceKeypair::generate();
-        let mut rotated = [0u8; 64];
-        rotated[..32].copy_from_slice(&new_kp.noise.private());
-        rotated[32..].copy_from_slice(&new_kp.signing.to_bytes());
-        *self.keys.lock().unwrap() = KeyState::from_keypair(&new_kp);
-        *self.manifest.lock().unwrap() = None;
-        (self.on_keypair_rotated)(rotated);
-    }
-
     // ── Destroy Group (ADR-0015) ──────────────────────────────────────────────
 
     /// Push `Message::Revoke` to all manifest members, wipe local manifest,
@@ -732,32 +681,13 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     pub fn pairing_token_with_duration(&self, duration: Duration) -> String {
         *self.pairing.lock().unwrap() = Some(PairingWindow {
             deadline: Instant::now() + duration,
-            on_paired: Box::new(|_| {}),
         });
         let ks = self.keys.lock().unwrap();
         crate::message::pairing_token(&ks.noise_pub.0, &ks.signing_pub.0)
     }
 
-    /// Opens a pairing window and returns the raw 64-byte payload (noise_pub || signing_pub).
-    /// Kept for internal use by session tests.
-    pub(crate) fn start_pairing(
-        &self,
-        on_paired: impl Fn(NoisePublicKey) + Send + 'static,
-    ) -> Vec<u8> {
-        self.start_pairing_with_duration(DEFAULT_PAIRING_WINDOW, on_paired)
-    }
-
-    pub(crate) fn start_pairing_with_duration(
-        &self,
-        duration: Duration,
-        on_paired: impl Fn(NoisePublicKey) + Send + 'static,
-    ) -> Vec<u8> {
-        *self.pairing.lock().unwrap() = Some(PairingWindow {
-            deadline: Instant::now() + duration,
-            on_paired: Box::new(on_paired),
-        });
-        let ks = self.keys.lock().unwrap();
-        pairing_payload(&ks.noise_pub.0, &ks.signing_pub.0)
+    pub fn cancel_pairing(&self) {
+        *self.pairing.lock().unwrap() = None;
     }
 
     /// Admit a device; requires both noise and signing pub keys.
@@ -858,10 +788,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let _ = self.push_message(&msg, noise_pub);
 
         true
-    }
-
-    pub fn cancel_pairing(&self) {
-        *self.pairing.lock().unwrap() = None;
     }
 
     /// Register the callback fired when a `Pair` message arrives within an open pairing window.

@@ -25,7 +25,6 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     keys: Arc<Mutex<KeyState>>,
     manifest: Arc<Mutex<Option<GroupManifest>>>,
     on_message: impl Fn(Message, [u8; 32]) + Send + 'static + Clone,
-    on_keypair_rotated: Arc<dyn Fn([u8; 64]) + Send + Sync + 'static>,
     on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static>,
     on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static>,
     on_group_destroyed: Arc<dyn Fn() + Send + Sync + 'static>,
@@ -108,7 +107,6 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
                             PendingMember {
                                 noise_pub: NoisePublicKey(*noise_pub),
                                 signing_pub: SigningPublicKey(*signing_pub),
-                                name: name.clone(),
                             },
                         );
                         if let Some(cb) = on_mr_cb.lock().unwrap().as_ref() {

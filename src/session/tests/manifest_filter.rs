@@ -273,7 +273,6 @@ fn on_removed_from_group_fires_when_excluded_from_manifest() {
         device_a,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
         move || {
             *rf.lock().unwrap() += 1;
         },

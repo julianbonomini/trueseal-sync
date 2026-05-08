@@ -208,7 +208,6 @@ fn push_sync_consumes_one_sequence_per_call() {
         device,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
     )
     .expect("connect");
     session.set_manifest(manifest);

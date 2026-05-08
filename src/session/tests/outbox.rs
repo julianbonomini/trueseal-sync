@@ -43,7 +43,6 @@ fn push_sync_appends_and_marks_delivered() {
         device,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
     )
     .expect("connect");
     session.set_manifest(make_two_member_manifest(
@@ -111,7 +110,6 @@ fn undelivered_entries_replayed_after_reconnect() {
         device,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
         || {},
         |_| {},
         || {},
@@ -177,7 +175,6 @@ fn push_sync_while_disconnected_returns_error_and_stays_in_outbox() {
         device,
         |_, _| {},
         Box::new(MemLog::new()),
-        |_| {},
     )
     .expect("connect");
     session.set_manifest(make_two_member_manifest(
