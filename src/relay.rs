@@ -165,6 +165,22 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         self.is_connected.load(Ordering::Acquire)
     }
 
+    /// Create a stub client in a permanently-disconnected state.
+    ///
+    /// Used by `connect_background` to start a session without any relay transport.
+    /// `is_connected()` returns `false` immediately; `push()` returns an error.
+    /// The reconnect loop will replace this client once the relay is reachable.
+    pub(crate) fn disconnected() -> Self {
+        // Create a channel and immediately drop the receiver so push_tx.send() fails.
+        let (push_tx, _rx) = mpsc::sync_channel::<PushBytes>(0);
+        Self {
+            push_tx,
+            callbacks: Arc::new(Mutex::new(Vec::new())),
+            is_connected: Arc::new(AtomicBool::new(false)),
+            _transport: PhantomData,
+        }
+    }
+
     /// Blocking receive loop — now a no-op since run() is started automatically in connect().
     /// Kept for API compatibility; returns immediately.
     ///

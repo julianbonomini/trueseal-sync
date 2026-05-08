@@ -20,8 +20,10 @@ use crate::store::{PersistentLog, Store};
 pub enum SessionError {
     #[error("invalid key length: expected {expected} bytes, got {got}")]
     InvalidKeyLength { expected: u32, got: u32 },
-    #[error("connection failed: {msg}")]
-    ConnectionFailed { msg: String },
+    #[error("invalid relay public key")]
+    InvalidRelayPublicKey,
+    #[error("invalid namespace: {msg}")]
+    InvalidNamespace { msg: String },
     #[error("push failed: {msg}")]
     PushFailed { msg: String },
     #[error("invalid pairing token")]
@@ -37,7 +39,7 @@ pub enum SessionError {
 impl From<CoreSessionError> for SessionError {
     fn from(e: CoreSessionError) -> Self {
         match e {
-            CoreSessionError::ConnectionFailed(msg) => SessionError::ConnectionFailed { msg },
+            CoreSessionError::ConnectionFailed(msg) => SessionError::PushFailed { msg },
             CoreSessionError::PushFailed(msg) => SessionError::PushFailed { msg },
             CoreSessionError::NotInGroup => SessionError::NotInGroup,
             CoreSessionError::InvalidKeypairBytes => SessionError::InvalidKeyLength {
@@ -126,14 +128,14 @@ pub struct HushFfiSession {
 
 #[uniffi::export]
 impl HushFfiSession {
-    /// Connect to a relay and start the session.
+    /// Create a session. Always succeeds — the relay connects in the background.
     ///
     /// - `base_dir`: directory where the SQLite database is stored
     /// - `namespace`: scopes the database file; one session per namespace
     /// - `relay_addr`: TCP address, e.g. `"relay.example.com:4433"`
-    /// - `relay_pub`: 32-byte X25519 relay public key
+    /// - `relay_pub`: 32-byte X25519 relay public key (wrong length → `InvalidRelayPublicKey`)
     /// - `on_message`: called for every inbound `Sync` message
-    /// - `on_keypair_rotated`: called after key rotation (Destroy Group)
+    /// - `on_keypair_rotated`: called after key rotation (legacy — will be removed in #48)
     ///
     /// The identity keypair is loaded from SQLite or auto-generated on first launch.
     /// Automatically reconnects on relay disconnects using an exponential backoff
@@ -150,41 +152,39 @@ impl HushFfiSession {
         on_group_destroyed: Box<dyn GroupDestroyedCallback>,
     ) -> Result<Arc<Self>, SessionError> {
         let store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
-            SessionError::ConnectionFailed {
+            SessionError::InvalidNamespace {
                 msg: format!("store: {e}"),
             }
         })?;
         let keypair = load_or_generate_keypair(&store)?;
-        let relay_pub_key = noise_pub_from_bytes(&relay_pub)?;
-
-        let stream = TcpStream::connect(&relay_addr)
-            .map_err(|e| SessionError::ConnectionFailed { msg: e.to_string() })?;
+        let relay_pub_key =
+            noise_pub_from_bytes(&relay_pub).map_err(|_| SessionError::InvalidRelayPublicKey)?;
 
         // Late-bind slot: filled after the session is built so the on_message
         // closure can look up sender noise pub from the session's manifest.
         let manifest_slot: Arc<Mutex<Option<Arc<Mutex<Option<crate::manifest::GroupManifest>>>>>> =
             Arc::new(Mutex::new(None));
         // Wrap callbacks in Arc so the on_message closure can be Clone
-        // (required by connect_with_reconnect for the reconnect loop).
+        // (required by connect_background for the reconnect loop).
         let on_message = Arc::new(on_message);
         let manifest_slot_cb = manifest_slot.clone();
 
         // Open a second store handle for PersistentLog (same DB file, separate connection).
         let log_store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
-            SessionError::ConnectionFailed {
+            SessionError::InvalidNamespace {
                 msg: format!("store: {e}"),
             }
         })?;
 
         // Open a third store handle for manifest persistence.
         let manifest_store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
-            SessionError::ConnectionFailed {
+            SessionError::InvalidNamespace {
                 msg: format!("store: {e}"),
             }
         })?;
         let manifest_store_save = Arc::new(Mutex::new(
             Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
-                SessionError::ConnectionFailed {
+                SessionError::InvalidNamespace {
                     msg: format!("store: {e}"),
                 }
             })?,
@@ -193,15 +193,14 @@ impl HushFfiSession {
         // Open a fourth store handle for wiping on group destroy.
         let wipe_store = Arc::new(Mutex::new(
             Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
-                SessionError::ConnectionFailed {
+                SessionError::InvalidNamespace {
                     msg: format!("store: {e}"),
                 }
             })?,
         ));
 
         let relay_addr_factory = relay_addr.clone();
-        let inner = HushSession::connect_with_reconnect(
-            stream,
+        let inner = HushSession::connect_background(
             relay_pub_key,
             keypair,
             move |msg, author_signing_pub| {
@@ -384,12 +383,12 @@ fn load_or_generate_keypair(store: &Store) -> Result<DeviceKeypair, SessionError
             let kp = DeviceKeypair::generate();
             store
                 .save_keypair(&kp)
-                .map_err(|e| SessionError::ConnectionFailed {
+                .map_err(|e| SessionError::InvalidNamespace {
                     msg: format!("store: {e}"),
                 })?;
             Ok(kp)
         }
-        Err(e) => Err(SessionError::ConnectionFailed {
+        Err(e) => Err(SessionError::InvalidNamespace {
             msg: format!("store: {e}"),
         }),
     }

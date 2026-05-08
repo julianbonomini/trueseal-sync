@@ -503,7 +503,96 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         Ok(session)
     }
 
-    // ── Push ──────────────────────────────────────────────────────────────────
+    /// Create a session that starts offline — no relay connection required.
+    ///
+    /// The session is immediately usable: `members()`, `pairing_token()`, etc.
+    /// `push_sync` queues to the outbox.
+    /// A background reconnect loop connects to the relay when available using `transport_factory`.
+    ///
+    /// Per ADR-0017 / PHILOSOPHY: `create()` is infallible. Use this constructor at the
+    /// FFI boundary so `create()` always succeeds regardless of relay reachability.
+    pub fn connect_background(
+        relay_pub: NoisePublicKey,
+        keypair: DeviceKeypair,
+        on_message: impl Fn(Message, [u8; 32]) + Send + 'static + Clone,
+        op_log: Box<dyn OperationLog>,
+        on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
+        on_removed_from_group: impl Fn() + Send + Sync + 'static,
+        on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
+        on_group_destroyed: impl Fn() + Send + Sync + 'static,
+        transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
+        reconnect_cap: Option<Duration>,
+    ) -> Result<Self, SessionError> {
+        // Build all arcs directly — mirrors connect_full but without an initial transport.
+        let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
+        let manifest: Arc<Mutex<Option<GroupManifest>>> = Arc::new(Mutex::new(None));
+        let pairing: Arc<Mutex<Option<PairingWindow>>> = Arc::new(Mutex::new(None));
+        let on_keypair_rotated: Arc<dyn Fn([u8; 64]) + Send + Sync + 'static> =
+            Arc::new(on_keypair_rotated);
+        let on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static> =
+            Arc::new(on_removed_from_group);
+        let on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static> =
+            Arc::new(on_manifest_changed);
+        let on_group_destroyed: Arc<dyn Fn() + Send + Sync + 'static> =
+            Arc::new(on_group_destroyed);
+        let destroyed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let pending_members: Arc<Mutex<HashMap<String, PendingMember>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let on_member_request: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>> =
+            Arc::new(Mutex::new(None));
+        let on_member_joined: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>> =
+            Arc::new(Mutex::new(None));
+        let on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>> =
+            Arc::new(Mutex::new(None));
+
+        // Stub client: permanently disconnected — the reconnect loop will replace it.
+        let client: Arc<Mutex<RelayClient<T>>> = Arc::new(Mutex::new(RelayClient::disconnected()));
+        let op_log_arc: Arc<Mutex<Box<dyn OperationLog>>> = Arc::new(Mutex::new(op_log));
+
+        let session = Self {
+            client: client.clone(),
+            keys: keys.clone(),
+            sequence: Arc::new(Mutex::new(0)),
+            pairing: pairing.clone(),
+            op_log: op_log_arc.clone(),
+            manifest: manifest.clone(),
+            on_keypair_rotated: on_keypair_rotated.clone(),
+            on_removed_from_group: on_removed_from_group.clone(),
+            on_manifest_changed: on_manifest_changed.clone(),
+            on_group_destroyed: on_group_destroyed.clone(),
+            destroyed: destroyed.clone(),
+            pending_members: pending_members.clone(),
+            on_member_request: on_member_request.clone(),
+            on_member_joined: on_member_joined.clone(),
+            on_member_left: on_member_left.clone(),
+        };
+
+        let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
+        std::thread::spawn(move || {
+            reconnect::reconnect_loop(
+                client,
+                op_log_arc,
+                relay_pub,
+                keys,
+                manifest,
+                on_message,
+                on_keypair_rotated,
+                on_removed_from_group,
+                on_manifest_changed,
+                on_group_destroyed,
+                destroyed,
+                pairing,
+                pending_members,
+                on_member_request,
+                on_member_joined,
+                on_member_left,
+                Arc::new(transport_factory),
+                cap,
+            );
+        });
+
+        Ok(session)
+    }
 
     /// Encrypt `blob` as a Sync message and fan out to every manifest member except self.
     /// One sequence number is consumed per call regardless of member count.
