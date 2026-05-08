@@ -87,8 +87,13 @@ pub trait RemovedFromGroupCallback: Send + Sync {
     fn on_removed_from_group(&self);
 }
 
-/// Fired when the group is destroyed — either by calling `destroyGroup()` on this
-/// device or by receiving `Message::Revoke` from another current member.
+/// Fired when a `Pair` message arrives within an open pairing window.
+/// The caller shows UI ("Name wants to join — Accept?"), then calls
+/// `accept_member(token)` or ignores the request.
+#[uniffi::export(callback_interface)]
+pub trait MemberRequestCallback: Send + Sync {
+    fn on_member_request(&self, token: String, name: String);
+}
 /// After this fires the session is terminal; call `create()` on the same namespace
 /// to start fresh with a new identity.
 #[uniffi::export(callback_interface)]
@@ -247,6 +252,23 @@ impl HushFfiSession {
     /// Returns `SessionError::InvalidToken` if the token is malformed.
     pub fn join_group(&self, token: String) -> Result<(), SessionError> {
         self.inner.join_group(&token).map_err(SessionError::from)
+    }
+
+    /// Register the callback fired when a `Pair` message arrives within an open pairing window.
+    ///
+    /// `callback.on_member_request(token, name)` fires with the opaque request token
+    /// and the auto-generated member name. Pass `token` to `accept_member(token)` to admit.
+    pub fn set_on_member_request(&self, callback: Box<dyn MemberRequestCallback>) {
+        self.inner.set_on_member_request(move |token, name| {
+            callback.on_member_request(token, name);
+        });
+    }
+
+    /// Admit a pending member identified by their opaque `token` from `onMemberRequest`.
+    ///
+    /// Returns `true` if admitted, `false` if the token is unknown or the pairing window closed.
+    pub fn accept_member(&self, token: String) -> bool {
+        self.inner.accept_member(&token)
     }
 
     /// Admit a device identified by its noise (32 B) and signing (32 B) public keys.

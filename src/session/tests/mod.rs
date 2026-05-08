@@ -1,3 +1,4 @@
+mod accept_member;
 mod accept_pair;
 mod destroy_group;
 mod fanout;

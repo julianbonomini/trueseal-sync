@@ -4,6 +4,7 @@ mod test_helpers;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -91,6 +92,14 @@ impl KeyState {
     }
 }
 
+/// A pending member request — stored while waiting for `accept_member(token)`.
+struct PendingMember {
+    noise_pub: NoisePublicKey,
+    signing_pub: SigningPublicKey,
+    /// Auto-generated name derived from the signing pub.
+    name: String,
+}
+
 // ── HushSession ───────────────────────────────────────────────────────────────
 
 /// The opinionated session facade (ADR-0010 / ADR-0014).
@@ -119,6 +128,11 @@ pub struct HushSession<T: Read + Write + Send + 'static> {
     /// Set to true after destroy_group() or receiving Revoke. All subsequent
     /// operations that mutate state return SessionError::GroupDestroyed.
     destroyed: Arc<AtomicBool>,
+    /// Pending member requests keyed by opaque token, set via set_on_member_request.
+    pending_members: Arc<Mutex<HashMap<String, PendingMember>>>,
+    /// Fired when a Pair message arrives inside an open pairing window.
+    /// `(token, name)` — caller shows UI then calls `accept_member(token)`.
+    on_member_request: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
 }
 
 impl<T: Read + Write + Send + 'static> HushSession<T> {
@@ -227,6 +241,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         };
 
         let manifest: Arc<Mutex<Option<GroupManifest>>> = Arc::new(Mutex::new(None));
+        let pairing: Arc<Mutex<Option<PairingWindow>>> = Arc::new(Mutex::new(None));
         let on_keypair_rotated: Arc<dyn Fn([u8; 64]) + Send + Sync + 'static> =
             Arc::new(on_keypair_rotated);
         let on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static> =
@@ -244,11 +259,51 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let on_mc_cb = on_manifest_changed.clone();
         let on_gd_cb = on_group_destroyed.clone();
         let destroyed_cb = destroyed.clone();
+        let pending_cb: Arc<Mutex<HashMap<String, PendingMember>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let on_mr_cb: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>> =
+            Arc::new(Mutex::new(None));
+        let pending_cb_ret = pending_cb.clone();
+        let on_mr_cb_ret = on_mr_cb.clone();
+        let pairing_cb = pairing.clone();
 
         let client = RelayClient::connect(transport, relay_pub, noise_kp)
             .map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
 
         client.subscribe(move |msg, author_signing_pub| {
+            // ── Pair (handled before manifest filter — joiner is not yet a member) ──
+            if let Message::Pair {
+                noise_pub,
+                signing_pub,
+            } = &msg
+            {
+                let window_open = pairing_cb
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|w| w.is_open())
+                    .unwrap_or(false);
+                if window_open {
+                    use base64::Engine as _;
+                    let token_bytes: [u8; 16] = rand::random();
+                    let token =
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
+                    let name = crate::member::member_name(&SigningPublicKey(*signing_pub));
+                    pending_cb.lock().unwrap().insert(
+                        token.clone(),
+                        PendingMember {
+                            noise_pub: NoisePublicKey(*noise_pub),
+                            signing_pub: SigningPublicKey(*signing_pub),
+                            name: name.clone(),
+                        },
+                    );
+                    if let Some(cb) = on_mr_cb.lock().unwrap().as_ref() {
+                        cb(token, name);
+                    }
+                }
+                return;
+            }
+
             // ── Manifest-based inbound filtering ──────────────────────────
             {
                 let guard = manifest_cb.lock().unwrap();
@@ -304,7 +359,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             client: Arc::new(Mutex::new(client)),
             keys,
             sequence: Arc::new(Mutex::new(0)),
-            pairing: Arc::new(Mutex::new(None)),
+            pairing,
             op_log: Arc::new(Mutex::new(op_log)),
             manifest,
             on_keypair_rotated,
@@ -312,6 +367,8 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             on_manifest_changed,
             on_group_destroyed,
             destroyed,
+            pending_members: pending_cb_ret,
+            on_member_request: on_mr_cb_ret,
         })
     }
 
@@ -631,6 +688,27 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
     pub fn cancel_pairing(&self) {
         *self.pairing.lock().unwrap() = None;
+    }
+
+    /// Register the callback fired when a `Pair` message arrives within an open pairing window.
+    ///
+    /// The callback receives `(token, name)`. The caller passes `token` back to
+    /// [`Self::accept_member`] to admit the device.
+    pub fn set_on_member_request(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
+        *self.on_member_request.lock().unwrap() = Some(Box::new(cb));
+    }
+
+    /// Admit a pending member identified by their opaque `token` from `on_member_request`.
+    ///
+    /// Returns `true` if the token was valid and the member was admitted.
+    /// Returns `false` if the token is unknown or the pairing window has closed.
+    /// Clears the pairing window on success (single-use window).
+    pub fn accept_member(&self, token: &str) -> bool {
+        let pending = self.pending_members.lock().unwrap().remove(token);
+        match pending {
+            None => false,
+            Some(pm) => self.accept_pair(pm.noise_pub, pm.signing_pub),
+        }
     }
 
     // ── Soft Removal ──────────────────────────────────────────────────────────
