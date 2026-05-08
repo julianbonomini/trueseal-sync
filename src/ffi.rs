@@ -43,6 +43,9 @@ impl From<CoreSessionError> for SessionError {
                 got: 0,
             },
             CoreSessionError::InvalidToken => SessionError::InvalidToken,
+            CoreSessionError::MemberNotFound => SessionError::PushFailed {
+                msg: "member not found".into(),
+            },
         }
     }
 }

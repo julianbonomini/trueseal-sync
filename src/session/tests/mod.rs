@@ -6,6 +6,7 @@ mod manifest_persist;
 mod outbox;
 mod pairing;
 mod push;
+mod remove_member;
 mod revocation;
 
 use ed25519_dalek::SigningKey;

@@ -38,6 +38,8 @@ pub enum SessionError {
     NotInGroup,
     #[error("invalid pairing token")]
     InvalidToken,
+    #[error("member not found in current manifest")]
+    MemberNotFound,
 }
 
 // ── Internal types ────────────────────────────────────────────────────────────
@@ -550,6 +552,81 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
     pub fn cancel_pairing(&self) {
         *self.pairing.lock().unwrap() = None;
+    }
+
+    // ── Soft Removal ──────────────────────────────────────────────────────────
+
+    /// Remove a device from the group by issuing a new manifest that excludes it.
+    ///
+    /// This is Soft Removal (ADR-0015): cooperative, not cryptographically enforced.
+    /// Remaining members filter the removed device's messages once they receive
+    /// the new manifest. The removed device also receives the new manifest so its
+    /// `on_removed_from_group` can fire.
+    ///
+    /// Returns `SessionError::NotInGroup` if no manifest is set.
+    /// Returns `SessionError::MemberNotFound` if `target` is not in the current manifest.
+    pub fn remove_member(&self, target: SigningPublicKey) -> Result<(), SessionError> {
+        let ks = self.keys.lock().unwrap();
+        let signing_key = SigningKey::from_bytes(&ks.signing_priv);
+        drop(ks);
+
+        let (new_manifest, notify, target_noise) = {
+            let guard = self.manifest.lock().unwrap();
+            let current = guard.as_ref().ok_or(SessionError::NotInGroup)?;
+
+            // Find the target member (need their noise_pub to push the manifest to them).
+            let target_member = current
+                .members
+                .iter()
+                .find(|m| m.signing_pub == target)
+                .ok_or(SessionError::MemberNotFound)?;
+            let target_noise = target_member.noise_pub;
+
+            let remaining: Vec<ManifestMember> = current
+                .members
+                .iter()
+                .filter(|m| m.signing_pub != target)
+                .cloned()
+                .collect();
+
+            let new_manifest = GroupManifest::new(
+                current.group_id,
+                current.version + 1,
+                remaining,
+                &signing_key,
+            );
+
+            // Notify: all remaining members excluding self.
+            let self_noise = self.keys.lock().unwrap().noise_pub;
+            let notify: Vec<NoisePublicKey> = new_manifest
+                .members
+                .iter()
+                .filter(|m| m.noise_pub != self_noise)
+                .map(|m| m.noise_pub)
+                .collect();
+
+            (new_manifest, notify, target_noise)
+        };
+
+        // Update local manifest and fire persistence callback.
+        *self.manifest.lock().unwrap() = Some(new_manifest.clone());
+        (self.on_manifest_changed)(&new_manifest);
+
+        let msg = Message::GroupManifest {
+            manifest: new_manifest,
+        };
+        // Push to remaining members (excluding self).
+        for peer in &notify {
+            let _ = self.push_message(&msg, *peer);
+        }
+        // Push to the removed member so their on_removed_from_group fires.
+        let _ = self.push_message(&msg, target_noise);
+
+        Ok(())
+    }
+
+    pub fn cancel_pairing_window(&self) {
+        self.cancel_pairing();
     }
 
     // ── Manifest helpers ──────────────────────────────────────────────────────
