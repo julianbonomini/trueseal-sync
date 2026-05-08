@@ -46,6 +46,7 @@ impl From<CoreSessionError> for SessionError {
             CoreSessionError::MemberNotFound => SessionError::PushFailed {
                 msg: "member not found".into(),
             },
+            CoreSessionError::GroupDestroyed => SessionError::GroupDestroyed,
         }
     }
 }
@@ -73,6 +74,15 @@ pub trait KeypairRotatedCallback: Send + Sync {
 #[uniffi::export(callback_interface)]
 pub trait RemovedFromGroupCallback: Send + Sync {
     fn on_removed_from_group(&self);
+}
+
+/// Fired when the group is destroyed — either by calling `destroyGroup()` on this
+/// device or by receiving `Message::Revoke` from another current member.
+/// After this fires the session is terminal; call `create()` on the same namespace
+/// to start fresh with a new identity.
+#[uniffi::export(callback_interface)]
+pub trait GroupDestroyedCallback: Send + Sync {
+    fn on_group_destroyed(&self);
 }
 
 // ── HushFfiSession ────────────────────────────────────────────────────────────
@@ -108,6 +118,7 @@ impl HushFfiSession {
         on_message: Box<dyn MessageCallback>,
         on_keypair_rotated: Box<dyn KeypairRotatedCallback>,
         on_removed_from_group: Box<dyn RemovedFromGroupCallback>,
+        on_group_destroyed: Box<dyn GroupDestroyedCallback>,
     ) -> Result<Arc<Self>, SessionError> {
         let store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
             SessionError::ConnectionFailed {
@@ -150,6 +161,15 @@ impl HushFfiSession {
             })?,
         ));
 
+        // Open a fourth store handle for wiping on group destroy.
+        let wipe_store = Arc::new(Mutex::new(
+            Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
+                SessionError::ConnectionFailed {
+                    msg: format!("store: {e}"),
+                }
+            })?,
+        ));
+
         let relay_addr_factory = relay_addr.clone();
         let inner = HushSession::connect_with_reconnect(
             stream,
@@ -183,6 +203,10 @@ impl HushFfiSession {
             },
             move |m: &crate::manifest::GroupManifest| {
                 let _ = manifest_store_save.lock().unwrap().save_group_manifest(m);
+            },
+            move || {
+                let _ = wipe_store.lock().unwrap().wipe();
+                on_group_destroyed.on_group_destroyed();
             },
             move || TcpStream::connect(&relay_addr_factory).map_err(|e| e.to_string()),
             None, // use default 30-second cap
@@ -242,6 +266,12 @@ impl HushFfiSession {
     /// `on_keypair_rotated` fires with the new 64-byte keypair bytes.
     pub fn revoke(&self) {
         self.inner.revoke();
+    }
+
+    /// Destroy the group: push Revoke to all members, wipe local state, fire on_group_destroyed.
+    /// Session becomes terminal — all subsequent `send()` calls return `GroupDestroyed`.
+    pub fn destroy_group(&self) {
+        self.inner.destroy_group();
     }
 
     /// This session's current noise public key (32 bytes).

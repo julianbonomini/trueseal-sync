@@ -227,12 +227,14 @@ pub(super) fn make_relay_kp() -> Keypair {
 
 /// Spawn a fully-connected 3-way relay (A↔B↔C).
 /// Any Push from any device is delivered to both of the other two.
+/// Uses channels to fan out from one reader to multiple writers, avoiding concurrent send() races.
 pub(super) fn spawn_tripartite_relay(
     relay_kp: &Keypair,
     pipe_a: MemPipe,
     pipe_b: MemPipe,
     pipe_c: MemPipe,
 ) {
+    use std::sync::mpsc;
     let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_kp_b = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_kp_c = Keypair::new(relay_kp.private(), relay_kp.public_key);
@@ -241,26 +243,50 @@ pub(super) fn spawn_tripartite_relay(
         let sess_b = Arc::new(accept(pipe_b, relay_kp_b).unwrap());
         let sess_c = Arc::new(accept(pipe_c, relay_kp_c).unwrap());
 
-        let make_fwd = |src: Arc<hush_noise::session::Session<MemPipe>>,
-                        dst1: Arc<hush_noise::session::Session<MemPipe>>,
-                        dst2: Arc<hush_noise::session::Session<MemPipe>>| {
+        // Three channels — one per session destination.
+        let (tx_a, rx_a) = mpsc::channel::<Vec<u8>>();
+        let (tx_b, rx_b) = mpsc::channel::<Vec<u8>>();
+        let (tx_c, rx_c) = mpsc::channel::<Vec<u8>>();
+
+        // Writer threads: one per session, drains the channel.
+        let sa_w = sess_a.clone();
+        std::thread::spawn(move || {
+            for msg in rx_a {
+                let _ = sa_w.send(&msg);
+            }
+        });
+        let sb_w = sess_b.clone();
+        std::thread::spawn(move || {
+            for msg in rx_b {
+                let _ = sb_w.send(&msg);
+            }
+        });
+        let sc_w = sess_c.clone();
+        std::thread::spawn(move || {
+            for msg in rx_c {
+                let _ = sc_w.send(&msg);
+            }
+        });
+
+        // Reader threads: one per session, routes to the other two channels.
+        let make_reader = |src: Arc<hush_noise::session::Session<MemPipe>>,
+                           out1: mpsc::Sender<Vec<u8>>,
+                           out2: mpsc::Sender<Vec<u8>>| {
             std::thread::spawn(move || loop {
                 let raw = match src.receive() {
                     Ok(r) => r,
                     Err(_) => break,
                 };
                 if let Some((MsgType::Push, body)) = parse(&raw) {
-                    let _ = dst1.send(&frame(MsgType::Deliver, body.clone()));
-                    let _ = dst2.send(&frame(MsgType::Deliver, body));
+                    let framed = frame(MsgType::Deliver, body);
+                    let _ = out1.send(framed.clone());
+                    let _ = out2.send(framed);
                 }
             })
         };
 
-        let sa = sess_a.clone();
-        let sb = sess_b.clone();
-        let sc = sess_c.clone();
-        make_fwd(sa.clone(), sb.clone(), sc.clone());
-        make_fwd(sb.clone(), sa.clone(), sc.clone());
-        make_fwd(sc, sa, sb);
+        make_reader(sess_a, tx_b.clone(), tx_c.clone());
+        make_reader(sess_b, tx_a.clone(), tx_c.clone());
+        make_reader(sess_c, tx_a.clone(), tx_b.clone());
     });
 }

@@ -114,6 +114,7 @@ fn undelivered_entries_replayed_after_reconnect() {
         |_| {},
         || {},
         |_| {},
+        || {},
         move || {
             pipe2_slot2
                 .lock()

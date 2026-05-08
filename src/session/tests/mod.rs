@@ -1,4 +1,5 @@
 mod accept_pair;
+mod destroy_group;
 mod fanout;
 mod join_group;
 mod manifest_filter;

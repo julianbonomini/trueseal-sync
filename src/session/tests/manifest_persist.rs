@@ -59,6 +59,7 @@ fn manifest_persists_across_session_restart() {
         move |m| {
             let _ = store_a_cb.lock().unwrap().save_group_manifest(m);
         },
+        || {},
     )
     .expect("session A");
 
@@ -74,6 +75,7 @@ fn manifest_persists_across_session_restart() {
         move |m| {
             let _ = store_b_cb.lock().unwrap().save_group_manifest(m);
         },
+        || {},
     )
     .expect("session B");
 

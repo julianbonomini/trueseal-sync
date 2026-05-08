@@ -6,6 +6,7 @@ mod tests;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,8 @@ pub enum SessionError {
     InvalidToken,
     #[error("member not found in current manifest")]
     MemberNotFound,
+    #[error("group has been destroyed")]
+    GroupDestroyed,
 }
 
 // ── Internal types ────────────────────────────────────────────────────────────
@@ -99,6 +102,11 @@ pub struct HushSession<T: Read + Write + Send + 'static> {
     /// Fired whenever the local manifest changes (inbound update or accept_pair).
     /// Callers use this to persist the manifest to SQLite.
     on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static>,
+    /// Fired when the group is destroyed (destroyGroup or receiving Revoke).
+    on_group_destroyed: Arc<dyn Fn() + Send + Sync + 'static>,
+    /// Set to true after destroy_group() or receiving Revoke. All subsequent
+    /// operations that mutate state return SessionError::GroupDestroyed.
+    destroyed: Arc<AtomicBool>,
 }
 
 impl<T: Read + Write + Send + 'static> HushSession<T> {
@@ -163,6 +171,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             on_keypair_rotated,
             || {},
             |_| {},
+            || {},
         )
     }
 
@@ -175,6 +184,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
+        on_group_destroyed: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self, SessionError> {
         let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
         let noise_kp = {
@@ -189,12 +199,17 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             Arc::new(on_removed_from_group);
         let on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static> =
             Arc::new(on_manifest_changed);
+        let on_group_destroyed: Arc<dyn Fn() + Send + Sync + 'static> =
+            Arc::new(on_group_destroyed);
+        let destroyed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
         let keys_cb = keys.clone();
         let manifest_cb = manifest.clone();
         let on_kpr_cb = on_keypair_rotated.clone();
         let on_rfg_cb = on_removed_from_group.clone();
         let on_mc_cb = on_manifest_changed.clone();
+        let on_gd_cb = on_group_destroyed.clone();
+        let destroyed_cb = destroyed.clone();
 
         let client = RelayClient::connect(transport, relay_pub, noise_kp)
             .map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
@@ -212,25 +227,18 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
             // ── Revoke ────────────────────────────────────────────────────
             if let Message::Revoke = &msg {
-                let maybe_kp = {
+                let in_group = {
                     let guard = manifest_cb.lock().unwrap();
-                    if let Some(ref m) = *guard {
-                        if m.contains_signing_pub(&author_signing_pub) {
-                            Some(crate::device::DeviceKeypair::generate())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
+                    guard
+                        .as_ref()
+                        .map(|m| m.contains_signing_pub(&author_signing_pub))
+                        .unwrap_or(false)
                 };
-                if let Some(new_kp) = maybe_kp {
+                if in_group {
+                    // Wipe local manifest (keypair rotation is now internal on next create()).
                     *manifest_cb.lock().unwrap() = None;
-                    let mut rotated = [0u8; 64];
-                    rotated[..32].copy_from_slice(&new_kp.noise.private());
-                    rotated[32..].copy_from_slice(&new_kp.signing.to_bytes());
-                    *keys_cb.lock().unwrap() = KeyState::from_keypair(&new_kp);
-                    (on_kpr_cb)(rotated);
+                    destroyed_cb.store(true, Ordering::Release);
+                    (on_gd_cb)();
                 }
                 return;
             }
@@ -268,6 +276,8 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             on_keypair_rotated,
             on_removed_from_group,
             on_manifest_changed,
+            on_group_destroyed,
+            destroyed,
         })
     }
 
@@ -280,6 +290,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
+        on_group_destroyed: impl Fn() + Send + Sync + 'static,
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
     ) -> Result<Self, SessionError> {
@@ -292,6 +303,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             on_keypair_rotated,
             on_removed_from_group,
             on_manifest_changed,
+            on_group_destroyed,
         )?;
         let client_arc = session.client.clone();
         let op_log_arc = session.op_log.clone();
@@ -300,6 +312,8 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let on_kpr_arc = session.on_keypair_rotated.clone();
         let on_rfg_arc = session.on_removed_from_group.clone();
         let on_mc_arc = session.on_manifest_changed.clone();
+        let on_gd_arc = session.on_group_destroyed.clone();
+        let destroyed_arc = session.destroyed.clone();
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
         std::thread::spawn(move || {
             reconnect::reconnect_loop(
@@ -312,6 +326,8 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 on_kpr_arc,
                 on_rfg_arc,
                 on_mc_arc,
+                on_gd_arc,
+                destroyed_arc,
                 Arc::new(transport_factory),
                 cap,
             );
@@ -324,7 +340,11 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// Encrypt `blob` as a Sync message and fan out to every manifest member except self.
     /// One sequence number is consumed per call regardless of member count.
     /// Returns `SessionError::NotInGroup` if no manifest is set.
+    /// Returns `SessionError::GroupDestroyed` if the group has been destroyed.
     pub fn push_sync(&self, blob: Vec<u8>) -> Result<(), SessionError> {
+        if self.destroyed.load(Ordering::Acquire) {
+            return Err(SessionError::GroupDestroyed);
+        }
         let recipients: Vec<NoisePublicKey> = {
             let guard = self.manifest.lock().unwrap();
             match *guard {
@@ -417,6 +437,30 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         *self.keys.lock().unwrap() = KeyState::from_keypair(&new_kp);
         *self.manifest.lock().unwrap() = None;
         (self.on_keypair_rotated)(rotated);
+    }
+
+    // ── Destroy Group (ADR-0015) ──────────────────────────────────────────────
+
+    /// Push `Message::Revoke` to all manifest members, wipe local manifest,
+    /// set session terminal, and fire `on_group_destroyed`.
+    ///
+    /// After this call, all subsequent `push_sync` / `send` calls return
+    /// `SessionError::GroupDestroyed`. The next `create()` on the same namespace
+    /// generates a fresh identity automatically.
+    pub fn destroy_group(&self) {
+        let peers: Vec<NoisePublicKey> = {
+            let guard = self.manifest.lock().unwrap();
+            match *guard {
+                None => vec![],
+                Some(ref m) => m.members.iter().map(|mb| mb.noise_pub).collect(),
+            }
+        };
+        for peer in peers {
+            let _ = self.push_message(&Message::Revoke, peer);
+        }
+        *self.manifest.lock().unwrap() = None;
+        self.destroyed.store(true, Ordering::Release);
+        (self.on_group_destroyed)();
     }
 
     // ── Pairing ───────────────────────────────────────────────────────────────

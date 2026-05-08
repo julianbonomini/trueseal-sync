@@ -281,6 +281,7 @@ fn on_removed_from_group_fires_on_remove_member() {
             *rc.lock().unwrap() += 1;
         },
         |_| {},
+        || {},
     )
     .expect("session B");
 
@@ -359,6 +360,7 @@ fn on_removed_from_group_does_not_fire_for_unaffected_member() {
             *brc.lock().unwrap() += 1;
         },
         |_| {},
+        || {},
     )
     .expect("session B");
     let session_c =

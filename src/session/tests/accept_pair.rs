@@ -84,6 +84,7 @@ fn accept_pair_sends_manifest_to_new_member() {
         |_| {},
         || {},
         |_| {},
+        || {},
     )
     .expect("session B");
     // Watch B's manifest directly.
@@ -165,6 +166,7 @@ fn accept_pair_extends_existing_manifest() {
             |_| {},
             || {},
             |_| {},
+            || {},
         )
         .expect("session C");
         _session_c.manifest.clone()
@@ -254,7 +256,7 @@ fn new_member_bootstrap_can_send_to_existing_members() {
         .push_sync(b"hello from C".to_vec())
         .expect("C push_sync");
 
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(500));
 
     let got = b_received.lock().unwrap();
     assert_eq!(got.len(), 1, "B must receive C's blob");

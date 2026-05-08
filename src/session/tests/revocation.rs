@@ -13,9 +13,9 @@ use super::super::test_helpers::*;
 use super::super::HushSession;
 use super::make_two_member_manifest;
 
-/// Regression: after B reconnects, A's revoke must still fire B's on_keypair_rotated.
+/// Regression: after B reconnects, A's destroy_group must still fire B's on_group_destroyed.
 #[test]
-fn post_reconnect_revoke_fires_on_keypair_rotated() {
+fn post_reconnect_destroy_fires_on_group_destroyed() {
     use std::sync::atomic::Ordering;
 
     let relay_kp = make_relay_kp();
@@ -52,6 +52,7 @@ fn post_reconnect_revoke_fires_on_keypair_rotated() {
             |_| {},
             || {},
             |_| {},
+            || {},
             move || {
                 pipe_a2_slot2
                     .lock()
@@ -64,8 +65,8 @@ fn post_reconnect_revoke_fires_on_keypair_rotated() {
         .expect("session A"),
     );
 
-    let b_rotated: Arc<Mutex<Vec<[u8; 64]>>> = Arc::new(Mutex::new(Vec::new()));
-    let br = b_rotated.clone();
+    let b_destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let bd = b_destroyed.clone();
     let pipe_b2_slot: Arc<Mutex<Option<MemPipe>>> = Arc::new(Mutex::new(Some(pipe_b2_client)));
     let pipe_b2_slot2 = pipe_b2_slot.clone();
     let session_b = Arc::new(
@@ -75,11 +76,12 @@ fn post_reconnect_revoke_fires_on_keypair_rotated() {
             device_b,
             |_, _| {},
             Box::new(MemLog::new()),
-            move |bytes| {
-                br.lock().unwrap().push(bytes);
-            },
+            |_| {},
             || {},
             |_| {},
+            move || {
+                *bd.lock().unwrap() += 1;
+            },
             move || {
                 pipe_b2_slot2
                     .lock()
@@ -103,22 +105,22 @@ fn post_reconnect_revoke_fires_on_keypair_rotated() {
     close_b1_client.store(true, Ordering::Release);
     std::thread::sleep(Duration::from_millis(500));
 
-    session_a.revoke();
+    session_a.destroy_group();
     std::thread::sleep(Duration::from_millis(400));
 
     assert_eq!(
-        b_rotated.lock().unwrap().len(),
+        *b_destroyed.lock().unwrap(),
         1,
-        "B's on_keypair_rotated must fire after post-reconnect revoke"
+        "B's on_group_destroyed must fire after post-reconnect destroy"
     );
     assert!(
         session_b.manifest.lock().unwrap().is_none(),
-        "B's manifest must be cleared after revoke"
+        "B's manifest must be cleared after destroy"
     );
 }
 
 #[test]
-fn revoke_ceremony_rotates_both_devices_and_clears_manifests() {
+fn destroy_group_fires_on_group_destroyed_for_all_members() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
@@ -134,33 +136,39 @@ fn revoke_ceremony_rotates_both_devices_and_clears_manifests() {
     let b_signing = device_b.signing_public_key();
     let b_sk = SigningKey::from_bytes(&device_b.signing.to_bytes());
 
-    let a_rotated: Arc<Mutex<Vec<[u8; 64]>>> = Arc::new(Mutex::new(Vec::new()));
-    let ar = a_rotated.clone();
+    let a_destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let ad = a_destroyed.clone();
     let session_a = Arc::new(
-        HushSession::connect_with_log(
+        HushSession::connect_full(
             pipe_a_client,
             relay_pub,
             device_a,
             |_, _| {},
             Box::new(MemLog::new()),
-            move |bytes| {
-                ar.lock().unwrap().push(bytes);
+            |_| {},
+            || {},
+            |_| {},
+            move || {
+                *ad.lock().unwrap() += 1;
             },
         )
         .expect("session A"),
     );
 
-    let b_rotated: Arc<Mutex<Vec<[u8; 64]>>> = Arc::new(Mutex::new(Vec::new()));
-    let br = b_rotated.clone();
+    let b_destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let bd = b_destroyed.clone();
     let session_b = Arc::new(
-        HushSession::connect_with_log(
+        HushSession::connect_full(
             pipe_b_client,
             relay_pub,
             device_b,
             |_, _| {},
             Box::new(MemLog::new()),
-            move |bytes| {
-                br.lock().unwrap().push(bytes);
+            |_| {},
+            || {},
+            |_| {},
+            move || {
+                *bd.lock().unwrap() += 1;
             },
         )
         .expect("session B"),
@@ -173,15 +181,15 @@ fn revoke_ceremony_rotates_both_devices_and_clears_manifests() {
         b_noise, b_signing, &b_sk, a_noise, a_signing,
     ));
 
-    session_a.revoke();
+    session_a.destroy_group();
     std::thread::sleep(Duration::from_millis(200));
 
-    assert_eq!(a_rotated.lock().unwrap().len(), 1, "A rotated once");
+    assert_eq!(*a_destroyed.lock().unwrap(), 1, "A on_group_destroyed once");
     assert!(
         session_a.manifest.lock().unwrap().is_none(),
         "A manifest cleared"
     );
-    assert_eq!(b_rotated.lock().unwrap().len(), 1, "B rotated once");
+    assert_eq!(*b_destroyed.lock().unwrap(), 1, "B on_group_destroyed once");
     assert!(
         session_b.manifest.lock().unwrap().is_none(),
         "B manifest cleared"

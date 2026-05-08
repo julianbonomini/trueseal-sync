@@ -1,11 +1,11 @@
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use hush_noise::keypair::Keypair as NoiseKeypair;
 
-use crate::device::DeviceKeypair;
 use crate::envelope::SigningKeypair;
 use crate::keys::NoisePublicKey;
 use crate::manifest::GroupManifest;
@@ -27,12 +27,18 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     on_keypair_rotated: Arc<dyn Fn([u8; 64]) + Send + Sync + 'static>,
     on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static>,
     on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static>,
+    on_group_destroyed: Arc<dyn Fn() + Send + Sync + 'static>,
+    destroyed: Arc<AtomicBool>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
 ) {
     let mut backoff = cap.min(Duration::from_secs(1));
     loop {
         std::thread::sleep(Duration::from_millis(50));
+        // Exit the reconnect loop if the group has been destroyed.
+        if destroyed.load(Ordering::Acquire) {
+            break;
+        }
         let connected = client.lock().unwrap().is_connected();
         if connected {
             backoff = Duration::from_secs(1);
@@ -62,9 +68,10 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
         {
             let keys_cb = keys.clone();
             let manifest_cb = manifest.clone();
-            let on_kpr_cb = on_keypair_rotated.clone();
             let on_rfg_cb = on_removed_from_group.clone();
             let on_mc_cb = on_manifest_changed.clone();
+            let on_gd_cb = on_group_destroyed.clone();
+            let destroyed_cb = destroyed.clone();
             let on_message = on_message.clone();
             new_client.subscribe(move |msg, author_signing_pub| {
                 {
@@ -77,25 +84,17 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
                 }
 
                 if let Message::Revoke = &msg {
-                    let maybe_kp = {
+                    let in_group = {
                         let guard = manifest_cb.lock().unwrap();
-                        if let Some(ref m) = *guard {
-                            if m.contains_signing_pub(&author_signing_pub) {
-                                Some(DeviceKeypair::generate())
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
+                        guard
+                            .as_ref()
+                            .map(|m| m.contains_signing_pub(&author_signing_pub))
+                            .unwrap_or(false)
                     };
-                    if let Some(new_kp) = maybe_kp {
+                    if in_group {
                         *manifest_cb.lock().unwrap() = None;
-                        let mut rotated = [0u8; 64];
-                        rotated[..32].copy_from_slice(&new_kp.noise.private());
-                        rotated[32..].copy_from_slice(&new_kp.signing.to_bytes());
-                        *keys_cb.lock().unwrap() = KeyState::from_keypair(&new_kp);
-                        (on_kpr_cb)(rotated);
+                        destroyed_cb.store(true, Ordering::Release);
+                        (on_gd_cb)();
                     }
                     return;
                 }

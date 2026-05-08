@@ -278,6 +278,7 @@ fn on_removed_from_group_fires_when_excluded_from_manifest() {
             *rf.lock().unwrap() += 1;
         },
         |_| {},
+        || {},
     )
     .expect("session A");
     session_a.set_manifest(v1);
