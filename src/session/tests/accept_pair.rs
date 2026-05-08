@@ -9,7 +9,7 @@ use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
 use super::super::HushSession;
-use super::make_two_member_manifest;
+use super::{make_one_member_manifest, make_two_member_manifest};
 
 /// A admits B into an empty group → both have a 2-member manifest.
 #[test]
@@ -183,4 +183,80 @@ fn accept_pair_extends_existing_manifest() {
     let c_m = c_manifest_arc.lock().unwrap();
     assert!(c_m.is_some(), "C must receive the manifest");
     assert_eq!(c_m.as_ref().unwrap().members.len(), 3, "C: 3 members");
+}
+
+/// #28 bootstrap: {A, B} exist, A admits C, C immediately sends a blob, B receives it.
+#[test]
+fn new_member_bootstrap_can_send_to_existing_members() {
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+
+    let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
+    let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
+    let (pipe_c_client, pipe_c_relay) = mem_pipe_pair();
+    spawn_tripartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay);
+
+    let device_a = DeviceKeypair::generate();
+    let device_b = DeviceKeypair::generate();
+    let device_c = DeviceKeypair::generate();
+    let a_noise = device_a.public_key();
+    let a_signing = device_a.signing_public_key();
+    let a_sk = SigningKey::from_bytes(&device_a.signing.to_bytes());
+    let b_noise = device_b.public_key();
+    let b_signing = device_b.signing_public_key();
+    let b_sk = SigningKey::from_bytes(&device_b.signing.to_bytes());
+    let c_noise = device_c.public_key();
+    let c_signing = device_c.signing_public_key();
+
+    // A and B already form a 2-member group.
+    let session_a =
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+    let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, b_noise, b_signing);
+    session_a.set_manifest(v1.clone());
+
+    let b_received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let br = b_received.clone();
+    let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _| {
+        if let crate::message::Message::Sync { body } = msg {
+            br.lock().unwrap().push(body);
+        }
+    })
+    .expect("session B");
+    session_b.set_manifest(v1);
+
+    // C connects; no manifest yet.
+    let session_c =
+        HushSession::connect(pipe_c_client, relay_pub, device_c, |_, _| {}).expect("session C");
+
+    // A opens pairing window and admits C.
+    let _token = session_a.pairing_token();
+    session_a.accept_pair(c_noise, c_signing);
+
+    // Give C time to receive the bootstrap GroupManifest from A.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // C should now have a 3-member manifest.
+    assert_eq!(
+        session_c
+            .manifest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .members
+            .len(),
+        3,
+        "C must have 3-member manifest after bootstrap"
+    );
+
+    // C sends a blob — should fan out to A and B.
+    session_c
+        .push_sync(b"hello from C".to_vec())
+        .expect("C push_sync");
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    let got = b_received.lock().unwrap();
+    assert_eq!(got.len(), 1, "B must receive C's blob");
+    assert_eq!(got[0], b"hello from C");
 }

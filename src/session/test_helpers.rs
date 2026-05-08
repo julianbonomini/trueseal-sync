@@ -224,3 +224,43 @@ pub(super) fn relay_pub(relay_kp: &Keypair) -> NoisePublicKey {
 pub(super) fn make_relay_kp() -> Keypair {
     generate_keypair()
 }
+
+/// Spawn a fully-connected 3-way relay (A↔B↔C).
+/// Any Push from any device is delivered to both of the other two.
+pub(super) fn spawn_tripartite_relay(
+    relay_kp: &Keypair,
+    pipe_a: MemPipe,
+    pipe_b: MemPipe,
+    pipe_c: MemPipe,
+) {
+    let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_kp_b = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_kp_c = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    std::thread::spawn(move || {
+        let sess_a = Arc::new(accept(pipe_a, relay_kp_a).unwrap());
+        let sess_b = Arc::new(accept(pipe_b, relay_kp_b).unwrap());
+        let sess_c = Arc::new(accept(pipe_c, relay_kp_c).unwrap());
+
+        let make_fwd = |src: Arc<hush_noise::session::Session<MemPipe>>,
+                        dst1: Arc<hush_noise::session::Session<MemPipe>>,
+                        dst2: Arc<hush_noise::session::Session<MemPipe>>| {
+            std::thread::spawn(move || loop {
+                let raw = match src.receive() {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                if let Some((MsgType::Push, body)) = parse(&raw) {
+                    let _ = dst1.send(&frame(MsgType::Deliver, body.clone()));
+                    let _ = dst2.send(&frame(MsgType::Deliver, body));
+                }
+            })
+        };
+
+        let sa = sess_a.clone();
+        let sb = sess_b.clone();
+        let sc = sess_c.clone();
+        make_fwd(sa.clone(), sb.clone(), sc.clone());
+        make_fwd(sb.clone(), sa.clone(), sc.clone());
+        make_fwd(sc, sa, sb);
+    });
+}
