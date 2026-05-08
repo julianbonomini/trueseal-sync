@@ -142,12 +142,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         parents: Vec<[u8; 32]>,
         author_signing: &crate::envelope::SigningKeypair,
     ) -> Result<(), RelayError> {
-        let plaintext = message.encode();
-        let author_pub = author_signing.public_key_bytes();
-        let payload = crypto::encrypt(recipient_pub, author_pub, &plaintext);
-        let envelope = Envelope::build(sequence, parents, recipient_pub, author_signing, payload);
-        let body = envelope.encode();
-        let framed = frame(MsgType::Push, &body);
+        let framed = build_push_blob(message, recipient_pub, sequence, parents, author_signing);
         self.push_tx
             .send(framed)
             .map_err(|_| RelayError::PushFailed("relay run loop exited".into()))
@@ -192,6 +187,25 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         // They can drop the spawned thread handle — the work happens automatically.
         Ok(())
     }
+}
+
+/// Build and frame a Push blob without sending it.
+///
+/// Encrypts `message` to `recipient_pub`, wraps it in a signed Envelope, and
+/// returns the wire-framed bytes ready to hand to `push_send` (ADR-0018).
+pub fn build_push_blob(
+    message: &Message,
+    recipient_pub: NoisePublicKey,
+    sequence: u64,
+    parents: Vec<[u8; 32]>,
+    author_signing: &crate::envelope::SigningKeypair,
+) -> Vec<u8> {
+    let plaintext = message.encode();
+    let author_pub = author_signing.public_key_bytes();
+    let payload = crypto::encrypt(recipient_pub, author_pub, &plaintext);
+    let envelope = Envelope::build(sequence, parents, recipient_pub, author_signing, payload);
+    let body = envelope.encode();
+    frame(MsgType::Push, &body)
 }
 
 /// The actual event loop: runs in a dedicated thread that owns the Session.

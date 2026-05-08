@@ -22,7 +22,8 @@ fn subscribe_handler_survives_poisoned_manifest_mutex() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -36,7 +37,7 @@ fn subscribe_handler_survives_poisoned_manifest_mutex() {
     let rc = received.clone();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
     let session_b = HushSession::connect_full(
         pipe_b_client,
         relay_pub,
@@ -48,6 +49,7 @@ fn subscribe_handler_survives_poisoned_manifest_mutex() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session B");
 
@@ -92,11 +94,12 @@ fn push_sync_survives_poisoned_manifest_mutex() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
-    spawn_single_relay(&relay_kp, pipe_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_single_relay(&relay_kp, pipe_relay, nk_rx);
 
     let device = DeviceKeypair::generate();
     let session =
-        HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("session");
+        HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, nk.factory()).expect("session");
 
     let manifest_arc = session.manifest.clone();
     let _ = std::panic::catch_unwind(|| {
@@ -118,11 +121,12 @@ fn members_survives_poisoned_manifest_mutex() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
-    spawn_single_relay(&relay_kp, pipe_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_single_relay(&relay_kp, pipe_relay, nk_rx);
 
     let device = DeviceKeypair::generate();
     let session =
-        HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("session");
+        HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, nk.factory()).expect("session");
 
     let manifest_arc = session.manifest.clone();
     let _ = std::panic::catch_unwind(|| {
@@ -147,7 +151,8 @@ fn on_manifest_changed_panic_does_not_poison_manifest_mutex() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -158,7 +163,7 @@ fn on_manifest_changed_panic_does_not_poison_manifest_mutex() {
     let b_signing = device_b.signing_public_key();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
     // B's on_manifest_changed panics — simulates a failing SQLite write.
     let session_b = HushSession::connect_full(
         pipe_b_client,
@@ -169,6 +174,7 @@ fn on_manifest_changed_panic_does_not_poison_manifest_mutex() {
         || {},
         |_| panic!("simulated SQLite write failure"),
         || {},
+        nk.factory(),
     )
     .expect("session B");
 

@@ -20,7 +20,8 @@ fn on_member_joined_fires_on_admitting_device() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -40,6 +41,7 @@ fn on_member_joined_fires_on_admitting_device() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session A");
 
@@ -62,6 +64,7 @@ fn on_member_joined_fires_on_admitting_device() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session B");
 
@@ -83,7 +86,8 @@ fn on_member_joined_fires_on_existing_members_via_manifest() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let a_noise = device_a.public_key();
@@ -107,6 +111,7 @@ fn on_member_joined_fires_on_existing_members_via_manifest() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session A");
 
@@ -119,6 +124,7 @@ fn on_member_joined_fires_on_existing_members_via_manifest() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session B");
 
@@ -180,7 +186,8 @@ fn on_member_left_fires_when_member_removed() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let a_noise = device_a.public_key();
@@ -206,6 +213,7 @@ fn on_member_left_fires_when_member_removed() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session A");
 
@@ -218,6 +226,7 @@ fn on_member_left_fires_when_member_removed() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session B");
 
@@ -286,7 +295,8 @@ fn on_member_left_does_not_fire_for_local_device() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let a_noise = device_a.public_key();
@@ -310,6 +320,7 @@ fn on_member_left_does_not_fire_for_local_device() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session A");
 
@@ -324,6 +335,7 @@ fn on_member_left_does_not_fire_for_local_device() {
         }, // on_removed_from_group
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session B");
 

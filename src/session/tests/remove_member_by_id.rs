@@ -40,6 +40,7 @@ fn remove_member_by_id_removes_the_member() {
         || {},
         |_| {},
         || {},
+        || Err("push factory: errors swallowed in test".into()),
     )
     .expect("connect");
 
@@ -91,6 +92,7 @@ fn remove_member_by_id_unknown_returns_member_not_found() {
         || {},
         |_| {},
         || {},
+        || Err("push factory: errors swallowed in test".into()),
     )
     .expect("connect");
 
@@ -133,6 +135,7 @@ fn remove_member_by_id_no_manifest_returns_not_in_group() {
         || {},
         |_| {},
         || {},
+        || Err("push factory: errors swallowed in test".into()),
     )
     .expect("connect");
 

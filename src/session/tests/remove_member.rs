@@ -27,7 +27,7 @@ fn remove_member_unknown_returns_member_not_found() {
     let noise = device.public_key();
     let sk = SigningKey::from_bytes(&device.signing.to_bytes());
 
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, || Err("push factory: errors swallowed".into())).expect("connect");
     let dummy_peer = DeviceKeypair::generate();
     let v1 = make_two_member_manifest(
         noise,
@@ -59,7 +59,7 @@ fn remove_member_no_manifest_returns_not_in_group() {
         });
     }
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, || Err("push factory: errors swallowed".into())).expect("connect");
 
     let target = DeviceKeypair::generate().signing_public_key();
     let result = session.remove_member(target);
@@ -78,7 +78,8 @@ fn remove_member_issues_new_manifest_excluding_target() {
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
     let (pipe_c_client, pipe_c_relay) = mem_pipe_pair();
-    spawn_tripartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_tripartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -116,11 +117,11 @@ fn remove_member_issues_new_manifest_excluding_target() {
     );
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
     let session_b =
-        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}).expect("session B");
+        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}, nk.factory()).expect("session B");
     let session_c =
-        HushSession::connect(pipe_c_client, relay_pub, device_c, |_, _| {}).expect("session C");
+        HushSession::connect(pipe_c_client, relay_pub, device_c, |_, _| {}, nk.factory()).expect("session C");
 
     session_a.set_manifest(v1.clone());
     session_b.set_manifest(v1.clone());
@@ -172,7 +173,8 @@ fn removed_member_messages_are_discarded() {
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
     let (pipe_c_client, pipe_c_relay) = mem_pipe_pair();
-    spawn_tripartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_tripartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -214,13 +216,13 @@ fn removed_member_messages_are_discarded() {
         if let crate::message::Message::Sync { body } = msg {
             ar.lock().unwrap().push(body);
         }
-    })
+    }, nk.factory())
     .expect("session A");
 
     let session_b =
-        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}).expect("session B");
+        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}, nk.factory()).expect("session B");
     let session_c =
-        HushSession::connect(pipe_c_client, relay_pub, device_c, |_, _| {}).expect("session C");
+        HushSession::connect(pipe_c_client, relay_pub, device_c, |_, _| {}, nk.factory()).expect("session C");
 
     session_a.set_manifest(v1.clone());
     session_b.set_manifest(v1.clone());
@@ -256,7 +258,8 @@ fn on_removed_from_group_fires_on_remove_member() {
 
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, true);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx, true);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -270,7 +273,7 @@ fn on_removed_from_group_fires_on_remove_member() {
     let rc = removed_count.clone();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
     let session_b = HushSession::connect_full(
         pipe_b_client,
         relay_pub,
@@ -282,6 +285,7 @@ fn on_removed_from_group_fires_on_remove_member() {
         },
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session B");
 
@@ -308,7 +312,8 @@ fn on_removed_from_group_does_not_fire_for_unaffected_member() {
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
     let (pipe_c_client, pipe_c_relay) = mem_pipe_pair();
-    spawn_tripartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_tripartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -348,7 +353,7 @@ fn on_removed_from_group_does_not_fire_for_unaffected_member() {
     let brc = b_removed_count.clone();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
     let session_b = HushSession::connect_full(
         pipe_b_client,
         relay_pub,
@@ -360,10 +365,11 @@ fn on_removed_from_group_does_not_fire_for_unaffected_member() {
         },
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session B");
     let session_c =
-        HushSession::connect(pipe_c_client, relay_pub, device_c, |_, _| {}).expect("session C");
+        HushSession::connect(pipe_c_client, relay_pub, device_c, |_, _| {}, nk.factory()).expect("session C");
 
     session_a.set_manifest(v1.clone());
     session_b.set_manifest(v1.clone());
@@ -392,7 +398,8 @@ fn removed_member_no_longer_receives_fanout_blobs() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, true);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx, true);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -408,12 +415,12 @@ fn removed_member_no_longer_receives_fanout_blobs() {
 
     // A connects first (relay accepts pipe_a_relay first).
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("A");
     let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _| {
         if let crate::message::Message::Sync { body } = msg {
             br.lock().unwrap().push(body);
         }
-    })
+    }, nk.factory())
     .expect("B");
 
     let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, b_noise, b_signing);

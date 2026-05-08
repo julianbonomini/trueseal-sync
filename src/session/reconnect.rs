@@ -12,7 +12,7 @@ use crate::keys::NoisePublicKey;
 use crate::manifest::GroupManifest;
 use crate::message::Message;
 use crate::operation_log::OperationLog;
-use crate::relay::RelayClient;
+use crate::relay::{build_push_blob, push_send, RelayClient};
 
 use super::{KeyState, PendingMember};
 
@@ -35,6 +35,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     on_member_joined: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
     on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
+    push_factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
     on_connection_changed: Arc<dyn Fn(bool) + Send + Sync + 'static>,
 ) {
@@ -104,16 +105,16 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
 
         // Replay undelivered outbox in ascending sequence order.
         let signing = SigningKeypair::from_signing_key(SigningKey::from_bytes(&signing_priv));
+        let relay_pub_bytes = relay_pub.0;
         let entries = op_log.lock().unwrap_or_else(|e| e.into_inner()).undelivered_entries();
         for entry in entries {
             let oid = entry.object_id;
             let recipient_pub = NoisePublicKey(oid);
             let msg = crate::message::Message::Sync { body: entry.blob };
-            let result =
-                client
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(&msg, recipient_pub, entry.sequence, vec![], &signing);
+            let framed = build_push_blob(&msg, recipient_pub, entry.sequence, vec![], &signing);
+            let result = (push_factory)()
+                .map_err(|e| crate::relay::RelayError::PushFailed(e))
+                .and_then(|transport| push_send(transport, relay_pub_bytes, framed));
             if result.is_ok() {
                 op_log.lock().unwrap_or_else(|e| e.into_inner()).mark_delivered(&oid, entry.sequence);
             }

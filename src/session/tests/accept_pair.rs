@@ -18,8 +18,9 @@ fn accept_pair_creates_genesis_manifest() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
     // A→B routing: relay accepts A (pipe_a_relay) first as src, then B (pipe_b_relay) as dst.
-    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, true);
+    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx, true);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -28,13 +29,13 @@ fn accept_pair_creates_genesis_manifest() {
 
     // A connects first (relay accepts pipe_a_relay first).
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
     // B connects second, collects inbound GroupManifest.
     let b_manifests: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let bm = b_manifests.clone();
     let _session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _| {
         bm.lock().unwrap().push(msg);
-    })
+    }, nk.factory())
     .expect("session B");
 
     // A opens a pairing window then accepts B.
@@ -60,7 +61,8 @@ fn accept_pair_sends_manifest_to_new_member() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, true);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx, true);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -68,7 +70,7 @@ fn accept_pair_sends_manifest_to_new_member() {
     let b_signing = device_b.signing_public_key();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
 
     let b_manifest_received: Arc<Mutex<Option<crate::manifest::GroupManifest>>> =
         Arc::new(Mutex::new(None));
@@ -82,6 +84,7 @@ fn accept_pair_sends_manifest_to_new_member() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session B");
     // Watch B's manifest directly.
@@ -105,13 +108,19 @@ fn accept_pair_without_window_returns_false() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
     let relay_kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
     std::thread::spawn(move || {
         let _ = hush_noise::session_xx::accept(pipe_relay, relay_kp2);
+        // drain nk_rx so push_factory doesn't block if accidentally called
+        while let Ok(pipe) = nk_rx.recv() {
+            let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+            std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(pipe, kp); });
+        }
     });
 
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, nk.factory()).expect("connect");
 
     let dummy_noise = crate::keys::NoisePublicKey([0xAA; 32]);
     let dummy_signing = crate::keys::SigningPublicKey([0xBB; 32]);
@@ -133,7 +142,8 @@ fn accept_pair_extends_existing_manifest() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_c_client, pipe_c_relay) = mem_pipe_pair();
-    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_c_relay, true);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_c_relay, nk_rx, true);
 
     let device_a = DeviceKeypair::generate();
     let a_noise = device_a.public_key();
@@ -150,7 +160,7 @@ fn accept_pair_extends_existing_manifest() {
     let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, dummy_b_noise, dummy_b_signing);
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
     session_a.set_manifest(v1);
 
     let c_manifest_arc = {
@@ -163,6 +173,7 @@ fn accept_pair_extends_existing_manifest() {
             || {},
             |_| {},
             || {},
+            nk.factory(),
         )
         .expect("session C");
         _session_c.manifest.clone()
@@ -192,7 +203,8 @@ fn new_member_bootstrap_can_send_to_existing_members() {
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
     let (pipe_c_client, pipe_c_relay) = mem_pipe_pair();
-    spawn_tripartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_tripartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -208,7 +220,7 @@ fn new_member_bootstrap_can_send_to_existing_members() {
 
     // A and B already form a 2-member group.
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
     let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, b_noise, b_signing);
     session_a.set_manifest(v1.clone());
 
@@ -218,13 +230,13 @@ fn new_member_bootstrap_can_send_to_existing_members() {
         if let crate::message::Message::Sync { body } = msg {
             br.lock().unwrap().push(body);
         }
-    })
+    }, nk.factory())
     .expect("session B");
     session_b.set_manifest(v1);
 
     // C connects; no manifest yet.
     let session_c =
-        HushSession::connect(pipe_c_client, relay_pub, device_c, |_, _| {}).expect("session C");
+        HushSession::connect(pipe_c_client, relay_pub, device_c, |_, _| {}, nk.factory()).expect("session C");
 
     // A opens pairing window and admits C.
     let _token = session_a.pairing_token();

@@ -24,7 +24,8 @@ fn manifest_persists_across_session_restart() {
     // ── Phase 1: pair A and B ────────────────────────────────────────────────
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, true);
+    let (nk_rx1, nk1) = nk_push_channel();
+    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx1, true);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -59,6 +60,7 @@ fn manifest_persists_across_session_restart() {
             let _ = store_a_cb.lock().unwrap().save_group_manifest(m);
         },
         || {},
+        nk1.factory(),
     )
     .expect("session A");
 
@@ -74,6 +76,7 @@ fn manifest_persists_across_session_restart() {
             let _ = store_b_cb.lock().unwrap().save_group_manifest(m);
         },
         || {},
+        nk1.factory(),
     )
     .expect("session B");
 
@@ -113,13 +116,15 @@ fn manifest_persists_across_session_restart() {
     // New relay for the restored sessions.
     let (pipe_a2_client, pipe_a2_relay) = mem_pipe_pair();
     let (pipe_b2_client, pipe_b2_relay) = mem_pipe_pair();
-    spawn_routing_relay(&relay_kp, pipe_a2_relay, pipe_b2_relay, true);
+    let (nk_rx2, nk2) = nk_push_channel();
+    spawn_routing_relay(&relay_kp, pipe_a2_relay, pipe_b2_relay, nk_rx2, true);
 
     let session_a2 = HushSession::connect(
         pipe_a2_client,
         relay_pub,
         DeviceKeypair::from_bytes(a_noise_priv, a_signing_priv).unwrap(),
         |_, _| {},
+        nk2.factory(),
     )
     .expect("session A2");
     let session_b2 = HushSession::connect(
@@ -127,6 +132,7 @@ fn manifest_persists_across_session_restart() {
         relay_pub,
         DeviceKeypair::from_bytes(b_noise_priv, b_signing_priv).unwrap(),
         |_, _| {},
+        nk2.factory(),
     )
     .expect("session B2");
 
@@ -187,7 +193,8 @@ fn manifest_restore_via_connect_background() {
     // ── Phase 1: pair A and B, persist manifest ───────────────────────────────
     let (pipe_a1_client, pipe_a1_relay) = mem_pipe_pair();
     let (pipe_b1_client, pipe_b1_relay) = mem_pipe_pair();
-    spawn_routing_relay(&relay_kp, pipe_a1_relay, pipe_b1_relay, true);
+    let (nk_rx1, nk1) = nk_push_channel();
+    spawn_routing_relay(&relay_kp, pipe_a1_relay, pipe_b1_relay, nk_rx1, true);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -209,6 +216,7 @@ fn manifest_restore_via_connect_background() {
         || {},
         move |m| { let _ = store_a_cb.lock().unwrap().save_group_manifest(m); },
         || {},
+        nk1.factory(),
     )
     .expect("session A");
 
@@ -217,6 +225,7 @@ fn manifest_restore_via_connect_background() {
             device_b.noise.private(), device_b.signing.to_bytes()
         ).unwrap(),
         |_, _| {},
+        nk1.factory(),
     ).expect("session B1");
 
     let _token = session_a.pairing_token();
@@ -234,7 +243,8 @@ fn manifest_restore_via_connect_background() {
     let (pipe_b2_client, pipe_b2_relay) = mem_pipe_pair();
     // A2 connects via reconnect factory (async); B2 connects synchronously.
     // Use parallel relay so accept order doesn't matter.
-    spawn_bidirectional_relay_parallel(&relay_kp, pipe_a2_relay, pipe_b2_relay);
+    let (nk_rx2, nk2) = nk_push_channel();
+    spawn_bidirectional_relay_parallel(&relay_kp, pipe_a2_relay, pipe_b2_relay, nk_rx2);
 
     // Signal: B2 received a message.
     let b2_received: Arc<(Mutex<u32>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
@@ -248,6 +258,7 @@ fn manifest_restore_via_connect_background() {
             *lock.lock().unwrap() += 1;
             cvar.notify_all();
         },
+        nk2.factory(),
     ).expect("session B2");
 
     // Store the B2 device private bytes to avoid Clone issue.
@@ -284,6 +295,7 @@ fn manifest_restore_via_connect_background() {
             pipe_a2_slot2.lock().unwrap().take()
                 .ok_or_else(|| "exhausted".to_string())
         },
+        nk2.factory(), // NK push factory (ADR-0018)
         Some(Duration::from_millis(50)),
         None,
     ).expect("session A2");

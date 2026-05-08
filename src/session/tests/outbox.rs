@@ -19,14 +19,19 @@ fn push_sync_appends_and_marks_delivered() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
     {
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let s = accept(pipe_relay, relay_kp2).unwrap();
-            loop {
-                if s.receive().is_err() {
-                    break;
-                }
+            let _s = accept(pipe_relay, relay_kp2).unwrap();
+            // Accept NK push connections and drain them so push_send succeeds.
+            while let Ok(nk_pipe) = nk_rx.recv() {
+                let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || {
+                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                        let _ = sess.receive();
+                    }
+                });
             }
         });
     }
@@ -44,6 +49,7 @@ fn push_sync_appends_and_marks_delivered() {
         device,
         |_, _| {},
         Box::new(MemLog::new()),
+        nk.factory(),
     )
     .expect("connect");
     session.set_manifest(make_two_member_manifest(
@@ -74,23 +80,28 @@ fn undelivered_entries_replayed_after_reconnect() {
     }
 
     let (pipe2_client, pipe2_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
     let received_envs: Arc<Mutex<Vec<Envelope>>> = Arc::new(Mutex::new(Vec::new()));
     let rx = received_envs.clone();
     {
         let relay_kp3 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let s = accept(pipe2_relay, relay_kp3).unwrap();
-            loop {
-                match s.receive() {
-                    Ok(raw) => {
-                        if let Some((MsgType::Push, body)) = parse(&raw) {
-                            if let Ok(env) = Envelope::decode(body) {
-                                rx.lock().unwrap().push(env);
+            let _s = accept(pipe2_relay, relay_kp3).unwrap();
+            // Accept NK push connections and record their envelope bodies.
+            while let Ok(nk_pipe) = nk_rx.recv() {
+                let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
+                let rx2 = rx.clone();
+                std::thread::spawn(move || {
+                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                        if let Ok(raw) = sess.receive() {
+                            if let Some((MsgType::Push, body)) = parse(&raw) {
+                                if let Ok(env) = Envelope::decode(body) {
+                                    rx2.lock().unwrap().push(env);
+                                }
                             }
                         }
                     }
-                    Err(_) => break,
-                }
+                });
             }
         });
     }
@@ -121,6 +132,7 @@ fn undelivered_entries_replayed_after_reconnect() {
                 .take()
                 .ok_or_else(|| "exhausted".into())
         },
+        nk.factory(), // NK push factory
         Some(Duration::from_millis(50)),
         None, // on_connection_changed
     )
@@ -178,6 +190,7 @@ fn push_sync_while_disconnected_queues_and_returns_ok() {
         device,
         |_, _| {},
         Box::new(MemLog::new()),
+        || Err("push factory unused: pushes go offline in this test".into()),
     )
     .expect("connect");
     session.set_manifest(make_two_member_manifest(
@@ -230,21 +243,24 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
     let relay2_received: Arc<(Mutex<u32>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
     let rr = relay2_received.clone();
     let (pipe2_client, pipe2_relay) = mem_pipe_pair();
+    let (nk_rx2, nk2) = nk_push_channel();
     {
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let s = accept(pipe2_relay, relay_kp2).unwrap();
-            loop {
-                match s.receive() {
-                    Ok(raw) => {
-                        if let Some((MsgType::Push, _)) = parse(&raw) {
-                            let (lock, cvar) = &*rr;
+            let _s = accept(pipe2_relay, relay_kp2).unwrap();
+            // Count NK push connections as received pushes.
+            while let Ok(nk_pipe) = nk_rx2.recv() {
+                let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
+                let rr2 = rr.clone();
+                std::thread::spawn(move || {
+                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                        if sess.receive().is_ok() {
+                            let (lock, cvar) = &*rr2;
                             *lock.lock().unwrap() += 1;
                             cvar.notify_all();
                         }
                     }
-                    Err(_) => break,
-                }
+                });
             }
         });
     }
@@ -270,6 +286,7 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
                     .take()
                     .ok_or_else(|| "exhausted".to_string())
             },
+            nk2.factory(), // NK push factory: zombie reconnect loop uses this
             Some(Duration::from_millis(50)),
             None,
         )
@@ -316,6 +333,7 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
                 .take()
                 .ok_or_else(|| "exhausted".to_string())
         },
+        nk2.factory(), // NK push factory for outbox replay
         Some(Duration::from_millis(50)),
         None,
     )
@@ -374,6 +392,7 @@ fn sequence_counter_not_reused_after_restart() {
             |_| {},
             || {},
             || Err("no relay".to_string()),
+            || Err("push factory unused: offline test".into()),
             Some(Duration::from_millis(50)),
             None,
         )
@@ -415,6 +434,7 @@ fn sequence_counter_not_reused_after_restart() {
             |_| {},
             || {},
             || Err("no relay".to_string()),
+            || Err("push factory unused: offline test".into()),
             Some(Duration::from_millis(50)),
             None,
         )

@@ -25,11 +25,14 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
         mem_pipe_pair_with_close();
     let (pipe_b1_client, pipe_b1_relay, _close_b1_relay, close_b1_client) =
         mem_pipe_pair_with_close();
-    spawn_bidirectional_relay(&relay_kp, pipe_a1_relay, pipe_b1_relay);
+    // Relay 1: initial connection (NK push unused here; pushes happen after reconnect via relay2).
+    let (nk_rx1, _nk1) = nk_push_channel();
+    spawn_bidirectional_relay(&relay_kp, pipe_a1_relay, pipe_b1_relay, nk_rx1);
 
     let (pipe_a2_client, pipe_a2_relay) = mem_pipe_pair();
     let (pipe_b2_client, pipe_b2_relay) = mem_pipe_pair();
-    spawn_bidirectional_relay_parallel(&relay_kp, pipe_a2_relay, pipe_b2_relay);
+    let (nk_rx2, nk2) = nk_push_channel();
+    spawn_bidirectional_relay_parallel(&relay_kp, pipe_a2_relay, pipe_b2_relay, nk_rx2);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -71,6 +74,7 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
                     .take()
                     .ok_or_else(|| "exhausted".to_string())
             },
+            nk2.factory(), // NK push via reconnect relay
             Some(Duration::from_millis(50)),
             Some(Box::new(move |connected| {
                 if connected {
@@ -106,6 +110,7 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
                     .take()
                     .ok_or_else(|| "exhausted".to_string())
             },
+            nk2.factory(), // NK push via reconnect relay
             Some(Duration::from_millis(50)),
             Some(Box::new(move |connected| {
                 if connected {
@@ -176,7 +181,8 @@ fn destroy_group_fires_on_group_destroyed_for_all_members() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -201,6 +207,7 @@ fn destroy_group_fires_on_group_destroyed_for_all_members() {
             move || {
                 *ad.lock().unwrap() += 1;
             },
+            nk.factory(),
         )
         .expect("session A"),
     );
@@ -219,6 +226,7 @@ fn destroy_group_fires_on_group_destroyed_for_all_members() {
             move || {
                 *bd.lock().unwrap() += 1;
             },
+            nk.factory(),
         )
         .expect("session B"),
     );
@@ -252,21 +260,27 @@ fn revoke_from_unknown_device_is_ignored() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_stranger_client, pipe_stranger_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
 
     {
         let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
         let relay_kp_s = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let sess_a = accept(pipe_a_relay, relay_kp_a).unwrap();
-            let sess_s = accept(pipe_stranger_relay, relay_kp_s).unwrap();
-            loop {
-                let raw = match sess_s.receive() {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                if let Some((MsgType::Push, body)) = parse(&raw) {
-                    let _ = sess_a.send(&frame(MsgType::Deliver, body));
-                }
+            let sess_a = std::sync::Arc::new(accept(pipe_a_relay, relay_kp_a).unwrap());
+            let _sess_s = accept(pipe_stranger_relay, relay_kp_s).unwrap();
+            // Route NK pushes from stranger to A (deliberate routing to test discard).
+            while let Ok(nk_pipe) = nk_rx.recv() {
+                let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
+                let sess_a2 = sess_a.clone();
+                std::thread::spawn(move || {
+                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                        if let Ok(raw) = sess.receive() {
+                            if let Some((MsgType::Push, body)) = parse(&raw) {
+                                let _ = sess_a2.send(&frame(MsgType::Deliver, body));
+                            }
+                        }
+                    }
+                });
             }
         });
     }
@@ -294,6 +308,7 @@ fn revoke_from_unknown_device_is_ignored() {
             move || {
                 *dc.lock().unwrap() += 1;
             },
+            nk.factory(),
         )
         .expect("session A"),
     );
@@ -306,7 +321,7 @@ fn revoke_from_unknown_device_is_ignored() {
     ));
 
     let session_stranger =
-        HushSession::connect(pipe_stranger_client, relay_pub, device_stranger, |_, _| {})
+        HushSession::connect(pipe_stranger_client, relay_pub, device_stranger, |_, _| {}, nk.factory())
             .expect("stranger");
     session_stranger
         .push_message(&Message::Revoke, session_a.noise_pub())
@@ -361,6 +376,7 @@ fn destroy_group_with_no_manifest_fires_callback_and_is_terminal() {
         move || {
             *dc.lock().unwrap() += 1;
         },
+        || Err("push factory unused: no manifest".into()),
     )
     .expect("connect");
 
