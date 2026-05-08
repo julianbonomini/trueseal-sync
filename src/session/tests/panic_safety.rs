@@ -10,6 +10,8 @@ use super::super::test_helpers::*;
 use super::super::HushSession;
 use super::make_two_member_manifest;
 
+// ── #65 ───────────────────────────────────────────────────────────────────────
+
 /// The subscribe handler runs on a background thread inside RelayClient.
 /// If the manifest mutex is poisoned, lock().unwrap() panics on that thread,
 /// killing it — messages stop arriving silently.
@@ -79,4 +81,56 @@ fn subscribe_handler_survives_poisoned_manifest_mutex() {
         1,
         "message must be delivered despite poisoned manifest mutex"
     );
+}
+
+// ── #67 ───────────────────────────────────────────────────────────────────────
+
+/// push_sync must not panic when the manifest mutex is poisoned.
+/// It should return Err(NotInGroup) — not crash the host app.
+#[test]
+fn push_sync_survives_poisoned_manifest_mutex() {
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    spawn_single_relay(&relay_kp, pipe_relay);
+
+    let device = DeviceKeypair::generate();
+    let session =
+        HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("session");
+
+    let manifest_arc = session.manifest.clone();
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = manifest_arc.lock().unwrap();
+        panic!("intentional poison");
+    });
+    assert!(session.manifest.is_poisoned(), "setup: manifest must be poisoned");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.push_sync(b"hello".to_vec())));
+    assert!(
+        result.is_ok(),
+        "push_sync must not panic with poisoned manifest"
+    );
+}
+
+/// members() must not panic when the manifest mutex is poisoned.
+#[test]
+fn members_survives_poisoned_manifest_mutex() {
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    spawn_single_relay(&relay_kp, pipe_relay);
+
+    let device = DeviceKeypair::generate();
+    let session =
+        HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("session");
+
+    let manifest_arc = session.manifest.clone();
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = manifest_arc.lock().unwrap();
+        panic!("intentional poison");
+    });
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.members()));
+    assert!(result.is_ok(), "members() must not panic with poisoned manifest");
+    assert_eq!(result.unwrap(), vec![], "poisoned None manifest → empty list");
 }

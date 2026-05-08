@@ -138,6 +138,25 @@ pub(super) fn spawn_routing_relay(
 }
 
 /// Spawn a bidirectional relay (A↔B).
+/// Spawns a minimal relay that accepts exactly one client connection and
+/// discards all messages. Used in tests that only need a live session
+/// without any fanout (single-device panic-safety tests, etc.).
+pub(super) fn spawn_single_relay(relay_kp: &Keypair, pipe: MemPipe) {
+    let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    std::thread::spawn(move || {
+        let sess = match accept(pipe, kp) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        loop {
+            match sess.receive() {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+}
+
 pub(super) fn spawn_bidirectional_relay(relay_kp: &Keypair, pipe_a: MemPipe, pipe_b: MemPipe) {
     let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_kp_b = Keypair::new(relay_kp.private(), relay_kp.public_key);

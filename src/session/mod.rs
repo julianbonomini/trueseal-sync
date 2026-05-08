@@ -284,12 +284,12 @@ pub(super) fn build_subscribe_handler(
 impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// Current noise public key for this session.
     pub fn noise_pub(&self) -> NoisePublicKey {
-        self.keys.lock().unwrap().noise_pub
+        self.keys.lock().unwrap_or_else(|e| e.into_inner()).noise_pub
     }
 
     /// Current signing public key for this session.
     pub fn signing_pub(&self) -> SigningPublicKey {
-        self.keys.lock().unwrap().signing_pub
+        self.keys.lock().unwrap_or_else(|e| e.into_inner()).signing_pub
     }
 
     /// List of remote group members (excludes the local device).
@@ -298,8 +298,8 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// Each entry has a stable `id` and an auto-generated `name` derived from
     /// the member's signing public key — see [`crate::member`].
     pub fn members(&self) -> Vec<Member> {
-        let local_signing = self.keys.lock().unwrap().signing_pub;
-        let guard = self.manifest.lock().unwrap();
+        let local_signing = self.keys.lock().unwrap_or_else(|e| e.into_inner()).signing_pub;
+        let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
         match &*guard {
             None => vec![],
             Some(m) => m
@@ -320,7 +320,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     pub fn join_group(&self, token: &str) -> Result<(), SessionError> {
         let (initiator_noise, _initiator_signing, _initiator_name) =
             crate::message::decode_pairing_token(token).map_err(|_| SessionError::InvalidToken)?;
-        let ks = self.keys.lock().unwrap();
+        let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         let msg = Message::Pair {
             noise_pub: ks.noise_pub.0,
             signing_pub: ks.signing_pub.0,
@@ -378,7 +378,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     ) -> Result<Self, SessionError> {
         let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
         let noise_kp = {
-            let ks = keys.lock().unwrap();
+            let ks = keys.lock().unwrap_or_else(|e| e.into_inner());
             NoiseKeypair::new(ks.noise_priv, ks.noise_pub_key)
         };
 
@@ -626,11 +626,11 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             return Err(SessionError::GroupDestroyed);
         }
         let recipients: Vec<NoisePublicKey> = {
-            let guard = self.manifest.lock().unwrap();
+            let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
             match *guard {
                 None => return Err(SessionError::NotInGroup),
                 Some(ref m) => {
-                    let self_noise = self.keys.lock().unwrap().noise_pub;
+                    let self_noise = self.keys.lock().unwrap_or_else(|e| e.into_inner()).noise_pub;
                     m.members
                         .iter()
                         .filter(|member| member.noise_pub != self_noise)
@@ -640,12 +640,12 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             }
         };
 
-        if !self.client.lock().unwrap().is_connected() {
+        if !self.client.lock().unwrap_or_else(|e| e.into_inner()).is_connected() {
             // Blob is durably queued in the outbox; delivery is guaranteed on
             // reconnect. Return Ok(()) — the caller should not retry (ADR-0017).
             let seq = self.next_seq();
             for r in &recipients {
-                self.op_log.lock().unwrap().append(&r.0, seq, blob.clone());
+                self.op_log.lock().unwrap_or_else(|e| e.into_inner()).append(&r.0, seq, blob.clone());
             }
             return Ok(());
         }
@@ -657,7 +657,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let mut last_err: Option<String> = None;
         for recipient_pub in recipients {
             let oid = recipient_pub.0;
-            self.op_log.lock().unwrap().append(&oid, seq, blob.clone());
+            self.op_log.lock().unwrap_or_else(|e| e.into_inner()).append(&oid, seq, blob.clone());
             let result =
                 self.client
                     .lock()
@@ -665,7 +665,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                     .push(&msg, recipient_pub, seq, vec![], &signing);
             match result {
                 Ok(()) => {
-                    self.op_log.lock().unwrap().mark_delivered(&oid, seq);
+                    self.op_log.lock().unwrap_or_else(|e| e.into_inner()).mark_delivered(&oid, seq);
                 }
                 Err(e) => {
                     last_err = Some(e.to_string());
@@ -702,7 +702,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// generates a fresh identity automatically.
     pub fn destroy_group(&self) {
         let peers: Vec<NoisePublicKey> = {
-            let guard = self.manifest.lock().unwrap();
+            let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
             match *guard {
                 None => vec![],
                 Some(ref m) => m.members.iter().map(|mb| mb.noise_pub).collect(),
@@ -711,7 +711,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         for peer in peers {
             let _ = self.push_message(&Message::Revoke, peer);
         }
-        *self.manifest.lock().unwrap() = None;
+        *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.destroyed.store(true, Ordering::Release);
         (self.on_group_destroyed)();
     }
@@ -726,15 +726,15 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     }
 
     pub fn pairing_token_with_duration(&self, duration: Duration) -> String {
-        *self.pairing.lock().unwrap() = Some(PairingWindow {
+        *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = Some(PairingWindow {
             deadline: Instant::now() + duration,
         });
-        let ks = self.keys.lock().unwrap();
+        let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         crate::message::pairing_token(&ks.noise_pub.0, &ks.signing_pub.0)
     }
 
     pub fn cancel_pairing(&self) {
-        *self.pairing.lock().unwrap() = None;
+        *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Admit a device; requires both noise and signing pub keys.
@@ -745,11 +745,11 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// and pushes it to all existing members plus the new member.
     pub fn accept_pair(&self, noise_pub: NoisePublicKey, signing_pub: SigningPublicKey) -> bool {
         let window_open = {
-            let guard = self.pairing.lock().unwrap();
+            let guard = self.pairing.lock().unwrap_or_else(|e| e.into_inner());
             guard.as_ref().map(|w| w.is_open()).unwrap_or(false)
         };
         // Always clear the window.
-        *self.pairing.lock().unwrap() = None;
+        *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
         if !window_open {
             return false;
@@ -762,14 +762,14 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             name: device_name(&signing_pub.0),
         };
 
-        let ks = self.keys.lock().unwrap();
+        let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         let self_noise = ks.noise_pub;
         let self_signing = ks.signing_pub;
         let signing_key = SigningKey::from_bytes(&ks.signing_priv);
         drop(ks);
 
         let new_manifest = {
-            let guard = self.manifest.lock().unwrap();
+            let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
             match &*guard {
                 None => {
                     // Genesis: version 1, self + new member.
@@ -798,7 +798,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
         // Determine who to notify: all existing members except self + the new member.
         let notify: Vec<NoisePublicKey> = {
-            let guard = self.manifest.lock().unwrap();
+            let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
             let existing = guard
                 .as_ref()
                 .map(|m| {
@@ -813,11 +813,11 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         };
 
         // Store the new manifest.
-        *self.manifest.lock().unwrap() = Some(new_manifest.clone());
+        *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_manifest.clone());
         (self.on_manifest_changed)(&new_manifest);
 
         // Fire onMemberJoined for the newly admitted device.
-        if let Some(cb) = self.on_member_joined.lock().unwrap().as_ref() {
+        if let Some(cb) = self.on_member_joined.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             cb(
                 crate::member::member_id(&signing_pub),
                 crate::member::member_name(&signing_pub),
@@ -842,20 +842,20 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// The callback receives `(token, name)`. The caller passes `token` back to
     /// [`Self::accept_member`] to admit the device.
     pub fn set_on_member_request(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
-        *self.on_member_request.lock().unwrap() = Some(Box::new(cb));
+        *self.on_member_request.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(cb));
     }
 
     /// Register the callback fired when a new member appears in an incoming manifest update.
     /// `(id, name)` — same format as [`Self::members`].
     pub fn set_on_member_joined(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
-        *self.on_member_joined.lock().unwrap() = Some(Box::new(cb));
+        *self.on_member_joined.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(cb));
     }
 
     /// Register the callback fired when a member disappears from an incoming manifest update.
     /// Does NOT fire when the local device is the removed one (that's `on_removed_from_group`).
     /// `(id, name)` — same format as [`Self::members`].
     pub fn set_on_member_left(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
-        *self.on_member_left.lock().unwrap() = Some(Box::new(cb));
+        *self.on_member_left.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(cb));
     }
 
     /// Admit a pending member identified by their opaque `token` from `on_member_request`.
@@ -864,7 +864,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// Returns `false` if the token is unknown or the pairing window has closed.
     /// Clears the pairing window on success (single-use window).
     pub fn accept_member(&self, token: &str) -> bool {
-        let pending = self.pending_members.lock().unwrap().remove(token);
+        let pending = self.pending_members.lock().unwrap_or_else(|e| e.into_inner()).remove(token);
         match pending {
             None => false,
             Some(pm) => self.accept_pair(pm.noise_pub, pm.signing_pub),
@@ -883,12 +883,12 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// Returns `SessionError::NotInGroup` if no manifest is set.
     /// Returns `SessionError::MemberNotFound` if `target` is not in the current manifest.
     pub fn remove_member(&self, target: SigningPublicKey) -> Result<(), SessionError> {
-        let ks = self.keys.lock().unwrap();
+        let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         let signing_key = SigningKey::from_bytes(&ks.signing_priv);
         drop(ks);
 
         let (new_manifest, notify, target_noise) = {
-            let guard = self.manifest.lock().unwrap();
+            let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
             let current = guard.as_ref().ok_or(SessionError::NotInGroup)?;
 
             // Find the target member (need their noise_pub to push the manifest to them).
@@ -914,7 +914,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             );
 
             // Notify: all remaining members excluding self.
-            let self_noise = self.keys.lock().unwrap().noise_pub;
+            let self_noise = self.keys.lock().unwrap_or_else(|e| e.into_inner()).noise_pub;
             let notify: Vec<NoisePublicKey> = new_manifest
                 .members
                 .iter()
@@ -926,7 +926,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         };
 
         // Update local manifest and fire persistence callback.
-        *self.manifest.lock().unwrap() = Some(new_manifest.clone());
+        *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_manifest.clone());
         (self.on_manifest_changed)(&new_manifest);
 
         let msg = Message::GroupManifest {
@@ -951,7 +951,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// Returns `SessionError::MemberNotFound` if no member with that id exists.
     pub fn remove_member_by_id(&self, id: &str) -> Result<(), SessionError> {
         let target = {
-            let guard = self.manifest.lock().unwrap();
+            let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
             let m = guard.as_ref().ok_or(SessionError::NotInGroup)?;
             m.members
                 .iter()
@@ -970,20 +970,20 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
     /// Replace the current manifest. Used by acceptMember (#26/#27) and tests.
     pub fn set_manifest(&self, m: GroupManifest) {
-        *self.manifest.lock().unwrap() = Some(m);
+        *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) = Some(m);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn next_seq(&self) -> u64 {
-        let mut s = self.sequence.lock().unwrap();
+        let mut s = self.sequence.lock().unwrap_or_else(|e| e.into_inner());
         let v = *s;
         *s += 1;
         v
     }
 
     fn signing(&self) -> SigningKeypair {
-        let ks = self.keys.lock().unwrap();
+        let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         SigningKeypair::from_signing_key(SigningKey::from_bytes(&ks.signing_priv))
     }
 }
