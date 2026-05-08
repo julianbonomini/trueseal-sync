@@ -46,7 +46,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
         if destroyed.load(Ordering::Acquire) {
             break;
         }
-        let connected = client.lock().unwrap().is_connected();
+        let connected = client.lock().unwrap_or_else(|e| e.into_inner()).is_connected();
         if connected {
             backoff = Duration::from_secs(1);
             if !was_connected {
@@ -71,7 +71,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
         };
 
         let (noise_priv, noise_pub_key, signing_priv) = {
-            let ks = keys.lock().unwrap();
+            let ks = keys.lock().unwrap_or_else(|e| e.into_inner());
             (ks.noise_priv, ks.noise_pub_key, ks.signing_priv)
         };
 
@@ -99,12 +99,12 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             ));
         }
 
-        *client.lock().unwrap() = new_client;
+        *client.lock().unwrap_or_else(|e| e.into_inner()) = new_client;
         backoff = Duration::from_secs(1);
 
         // Replay undelivered outbox in ascending sequence order.
         let signing = SigningKeypair::from_signing_key(SigningKey::from_bytes(&signing_priv));
-        let entries = op_log.lock().unwrap().undelivered_entries();
+        let entries = op_log.lock().unwrap_or_else(|e| e.into_inner()).undelivered_entries();
         for entry in entries {
             let oid = entry.object_id;
             let recipient_pub = NoisePublicKey(oid);
@@ -112,10 +112,10 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             let result =
                 client
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .push(&msg, recipient_pub, entry.sequence, vec![], &signing);
             if result.is_ok() {
-                op_log.lock().unwrap().mark_delivered(&oid, entry.sequence);
+                op_log.lock().unwrap_or_else(|e| e.into_inner()).mark_delivered(&oid, entry.sequence);
             }
         }
     }

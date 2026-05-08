@@ -157,7 +157,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
     /// Decryption and type parsing happen inside — callers receive a clean `Message`
     /// and the sender's signing public key (`author_pub` from the Envelope).
     pub fn subscribe(&self, callback: impl Fn(Message, [u8; 32]) + Send + 'static) {
-        self.callbacks.lock().unwrap().push(Box::new(callback));
+        self.callbacks.lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(callback));
     }
 
     /// Returns true while the background run loop is alive (relay connected).
@@ -260,7 +260,7 @@ fn run_loop<T: Read + Write + Send + 'static>(
                         if let Ok((author_pub, plaintext)) = crypto::decrypt(my_noise_priv, &env.payload) {
                             if env.verify_with(author_pub).is_ok() {
                                 if let Ok(msg) = Message::decode(&plaintext) {
-                                    let cbs = callbacks.lock().unwrap();
+                                    let cbs = callbacks.lock().unwrap_or_else(|e| e.into_inner());
                                     for cb in cbs.iter() {
                                         cb(msg.clone(), author_pub);
                                     }

@@ -1,4 +1,5 @@
 mod accept_member;
+mod panic_safety;
 mod accept_pair;
 mod connection;
 mod destroy_group;

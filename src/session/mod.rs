@@ -162,7 +162,7 @@ pub(super) fn build_subscribe_handler(
         {
             let window_open = pairing
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
                 .map(|w| w.is_open())
                 .unwrap_or(false);
@@ -171,14 +171,14 @@ pub(super) fn build_subscribe_handler(
                 let token_bytes: [u8; 16] = rand::random();
                 let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
                 let name = member_name(&SigningPublicKey(*signing_pub));
-                pending_members.lock().unwrap().insert(
+                pending_members.lock().unwrap_or_else(|e| e.into_inner()).insert(
                     token.clone(),
                     PendingMember {
                         noise_pub: NoisePublicKey(*noise_pub),
                         signing_pub: SigningPublicKey(*signing_pub),
                     },
                 );
-                if let Some(cb) = on_member_request.lock().unwrap().as_ref() {
+                if let Some(cb) = on_member_request.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                     cb(token, name);
                 }
             }
@@ -187,7 +187,7 @@ pub(super) fn build_subscribe_handler(
 
         // ── Manifest-based inbound filtering ──────────────────────────────────
         {
-            let guard = manifest.lock().unwrap();
+            let guard = manifest.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref m) = *guard {
                 if !m.contains_signing_pub(&author_signing_pub) {
                     return; // not a member — discard
@@ -198,14 +198,14 @@ pub(super) fn build_subscribe_handler(
         // ── Revoke ────────────────────────────────────────────────────────────
         if let Message::Revoke = &msg {
             let in_group = {
-                let guard = manifest.lock().unwrap();
+                let guard = manifest.lock().unwrap_or_else(|e| e.into_inner());
                 guard
                     .as_ref()
                     .map(|m| m.contains_signing_pub(&author_signing_pub))
                     .unwrap_or(false)
             };
             if in_group {
-                *manifest.lock().unwrap() = None;
+                *manifest.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 destroyed.store(true, Ordering::Release);
                 (on_group_destroyed)();
             }
@@ -214,8 +214,8 @@ pub(super) fn build_subscribe_handler(
 
         // ── GroupManifest update ───────────────────────────────────────────────
         if let Message::GroupManifest { manifest: incoming } = &msg {
-            let local_signing_pub = keys.lock().unwrap().signing_pub.0;
-            let mut guard = manifest.lock().unwrap();
+            let local_signing_pub = keys.lock().unwrap_or_else(|e| e.into_inner()).signing_pub.0;
+            let mut guard = manifest.lock().unwrap_or_else(|e| e.into_inner());
             let accept = match *guard {
                 None => incoming.verify(None).is_ok(),
                 Some(ref current) => incoming.verify(Some(current)).is_ok(),
@@ -259,12 +259,12 @@ pub(super) fn build_subscribe_handler(
                 (on_manifest_changed)(incoming);
                 drop(guard);
 
-                if let Some(cb) = on_member_joined.lock().unwrap().as_ref() {
+                if let Some(cb) = on_member_joined.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                     for (id, name) in joined {
                         cb(id, name);
                     }
                 }
-                if let Some(cb) = on_member_left.lock().unwrap().as_ref() {
+                if let Some(cb) = on_member_left.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                     for (id, name) in left {
                         cb(id, name);
                     }
