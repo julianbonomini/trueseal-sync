@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -40,6 +40,18 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
     let b_signing = device_b.signing_public_key();
     let b_sk = SigningKey::from_bytes(&device_b.signing.to_bytes());
 
+    // Condvar: fires when A reconnects via pipe2.
+    let a_reconnected = Arc::new((Mutex::new(false), Condvar::new()));
+    let a_reconnected2 = a_reconnected.clone();
+
+    // Condvar: fires when B reconnects via pipe2.
+    let b_reconnected = Arc::new((Mutex::new(false), Condvar::new()));
+    let b_reconnected2 = b_reconnected.clone();
+
+    // Condvar: fires when B's on_group_destroyed is called.
+    let b_destroyed: Arc<(Mutex<u32>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
+    let bd = b_destroyed.clone();
+
     let pipe_a2_slot: Arc<Mutex<Option<MemPipe>>> = Arc::new(Mutex::new(Some(pipe_a2_client)));
     let pipe_a2_slot2 = pipe_a2_slot.clone();
     let session_a = Arc::new(
@@ -60,13 +72,17 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
                     .ok_or_else(|| "exhausted".to_string())
             },
             Some(Duration::from_millis(50)),
-            None, // on_connection_changed
+            Some(Box::new(move |connected| {
+                if connected {
+                    let (lock, cvar) = &*a_reconnected2;
+                    *lock.lock().unwrap() = true;
+                    cvar.notify_all();
+                }
+            })),
         )
         .expect("session A"),
     );
 
-    let b_destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
-    let bd = b_destroyed.clone();
     let pipe_b2_slot: Arc<Mutex<Option<MemPipe>>> = Arc::new(Mutex::new(Some(pipe_b2_client)));
     let pipe_b2_slot2 = pipe_b2_slot.clone();
     let session_b = Arc::new(
@@ -79,7 +95,9 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
             || {},
             |_| {},
             move || {
-                *bd.lock().unwrap() += 1;
+                let (lock, cvar) = &*bd;
+                *lock.lock().unwrap() += 1;
+                cvar.notify_all();
             },
             move || {
                 pipe_b2_slot2
@@ -89,7 +107,13 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
                     .ok_or_else(|| "exhausted".to_string())
             },
             Some(Duration::from_millis(50)),
-            None, // on_connection_changed
+            Some(Box::new(move |connected| {
+                if connected {
+                    let (lock, cvar) = &*b_reconnected2;
+                    *lock.lock().unwrap() = true;
+                    cvar.notify_all();
+                }
+            })),
         )
         .expect("session B"),
     );
@@ -101,18 +125,45 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
         b_noise, b_signing, &b_sk, a_noise, a_signing,
     ));
 
+    // Drop pipe1 — triggers reconnect on both sides.
     close_a1_client.store(true, Ordering::Release);
     close_b1_client.store(true, Ordering::Release);
-    std::thread::sleep(Duration::from_millis(500));
+
+    // Wait until A has reconnected via pipe2 (structural, not sleep-based).
+    {
+        let (lock, cvar) = &*a_reconnected;
+        let result = cvar
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |ok| !*ok)
+            .unwrap();
+        assert!(!result.1.timed_out(), "A must reconnect within 5s");
+    }
+
+    // Wait until B has reconnected via pipe2.
+    {
+        let (lock, cvar) = &*b_reconnected;
+        let result = cvar
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |ok| !*ok)
+            .unwrap();
+        assert!(!result.1.timed_out(), "B must reconnect within 5s");
+    }
 
     session_a.destroy_group();
-    std::thread::sleep(Duration::from_millis(400));
 
-    assert_eq!(
-        *b_destroyed.lock().unwrap(),
-        1,
-        "B's on_group_destroyed must fire after post-reconnect destroy"
-    );
+    // Wait until B's on_group_destroyed fires (structural, not sleep-based).
+    {
+        let (lock, cvar) = &*b_destroyed;
+        let result = cvar
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |count| {
+                *count == 0
+            })
+            .unwrap();
+        assert!(
+            !result.1.timed_out(),
+            "B's on_group_destroyed must fire after post-reconnect destroy"
+        );
+        assert_eq!(*result.0, 1, "B's on_group_destroyed must fire exactly once");
+    }
+
     assert!(
         session_b.manifest.lock().unwrap().is_none(),
         "B's manifest must be cleared after destroy"
