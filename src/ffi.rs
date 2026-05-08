@@ -151,6 +151,16 @@ impl HushFfiSession {
         on_group_destroyed: Box<dyn GroupDestroyedCallback>,
         on_connection_changed: Option<Box<dyn ConnectionChangedCallback>>,
     ) -> Result<Arc<Self>, SessionError> {
+        // Validate namespace: must be non-empty and match [a-zA-Z0-9_-]+
+        if namespace.is_empty()
+            || !namespace
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(SessionError::InvalidNamespace {
+                msg: format!("namespace must match [a-zA-Z0-9_-]+ (got {:?})", namespace),
+            });
+        }
         let store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
             SessionError::InvalidNamespace {
                 msg: format!("store: {e}"),
@@ -420,6 +430,73 @@ mod tests {
             kp1.public_key(),
             kp2.public_key(),
             "same keypair after reopen"
+        );
+    }
+
+    /// Invalid namespace (empty or bad chars) returns InvalidNamespace.
+    #[test]
+    fn invalid_namespace_returns_error() {
+        struct NoopMsg;
+        impl MessageCallback for NoopMsg {
+            fn on_message(&self, _blob: Vec<u8>, _snp: Vec<u8>) {}
+        }
+        struct NoopRfg;
+        impl RemovedFromGroupCallback for NoopRfg {
+            fn on_removed_from_group(&self) {}
+        }
+        struct NoopGd;
+        impl GroupDestroyedCallback for NoopGd {
+            fn on_group_destroyed(&self) {}
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let relay_pub = vec![0u8; 32];
+
+        for bad in &["", "bad namespace", "no/slash", "dot.bad", "sp ace"] {
+            let result = HushFfiSession::create(
+                dir.path().to_string_lossy().into_owned(),
+                bad.to_string(),
+                "relay.example.com:4433".into(),
+                relay_pub.clone(),
+                Box::new(NoopMsg),
+                Box::new(NoopRfg),
+                Box::new(NoopGd),
+                None,
+            );
+            assert!(
+                matches!(result, Err(SessionError::InvalidNamespace { .. })),
+                "namespace {bad:?} should return InvalidNamespace"
+            );
+        }
+    }
+
+    /// Two sessions with different namespaces have independent identities.
+    #[test]
+    fn different_namespaces_have_independent_identities() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s1 = crate::store::Store::open(dir.path(), "alpha").expect("open alpha");
+        let s2 = crate::store::Store::open(dir.path(), "beta").expect("open beta");
+        let kp1 = load_or_generate_keypair(&s1).expect("kp1");
+        let kp2 = load_or_generate_keypair(&s2).expect("kp2");
+        assert_ne!(
+            kp1.public_key(),
+            kp2.public_key(),
+            "different namespaces must generate independent identities"
+        );
+    }
+
+    /// Same namespace returns the same identity on second open.
+    #[test]
+    fn same_namespace_is_stable_across_opens() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let s1 = crate::store::Store::open(dir.path(), "myapp").expect("first open");
+        let kp1 = load_or_generate_keypair(&s1).expect("kp1");
+        drop(s1);
+        let s2 = crate::store::Store::open(dir.path(), "myapp").expect("second open");
+        let kp2 = load_or_generate_keypair(&s2).expect("kp2");
+        assert_eq!(
+            kp1.public_key(),
+            kp2.public_key(),
+            "same namespace must return same identity after re-open"
         );
     }
 }
