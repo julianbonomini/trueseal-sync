@@ -704,6 +704,26 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         Ok(())
     }
 
+    /// Remove a member identified by their opaque `member_id` string.
+    ///
+    /// Resolves the id back to `signing_pub` by scanning the current manifest,
+    /// then delegates to [`Self::remove_member`].
+    ///
+    /// Returns `SessionError::NotInGroup` if no manifest is set.
+    /// Returns `SessionError::MemberNotFound` if no member with that id exists.
+    pub fn remove_member_by_id(&self, id: &str) -> Result<(), SessionError> {
+        let target = {
+            let guard = self.manifest.lock().unwrap();
+            let m = guard.as_ref().ok_or(SessionError::NotInGroup)?;
+            m.members
+                .iter()
+                .find(|mm| crate::member::member_id(&mm.signing_pub) == id)
+                .map(|mm| mm.signing_pub)
+                .ok_or(SessionError::MemberNotFound)?
+        };
+        self.remove_member(target)
+    }
+
     pub fn cancel_pairing_window(&self) {
         self.cancel_pairing();
     }

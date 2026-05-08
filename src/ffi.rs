@@ -28,6 +28,8 @@ pub enum SessionError {
     InvalidToken,
     #[error("not in any group")]
     NotInGroup,
+    #[error("member not found")]
+    MemberNotFound,
     #[error("group has been destroyed")]
     GroupDestroyed,
 }
@@ -43,9 +45,7 @@ impl From<CoreSessionError> for SessionError {
                 got: 0,
             },
             CoreSessionError::InvalidToken => SessionError::InvalidToken,
-            CoreSessionError::MemberNotFound => SessionError::PushFailed {
-                msg: "member not found".into(),
-            },
+            CoreSessionError::MemberNotFound => SessionError::MemberNotFound,
             CoreSessionError::GroupDestroyed => SessionError::GroupDestroyed,
         }
     }
@@ -280,6 +280,20 @@ impl HushFfiSession {
                 name: m.name,
             })
             .collect()
+    }
+
+    /// Remove a group member by their opaque `member_id` from `members()`.
+    ///
+    /// Issues a new manifest excluding the target and propagates it to all
+    /// remaining members (including the removed device so it can fire
+    /// `onRemovedFromGroup`).
+    ///
+    /// Returns `SessionError::NotInGroup` if no manifest is set.
+    /// Returns `SessionError::MemberNotFound` if no member with that id exists.
+    pub fn remove_member(&self, member_id: String) -> Result<(), SessionError> {
+        self.inner
+            .remove_member_by_id(&member_id)
+            .map_err(SessionError::from)
     }
 
     /// Encrypt `blob` and fan out to all current group members.
