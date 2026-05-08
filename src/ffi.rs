@@ -51,6 +51,17 @@ impl From<CoreSessionError> for SessionError {
     }
 }
 
+// ── Public types ──────────────────────────────────────────────────────────────
+
+/// A remote group member as seen through the FFI surface.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct Member {
+    /// Stable opaque identifier, e.g. `"YWJjZGVmZ2"`.
+    pub id: String,
+    /// Auto-generated human-readable name, e.g. `"AmberFalcon"`.
+    pub name: String,
+}
+
 // ── Callback interfaces ───────────────────────────────────────────────────────
 
 /// Fired when a `Sync` message is delivered to this device.
@@ -254,6 +265,21 @@ impl HushFfiSession {
     /// Close the pairing window without admitting any device.
     pub fn cancel_pairing(&self) {
         self.inner.cancel_pairing();
+    }
+
+    /// List remote group members (excludes the local device).
+    ///
+    /// Returns an empty `Vec` when no manifest is set.
+    /// Each `Member` has a stable `id` and an auto-generated `name`.
+    pub fn members(&self) -> Vec<Member> {
+        self.inner
+            .members()
+            .into_iter()
+            .map(|m| Member {
+                id: m.id,
+                name: m.name,
+            })
+            .collect()
     }
 
     /// Encrypt `blob` and fan out to all current group members.

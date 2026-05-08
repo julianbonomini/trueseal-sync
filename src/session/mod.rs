@@ -18,12 +18,24 @@ use crate::device::DeviceKeypair;
 use crate::envelope::SigningKeypair;
 use crate::keys::{NoisePublicKey, SigningPublicKey};
 use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
+use crate::member::{member_id, member_name};
 use crate::message::{device_name, pairing_payload, Message};
 use crate::operation_log::{MemLog, OperationLog};
 use crate::relay::RelayClient;
 
 const DEFAULT_PAIRING_WINDOW: Duration = Duration::from_secs(60);
 const DEFAULT_RECONNECT_CAP: Duration = Duration::from_secs(30);
+
+// ── Public types ──────────────────────────────────────────────────────────────
+
+/// A remote group member as seen by this session.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Member {
+    /// Stable opaque identifier derived from the member's signing public key.
+    pub id: String,
+    /// Auto-generated human-readable name derived from the member's signing public key.
+    pub name: String,
+}
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -118,6 +130,28 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// Current signing public key for this session.
     pub fn signing_pub(&self) -> SigningPublicKey {
         self.keys.lock().unwrap().signing_pub
+    }
+
+    /// List of remote group members (excludes the local device).
+    ///
+    /// Returns an empty `Vec` when no manifest is set.
+    /// Each entry has a stable `id` and an auto-generated `name` derived from
+    /// the member's signing public key — see [`crate::member`].
+    pub fn members(&self) -> Vec<Member> {
+        let local_signing = self.keys.lock().unwrap().signing_pub;
+        let guard = self.manifest.lock().unwrap();
+        match &*guard {
+            None => vec![],
+            Some(m) => m
+                .members
+                .iter()
+                .filter(|mm| mm.signing_pub.0 != local_signing.0)
+                .map(|mm| Member {
+                    id: member_id(&mm.signing_pub),
+                    name: member_name(&mm.signing_pub),
+                })
+                .collect(),
+        }
     }
 
     /// Send a `Pair` message to the initiator identified by `token`.

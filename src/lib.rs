@@ -6,6 +6,7 @@ pub mod envelope;
 pub mod ffi;
 pub mod keys;
 pub mod manifest;
+pub mod member;
 pub mod message;
 pub mod operation_log;
 pub mod relay;
