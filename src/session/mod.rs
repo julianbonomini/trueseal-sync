@@ -436,6 +436,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
+        on_connection_changed: Option<Box<dyn Fn(bool) + Send + Sync + 'static>>,
     ) -> Result<Self, SessionError> {
         let session = Self::connect_full(
             transport,
@@ -461,6 +462,9 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let on_mj_arc = session.on_member_joined.clone();
         let on_ml_arc = session.on_member_left.clone();
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
+        let on_cc: Arc<dyn Fn(bool) + Send + Sync + 'static> = on_connection_changed
+            .map(|f| -> Arc<dyn Fn(bool) + Send + Sync + 'static> { Arc::new(f) })
+            .unwrap_or_else(|| Arc::new(|_| {}));
         std::thread::spawn(move || {
             reconnect::reconnect_loop(
                 client_arc,
@@ -480,6 +484,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 on_ml_arc,
                 Arc::new(transport_factory),
                 cap,
+                on_cc,
             );
         });
         Ok(session)
@@ -503,6 +508,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
+        on_connection_changed: Option<Box<dyn Fn(bool) + Send + Sync + 'static>>,
     ) -> Result<Self, SessionError> {
         // Build all arcs directly — mirrors connect_full but without an initial transport.
         let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
@@ -546,6 +552,9 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         };
 
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
+        let on_cc: Arc<dyn Fn(bool) + Send + Sync + 'static> = on_connection_changed
+            .map(|f| -> Arc<dyn Fn(bool) + Send + Sync + 'static> { Arc::new(f) })
+            .unwrap_or_else(|| Arc::new(|_| {}));
         std::thread::spawn(move || {
             reconnect::reconnect_loop(
                 client,
@@ -565,6 +574,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 on_member_left,
                 Arc::new(transport_factory),
                 cap,
+                on_cc,
             );
         });
 

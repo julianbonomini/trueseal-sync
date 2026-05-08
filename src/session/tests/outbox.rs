@@ -121,6 +121,7 @@ fn undelivered_entries_replayed_after_reconnect() {
                 .ok_or_else(|| "exhausted".into())
         },
         Some(Duration::from_millis(50)),
+        None, // on_connection_changed
     )
     .expect("initial connect");
     session.set_manifest(make_two_member_manifest(

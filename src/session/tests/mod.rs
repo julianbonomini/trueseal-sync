@@ -1,5 +1,6 @@
 mod accept_member;
 mod accept_pair;
+mod connection;
 mod destroy_group;
 mod fanout;
 mod join_group;

@@ -60,6 +60,7 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
                     .ok_or_else(|| "exhausted".to_string())
             },
             Some(Duration::from_millis(50)),
+            None, // on_connection_changed
         )
         .expect("session A"),
     );
@@ -88,6 +89,7 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
                     .ok_or_else(|| "exhausted".to_string())
             },
             Some(Duration::from_millis(50)),
+            None, // on_connection_changed
         )
         .expect("session B"),
     );

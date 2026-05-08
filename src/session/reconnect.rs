@@ -36,8 +36,10 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
+    on_connection_changed: Arc<dyn Fn(bool) + Send + Sync + 'static>,
 ) {
     let mut backoff = cap.min(Duration::from_secs(1));
+    let mut was_connected = false; // track last-known state to detect transitions
     loop {
         std::thread::sleep(Duration::from_millis(50));
         // Exit the reconnect loop if the group has been destroyed.
@@ -47,7 +49,17 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
         let connected = client.lock().unwrap().is_connected();
         if connected {
             backoff = Duration::from_secs(1);
+            if !was_connected {
+                was_connected = true;
+                (on_connection_changed)(true);
+            }
             continue;
+        }
+
+        // Transition: was connected, now disconnected.
+        if was_connected {
+            was_connected = false;
+            (on_connection_changed)(false);
         }
 
         std::thread::sleep(backoff);

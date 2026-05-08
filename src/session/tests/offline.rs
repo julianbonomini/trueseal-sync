@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use crate::device::DeviceKeypair;
 use crate::operation_log::MemLog;
 
@@ -23,6 +21,7 @@ fn create_offline_returns_session_immediately() {
         |_| {},
         || {},
         || Err("unreachable".into()),
+        None,
         None,
     );
 
@@ -48,6 +47,7 @@ fn offline_session_send_returns_not_in_group() {
         |_| {},
         || {},
         || Err("unreachable".into()),
+        None,
         None,
     )
     .expect("offline session");
@@ -83,6 +83,7 @@ fn offline_session_with_manifest_queues_to_outbox() {
         |_| {},
         || {},
         || Err("unreachable".into()),
+        None,
         None,
     )
     .expect("offline session");

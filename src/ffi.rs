@@ -108,6 +108,15 @@ pub trait MemberLeftCallback: Send + Sync {
     fn on_member_left(&self, member_id: String, member_name: String);
 }
 
+/// Fired when the relay connection state changes.
+/// `connected = true` when the relay connects; `false` when it disconnects.
+/// Informational only — the library queues outbox messages and reconnects automatically.
+/// Does NOT fire at session construction time.
+#[uniffi::export(callback_interface)]
+pub trait ConnectionChangedCallback: Send + Sync {
+    fn on_connection_changed(&self, connected: bool);
+}
+
 // ── HushFfiSession ────────────────────────────────────────────────────────────
 
 /// A connected hush-sync session over TCP.
@@ -140,6 +149,7 @@ impl HushFfiSession {
         on_message: Box<dyn MessageCallback>,
         on_removed_from_group: Box<dyn RemovedFromGroupCallback>,
         on_group_destroyed: Box<dyn GroupDestroyedCallback>,
+        on_connection_changed: Option<Box<dyn ConnectionChangedCallback>>,
     ) -> Result<Arc<Self>, SessionError> {
         let store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
             SessionError::InvalidNamespace {
@@ -225,6 +235,9 @@ impl HushFfiSession {
             },
             move || TcpStream::connect(&relay_addr_factory).map_err(|e| e.to_string()),
             None, // use default 30-second cap
+            on_connection_changed.map(|cb| -> Box<dyn Fn(bool) + Send + Sync + 'static> {
+                Box::new(move |connected| cb.on_connection_changed(connected))
+            }),
         )
         .map_err(SessionError::from)?;
 
