@@ -217,11 +217,11 @@ impl HushFfiSession {
                 if let Message::Sync { body } = msg {
                     let sender_noise_pub = manifest_slot_cb
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .as_ref()
                         .and_then(|m| {
                             m.lock()
-                                .unwrap()
+                                .unwrap_or_else(|e| e.into_inner())
                                 .as_ref()
                                 .and_then(|manifest| {
                                     manifest.noise_pub_for_signing(&author_signing_pub)
@@ -237,10 +237,10 @@ impl HushFfiSession {
                 on_removed_from_group.on_removed_from_group();
             },
             move |m: &crate::manifest::GroupManifest| {
-                let _ = manifest_store_save.lock().unwrap().save_group_manifest(m);
+                let _ = manifest_store_save.lock().unwrap_or_else(|e| e.into_inner()).save_group_manifest(m);
             },
             move || {
-                let _ = wipe_store.lock().unwrap().wipe();
+                let _ = wipe_store.lock().unwrap_or_else(|e| e.into_inner()).wipe();
                 on_group_destroyed.on_group_destroyed();
             },
             move || TcpStream::connect(&relay_addr_factory).map_err(|e| e.to_string()),
@@ -257,7 +257,7 @@ impl HushFfiSession {
         }
 
         // Wire the manifest arc into the closure's slot now that the session exists.
-        *manifest_slot.lock().unwrap() = Some(inner.manifest.clone());
+        *manifest_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(inner.manifest.clone());
 
         Ok(Arc::new(Self { inner }))
     }
