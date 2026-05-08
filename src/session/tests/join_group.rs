@@ -15,8 +15,9 @@ fn join_group_sends_pair_message_to_initiator() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
     // Relay routes B→A: accepts B's pipe (pipe_b_relay) first, then A's (pipe_a_relay).
-    spawn_routing_relay(&relay_kp, pipe_b_relay, pipe_a_relay, true);
+    spawn_routing_relay(&relay_kp, pipe_b_relay, pipe_a_relay, nk_rx, true);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -25,9 +26,9 @@ fn join_group_sends_pair_message_to_initiator() {
 
     // B connects first — matches relay accept order.
     let session_b =
-        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}).expect("session B");
+        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}, nk.factory()).expect("session B");
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
 
     // Capture the opaque token issued when B's Pair arrives.
     let req_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -69,12 +70,17 @@ fn join_group_invalid_token_returns_error() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay_kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let (nk_rx2, nk2) = nk_push_channel();
     std::thread::spawn(move || {
         let _ = hush_noise::session_xx::accept(pipe_relay, relay_kp2);
+        while let Ok(p) = nk_rx2.recv() {
+            let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+            std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(p, kp); });
+        }
     });
 
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, nk2.factory()).expect("connect");
 
     let result = session.join_group("not-a-valid-token!!!!");
     assert!(

@@ -243,7 +243,8 @@ impl HushFfiSession {
                 let _ = wipe_store.lock().unwrap_or_else(|e| e.into_inner()).wipe();
                 on_group_destroyed.on_group_destroyed();
             },
-            move || TcpStream::connect(&relay_addr_factory).map_err(|e| e.to_string()),
+            move || TcpStream::connect(&relay_addr_factory).map_err(|e| e.to_string()), // transport_factory
+            move || TcpStream::connect(&relay_addr).map_err(|e| e.to_string()), // push_factory (NK, ADR-0018)
             None, // use default 30-second cap
             on_connection_changed.map(|cb| -> Box<dyn Fn(bool) + Send + Sync + 'static> {
                 Box::new(move |connected| cb.on_connection_changed(connected))

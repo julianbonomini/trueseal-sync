@@ -30,6 +30,7 @@ fn members_empty_when_no_manifest() {
         || {},
         |_| {},
         || {},
+        || Err("push factory unused in members test".into()),
     )
     .expect("connect");
 
@@ -64,6 +65,7 @@ fn members_excludes_local_device() {
         || {},
         |_| {},
         || {},
+        || Err("push factory unused in members test".into()),
     )
     .expect("connect");
 
@@ -113,6 +115,7 @@ fn members_id_and_name_are_stable() {
         || {},
         |_| {},
         || {},
+        || Err("push factory unused in members test".into()),
     )
     .expect("connect");
 

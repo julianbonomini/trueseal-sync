@@ -3,6 +3,7 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use hush_noise::{
     keypair::{generate_keypair, Keypair},
+    session_nk,
     session_xx::accept,
 };
 
@@ -15,6 +16,39 @@ pub(super) type MemPipeSimple = MemPipe;
 /// Like `mem_pipe_pair` but with a shorter name for NK-push tests.
 pub(super) fn mem_pipe_pair_simple() -> (MemPipeSimple, MemPipeSimple) {
     mem_pipe_pair()
+}
+
+/// Sender side of an NK push channel.
+/// Clone to give the same relay-side channel to multiple sessions.
+#[derive(Clone)]
+pub(super) struct NkSender(Arc<Mutex<mpsc::Sender<MemPipe>>>);
+
+impl NkSender {
+    /// Return a push factory suitable for a session constructor.
+    /// Each call creates an independent factory closure sharing the same channel.
+    pub fn factory(&self) -> impl Fn() -> Result<MemPipe, String> + Send + Sync + 'static {
+        let tx = self.0.clone();
+        move || {
+            let (client, relay) = mem_pipe_pair();
+            tx.lock()
+                .unwrap()
+                .send(relay)
+                .map_err(|_| "nk channel closed".to_string())?;
+            Ok(client)
+        }
+    }
+}
+
+/// Create an NK push channel.
+///
+/// Returns `(relay_rx, nk_sender)` where:
+/// - `relay_rx` is passed to a relay helper that accepts NK push connections
+/// - `nk_sender.factory()` is passed to a session constructor; each push opens
+///   a fresh in-memory pipe and sends the relay-side end through the channel.
+/// - Multiple sessions can share a channel by cloning `nk_sender`.
+pub(super) fn nk_push_channel() -> (mpsc::Receiver<MemPipe>, NkSender) {
+    let (tx, rx) = mpsc::channel::<MemPipe>();
+    (rx, NkSender(Arc::new(Mutex::new(tx))))
 }
 
 // ── In-memory bidirectional pipe ─────────────────────────────────────────────
@@ -113,27 +147,38 @@ pub(super) fn spawn_routing_relay(
     relay_kp: &Keypair,
     pipe_a: MemPipe,
     pipe_b: MemPipe,
+    nk_rx: mpsc::Receiver<MemPipe>,
     a_is_src: bool,
 ) {
     let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_kp_b = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_priv = relay_kp.private();
+    let relay_pub_key = relay_kp.public_key;
     std::thread::spawn(move || {
         let sess_a = accept(pipe_a, relay_kp_a).unwrap();
         let sess_b = accept(pipe_b, relay_kp_b).unwrap();
-        let (src, dst) = if a_is_src {
-            (sess_a, sess_b)
+        let (_src, dst) = if a_is_src {
+            (Arc::new(sess_a), Arc::new(sess_b))
         } else {
-            (sess_b, sess_a)
+            (Arc::new(sess_b), Arc::new(sess_a))
         };
-        loop {
-            let raw = match src.receive() {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-            if let Some((MsgType::Push, body)) = parse(&raw) {
-                let _ = dst.send(&frame(MsgType::Deliver, body));
+        // NK push accept loop: every push from the pushing device arrives here.
+        let dst_nk = dst.clone();
+        std::thread::spawn(move || {
+            while let Ok(nk_pipe) = nk_rx.recv() {
+                let kp = Keypair::new(relay_priv, relay_pub_key);
+                let dst2 = dst_nk.clone();
+                std::thread::spawn(move || {
+                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                        if let Ok(raw) = sess.receive() {
+                            if let Some((MsgType::Push, body)) = parse(&raw) {
+                                let _ = dst2.send(&frame(MsgType::Deliver, body));
+                            }
+                        }
+                    }
+                });
             }
-        }
+        });
     });
 }
 
@@ -141,8 +186,23 @@ pub(super) fn spawn_routing_relay(
 /// Spawns a minimal relay that accepts exactly one client connection and
 /// discards all messages. Used in tests that only need a live session
 /// without any fanout (single-device panic-safety tests, etc.).
-pub(super) fn spawn_single_relay(relay_kp: &Keypair, pipe: MemPipe) {
+pub(super) fn spawn_single_relay(relay_kp: &Keypair, pipe: MemPipe, nk_rx: mpsc::Receiver<MemPipe>) {
     let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_priv = relay_kp.private();
+    let relay_pub_key = relay_kp.public_key;
+    // NK accept loop: accept and discard NK connections (tests using this relay
+    // may trigger push_message internally; the NK session must be accepted so
+    // the push does not block). There is no routing destination here.
+    std::thread::spawn(move || {
+        while let Ok(nk_pipe) = nk_rx.recv() {
+            let kp = Keypair::new(relay_priv, relay_pub_key);
+            std::thread::spawn(move || {
+                if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                    let _ = sess.receive();
+                }
+            });
+        }
+    });
     std::thread::spawn(move || {
         let sess = match accept(pipe, kp) {
             Ok(s) => s,
@@ -157,36 +217,45 @@ pub(super) fn spawn_single_relay(relay_kp: &Keypair, pipe: MemPipe) {
     });
 }
 
-pub(super) fn spawn_bidirectional_relay(relay_kp: &Keypair, pipe_a: MemPipe, pipe_b: MemPipe) {
+pub(super) fn spawn_bidirectional_relay(relay_kp: &Keypair, pipe_a: MemPipe, pipe_b: MemPipe, nk_rx: mpsc::Receiver<MemPipe>) {
     let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_kp_b = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_priv = relay_kp.private();
+    let relay_pub_key = relay_kp.public_key;
     std::thread::spawn(move || {
         let sess_a = accept(pipe_a, relay_kp_a).unwrap();
         let sess_b = accept(pipe_b, relay_kp_b).unwrap();
+        // Build routing table: noise_pub → deliver channel
+        let a_noise = sess_a.remote_public_key();
+        let b_noise = sess_b.remote_public_key();
         let sess_a = Arc::new(sess_a);
         let sess_b = Arc::new(sess_b);
-        // A→B
-        let sa2 = sess_a.clone();
-        let sb2 = sess_b.clone();
-        std::thread::spawn(move || loop {
-            let raw = match sa2.receive() {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-            if let Some((MsgType::Push, body)) = parse(&raw) {
-                let _ = sb2.send(&frame(MsgType::Deliver, body));
+        // NK router: accept NK connections, parse recipient_pub, deliver to matching session.
+        let sa_nk = sess_a.clone();
+        let sb_nk = sess_b.clone();
+        std::thread::spawn(move || {
+            while let Ok(nk_pipe) = nk_rx.recv() {
+                let kp = Keypair::new(relay_priv, relay_pub_key);
+                let sa2 = sa_nk.clone();
+                let sb2 = sb_nk.clone();
+                std::thread::spawn(move || {
+                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                        if let Ok(raw) = sess.receive() {
+                            if let Some((MsgType::Push, body)) = parse(&raw) {
+                                let framed = frame(MsgType::Deliver, body.clone());
+                                if let Ok(env) = crate::envelope::Envelope::decode(&body) {
+                                    if env.recipient_pub == a_noise {
+                                        let _ = sa2.send(&framed);
+                                    } else if env.recipient_pub == b_noise {
+                                        let _ = sb2.send(&framed);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
             }
         });
-        // B→A
-        loop {
-            let raw = match sess_b.receive() {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-            if let Some((MsgType::Push, body)) = parse(&raw) {
-                let _ = sess_a.send(&frame(MsgType::Deliver, body));
-            }
-        }
     });
 }
 
@@ -197,13 +266,16 @@ pub(super) fn spawn_bidirectional_relay_parallel(
     relay_kp: &Keypair,
     pipe_a: MemPipe,
     pipe_b: MemPipe,
+    nk_rx: mpsc::Receiver<MemPipe>,
 ) {
-    use std::sync::mpsc;
+    use std::sync::mpsc as std_mpsc;
     let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_kp_b = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_priv = relay_kp.private();
+    let relay_pub_key = relay_kp.public_key;
 
-    let (tx_a, rx_a) = mpsc::channel();
-    let (tx_b, rx_b) = mpsc::channel();
+    let (tx_a, rx_a) = std_mpsc::channel();
+    let (tx_b, rx_b) = std_mpsc::channel();
 
     std::thread::spawn(move || {
         let sess = accept(pipe_a, relay_kp_a).unwrap();
@@ -217,30 +289,36 @@ pub(super) fn spawn_bidirectional_relay_parallel(
     std::thread::spawn(move || {
         let sess_a = rx_a.recv().unwrap();
         let sess_b = rx_b.recv().unwrap();
+        let a_noise = sess_a.remote_public_key();
+        let b_noise = sess_b.remote_public_key();
         let sess_a = Arc::new(sess_a);
         let sess_b = Arc::new(sess_b);
-        let sa2 = sess_a.clone();
-        let sb2 = sess_b.clone();
-        // A → B
-        std::thread::spawn(move || loop {
-            let raw = match sa2.receive() {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-            if let Some((MsgType::Push, body)) = parse(&raw) {
-                let _ = sb2.send(&frame(MsgType::Deliver, body));
+        // NK router
+        let sa_nk = sess_a.clone();
+        let sb_nk = sess_b.clone();
+        std::thread::spawn(move || {
+            while let Ok(nk_pipe) = nk_rx.recv() {
+                let kp = Keypair::new(relay_priv, relay_pub_key);
+                let sa2 = sa_nk.clone();
+                let sb2 = sb_nk.clone();
+                std::thread::spawn(move || {
+                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                        if let Ok(raw) = sess.receive() {
+                            if let Some((MsgType::Push, body)) = parse(&raw) {
+                                let framed = frame(MsgType::Deliver, body.clone());
+                                if let Ok(env) = crate::envelope::Envelope::decode(&body) {
+                                    if env.recipient_pub == a_noise {
+                                        let _ = sa2.send(&framed);
+                                    } else if env.recipient_pub == b_noise {
+                                        let _ = sb2.send(&framed);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
             }
         });
-        // B → A
-        loop {
-            let raw = match sess_b.receive() {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-            if let Some((MsgType::Push, body)) = parse(&raw) {
-                let _ = sess_a.send(&frame(MsgType::Deliver, body));
-            }
-        }
     });
 }
 
@@ -274,11 +352,13 @@ pub(super) fn spawn_tripartite_relay(
     pipe_a: MemPipe,
     pipe_b: MemPipe,
     pipe_c: MemPipe,
+    nk_rx: mpsc::Receiver<MemPipe>,
 ) {
-    use std::sync::mpsc;
     let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_kp_b = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_kp_c = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_priv = relay_kp.private();
+    let relay_pub_key = relay_kp.public_key;
     std::thread::spawn(move || {
         let sess_a = Arc::new(accept(pipe_a, relay_kp_a).unwrap());
         let sess_b = Arc::new(accept(pipe_b, relay_kp_b).unwrap());
@@ -309,42 +389,54 @@ pub(super) fn spawn_tripartite_relay(
             }
         });
 
-        // Reader threads: one per session, routes to the other two channels.
-        let make_reader = |src: Arc<hush_noise::session_xx::Session<MemPipe>>,
-                           out1: mpsc::Sender<Vec<u8>>,
-                           out2: mpsc::Sender<Vec<u8>>| {
-            std::thread::spawn(move || loop {
-                let raw = match src.receive() {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                if let Some((MsgType::Push, body)) = parse(&raw) {
-                    let framed = frame(MsgType::Deliver, body);
-                    let _ = out1.send(framed.clone());
-                    let _ = out2.send(framed);
-                }
-            })
-        };
-
-        make_reader(sess_a, tx_b.clone(), tx_c.clone());
-        make_reader(sess_b, tx_a.clone(), tx_c.clone());
-        make_reader(sess_c, tx_a.clone(), tx_b.clone());
+        // NK router: route each NK push to the intended recipient.
+        let a_noise = sess_a.remote_public_key();
+        let b_noise = sess_b.remote_public_key();
+        let c_noise = sess_c.remote_public_key();
+        let txa2 = tx_a.clone();
+        let txb2 = tx_b.clone();
+        let txc2 = tx_c.clone();
+        std::thread::spawn(move || {
+            while let Ok(nk_pipe) = nk_rx.recv() {
+                let kp = Keypair::new(relay_priv, relay_pub_key);
+                let ta = txa2.clone();
+                let tb = txb2.clone();
+                let tc = txc2.clone();
+                std::thread::spawn(move || {
+                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                        if let Ok(raw) = sess.receive() {
+                            if let Some((MsgType::Push, body)) = parse(&raw) {
+                                let framed = frame(MsgType::Deliver, body.clone());
+                                if let Ok(env) = crate::envelope::Envelope::decode(&body) {
+                                    if env.recipient_pub == a_noise { let _ = ta.send(framed); }
+                                    else if env.recipient_pub == b_noise { let _ = tb.send(framed); }
+                                    else if env.recipient_pub == c_noise { let _ = tc.send(framed); }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
     });
 }
 
 /// Spawn a fully-connected 4-way relay (A↔B↔C↔D).
-/// Any Push from any device is delivered to the other three.
+/// Any Push from any device is delivered to the intended recipient.
 pub(super) fn spawn_quadpartite_relay(
     relay_kp: &Keypair,
     pipe_a: MemPipe,
     pipe_b: MemPipe,
     pipe_c: MemPipe,
     pipe_d: MemPipe,
+    nk_rx: mpsc::Receiver<MemPipe>,
 ) {
     let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_kp_b = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_kp_c = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_kp_d = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_priv = relay_kp.private();
+    let relay_pub_key = relay_kp.public_key;
     std::thread::spawn(move || {
         let sess_a = Arc::new(accept(pipe_a, relay_kp_a).unwrap());
         let sess_b = Arc::new(accept(pipe_b, relay_kp_b).unwrap());
@@ -368,28 +460,38 @@ pub(super) fn spawn_quadpartite_relay(
             });
         }
 
-        // Reader threads: each device's push goes to the other three.
-        let make_reader = |src: Arc<hush_noise::session_xx::Session<MemPipe>>,
-                           out1: mpsc::Sender<Vec<u8>>,
-                           out2: mpsc::Sender<Vec<u8>>,
-                           out3: mpsc::Sender<Vec<u8>>| {
-            std::thread::spawn(move || loop {
-                let raw = match src.receive() {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
-                if let Some((MsgType::Push, body)) = parse(&raw) {
-                    let framed = frame(MsgType::Deliver, body);
-                    let _ = out1.send(framed.clone());
-                    let _ = out2.send(framed.clone());
-                    let _ = out3.send(framed);
-                }
-            })
-        };
-
-        make_reader(sess_a, tx_b.clone(), tx_c.clone(), tx_d.clone());
-        make_reader(sess_b, tx_a.clone(), tx_c.clone(), tx_d.clone());
-        make_reader(sess_c, tx_a.clone(), tx_b.clone(), tx_d.clone());
-        make_reader(sess_d, tx_a.clone(), tx_b.clone(), tx_c.clone());
+        // NK router: route each NK push to the intended recipient.
+        let a_noise = sess_a.remote_public_key();
+        let b_noise = sess_b.remote_public_key();
+        let c_noise = sess_c.remote_public_key();
+        let d_noise = sess_d.remote_public_key();
+        let txa2 = tx_a.clone();
+        let txb2 = tx_b.clone();
+        let txc2 = tx_c.clone();
+        let txd2 = tx_d.clone();
+        std::thread::spawn(move || {
+            while let Ok(nk_pipe) = nk_rx.recv() {
+                let kp = Keypair::new(relay_priv, relay_pub_key);
+                let ta = txa2.clone();
+                let tb = txb2.clone();
+                let tc = txc2.clone();
+                let td = txd2.clone();
+                std::thread::spawn(move || {
+                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                        if let Ok(raw) = sess.receive() {
+                            if let Some((MsgType::Push, body)) = parse(&raw) {
+                                let framed = frame(MsgType::Deliver, body.clone());
+                                if let Ok(env) = crate::envelope::Envelope::decode(&body) {
+                                    if env.recipient_pub == a_noise { let _ = ta.send(framed); }
+                                    else if env.recipient_pub == b_noise { let _ = tb.send(framed); }
+                                    else if env.recipient_pub == c_noise { let _ = tc.send(framed); }
+                                    else if env.recipient_pub == d_noise { let _ = td.send(framed); }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
     });
 }

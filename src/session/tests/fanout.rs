@@ -18,14 +18,19 @@ fn push_sync_no_manifest_returns_not_in_group() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
     {
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
             let _ = accept(pipe_relay, relay_kp2);
+            while let Ok(p) = nk_rx.recv() {
+                let kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(p, kp2); });
+            }
         });
     }
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, nk.factory()).expect("connect");
     let result = session.push_sync(b"hello".to_vec());
     assert!(
         matches!(result, Err(SessionError::NotInGroup)),
@@ -44,7 +49,8 @@ fn push_sync_fans_out_to_all_members() {
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
     let (pipe_c_client, pipe_c_relay) = mem_pipe_pair();
-    spawn_tripartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_tripartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -72,13 +78,13 @@ fn push_sync_fans_out_to_all_members() {
     let manifest_c = GroupManifest::new(group_id, 1, members.clone(), &c_sk);
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
 
     let received_b: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx_b = received_b.clone();
     let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _| {
         rx_b.lock().unwrap().push(msg);
-    })
+    }, nk.factory())
     .expect("session B");
     session_b.set_manifest(manifest_b);
 
@@ -86,7 +92,7 @@ fn push_sync_fans_out_to_all_members() {
     let rx_c = received_c.clone();
     let session_c = HushSession::connect(pipe_c_client, relay_pub, device_c, move |msg, _| {
         rx_c.lock().unwrap().push(msg);
-    })
+    }, nk.factory())
     .expect("session C");
     session_c.set_manifest(manifest_c);
 
@@ -117,10 +123,13 @@ fn push_sync_consumes_one_sequence_per_call() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay, _close_relay, close_client) = mem_pipe_pair_with_close();
+    let (nk_rx, nk) = nk_push_channel();
     {
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
             let s = accept(pipe_relay, relay_kp2).unwrap();
+            // drain nk connections (pushes go offline in this test but drain for safety)
+            let _ = nk_rx;
             loop {
                 if s.receive().is_err() {
                     break;
@@ -163,6 +172,7 @@ fn push_sync_consumes_one_sequence_per_call() {
         device,
         |_, _| {},
         Box::new(MemLog::new()),
+        nk.factory(),
     )
     .expect("connect");
     session.set_manifest(manifest);
@@ -197,7 +207,8 @@ fn push_sync_fans_out_to_n_recipients() {
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
     let (pipe_c_client, pipe_c_relay) = mem_pipe_pair();
     let (pipe_d_client, pipe_d_relay) = mem_pipe_pair();
-    spawn_quadpartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay, pipe_d_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_quadpartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay, pipe_d_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -246,10 +257,10 @@ fn push_sync_fans_out_to_n_recipients() {
     let received_d = make_received();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("A");
-    let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, make_cb(received_b.clone())).expect("B");
-    let session_c = HushSession::connect(pipe_c_client, relay_pub, device_c, make_cb(received_c.clone())).expect("C");
-    let session_d = HushSession::connect(pipe_d_client, relay_pub, device_d, make_cb(received_d.clone())).expect("D");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("A");
+    let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, make_cb(received_b.clone()), nk.factory()).expect("B");
+    let session_c = HushSession::connect(pipe_c_client, relay_pub, device_c, make_cb(received_c.clone()), nk.factory()).expect("C");
+    let session_d = HushSession::connect(pipe_d_client, relay_pub, device_d, make_cb(received_d.clone()), nk.factory()).expect("D");
 
     session_a.set_manifest(manifest_a);
     session_b.set_manifest(manifest_b);

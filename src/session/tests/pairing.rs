@@ -16,13 +16,14 @@ fn pairing_ceremony_creates_manifest_with_new_member() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, true); // A→B
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx, true); // A→B
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
 
     let session_a = Arc::new(
-        HushSession::connect(pipe_a_client, relay_pub, device_a, move |_, _| {})
+        HushSession::connect(pipe_a_client, relay_pub, device_a, move |_, _| {}, nk.factory())
             .expect("session A"),
     );
 
@@ -31,7 +32,7 @@ fn pairing_ceremony_creates_manifest_with_new_member() {
     let device_b_noise_pub = device_b.public_key();
     let device_b_signing_pub = device_b.signing_public_key();
     let _session_b =
-        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}).expect("session B");
+        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}, nk.factory()).expect("session B");
 
     let admitted = session_a.accept_pair(device_b_noise_pub, device_b_signing_pub);
     assert!(admitted, "accept_pair must return true when window is open");
@@ -59,7 +60,7 @@ fn accept_pair_outside_window_is_noop() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, || Err("push factory unused in pairing test".into())).expect("connect");
 
     let dummy = NoisePublicKey(make_relay_kp().public_key);
     let dummy_signing = crate::keys::SigningPublicKey([0u8; 32]);
@@ -83,7 +84,7 @@ fn accept_pair_after_timeout_is_noop() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, || Err("push factory unused in pairing test".into())).expect("connect");
 
     let _token = session.pairing_token_with_duration(Duration::from_millis(1));
     std::thread::sleep(Duration::from_millis(10));
@@ -108,7 +109,7 @@ fn accept_pair_returns_bool_reflecting_window_state() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, || Err("push factory unused in pairing test".into())).expect("connect");
 
     let dummy = NoisePublicKey(make_relay_kp().public_key);
     let dummy_signing = crate::keys::SigningPublicKey([0u8; 32]);
@@ -150,7 +151,7 @@ fn no_callback_fired_when_window_closed() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}).expect("connect");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, || Err("push factory unused in pairing test".into())).expect("connect");
 
     let fired: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let _fc = fired.clone();

@@ -22,7 +22,7 @@ use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
 use crate::member::{member_id, member_name};
 use crate::message::{device_name, Message};
 use crate::operation_log::{MemLog, OperationLog};
-use crate::relay::RelayClient;
+use crate::relay::{build_push_blob, push_send, RelayClient};
 
 const DEFAULT_PAIRING_WINDOW: Duration = Duration::from_secs(60);
 const DEFAULT_RECONNECT_CAP: Duration = Duration::from_secs(30);
@@ -106,6 +106,10 @@ pub(super) struct PendingMember {
 /// Transport-generic so tests can inject in-memory pipes.
 pub struct HushSession<T: Read + Write + Send + 'static> {
     client: Arc<Mutex<RelayClient<T>>>,
+    /// Raw relay public key used as the NK push target (ADR-0018).
+    relay_pub_bytes: [u8; 32],
+    /// Factory that opens a fresh transport to the relay for each NK push.
+    push_factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync + 'static>,
     keys: Arc<Mutex<KeyState>>,
     sequence: Arc<Mutex<u64>>,
     pairing: Arc<Mutex<Option<PairingWindow>>>,
@@ -338,6 +342,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         relay_pub: NoisePublicKey,
         keypair: DeviceKeypair,
         on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
+        push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
     ) -> Result<Self, SessionError> {
         Self::connect_with_log(
             transport,
@@ -345,6 +350,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             keypair,
             on_message,
             Box::new(MemLog::new()),
+            push_factory,
         )
     }
 
@@ -354,6 +360,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         keypair: DeviceKeypair,
         on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
         op_log: Box<dyn OperationLog>,
+        push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
     ) -> Result<Self, SessionError> {
         Self::connect_full(
             transport,
@@ -364,6 +371,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             || {},
             |_| {},
             || {},
+            push_factory,
         )
     }
 
@@ -376,6 +384,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
+        push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
     ) -> Result<Self, SessionError> {
         let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
         let noise_kp = {
@@ -437,6 +446,8 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
+            relay_pub_bytes: relay_pub.0,
+            push_factory: Arc::new(push_factory),
             keys,
             sequence: Arc::new(Mutex::new(initial_seq)),
             pairing,
@@ -463,9 +474,11 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
+        push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
         on_connection_changed: Option<Box<dyn Fn(bool) + Send + Sync + 'static>>,
     ) -> Result<Self, SessionError> {
+        let transport_factory = Arc::new(transport_factory);
         let session = Self::connect_full(
             transport,
             relay_pub,
@@ -475,6 +488,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             on_removed_from_group,
             on_manifest_changed,
             on_group_destroyed,
+            push_factory,
         )?;
         let client_arc = session.client.clone();
         let op_log_arc = session.op_log.clone();
@@ -489,6 +503,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let on_mr_arc = session.on_member_request.clone();
         let on_mj_arc = session.on_member_joined.clone();
         let on_ml_arc = session.on_member_left.clone();
+        let push_factory_arc = session.push_factory.clone();
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
         let on_cc: Arc<dyn Fn(bool) + Send + Sync + 'static> = on_connection_changed
             .map(|f| -> Arc<dyn Fn(bool) + Send + Sync + 'static> { Arc::new(f) })
@@ -510,7 +525,8 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 on_mr_arc,
                 on_mj_arc,
                 on_ml_arc,
-                Arc::new(transport_factory),
+                transport_factory,
+                push_factory_arc,
                 cap,
                 on_cc,
             );
@@ -535,6 +551,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
+        push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
         on_connection_changed: Option<Box<dyn Fn(bool) + Send + Sync + 'static>>,
     ) -> Result<Self, SessionError> {
@@ -558,6 +575,11 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>> =
             Arc::new(Mutex::new(None));
 
+        let transport_factory = Arc::new(transport_factory);
+        let push_factory_arc: Arc<dyn Fn() -> Result<T, String> + Send + Sync + 'static> =
+            Arc::new(push_factory);
+        let push_factory_for_reconnect = push_factory_arc.clone();
+
         // Stub client: permanently disconnected — the reconnect loop will replace it.
         let client: Arc<Mutex<RelayClient<T>>> = Arc::new(Mutex::new(RelayClient::disconnected()));
         let op_log_arc: Arc<Mutex<Box<dyn OperationLog>>> = Arc::new(Mutex::new(op_log));
@@ -573,6 +595,8 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
         let session = Self {
             client: client.clone(),
+            relay_pub_bytes: relay_pub.0,
+            push_factory: push_factory_arc,
             keys: keys.clone(),
             sequence: Arc::new(Mutex::new(initial_seq)),
             pairing: pairing.clone(),
@@ -609,7 +633,8 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 on_member_request,
                 on_member_joined,
                 on_member_left,
-                Arc::new(transport_factory),
+                transport_factory,
+                push_factory_for_reconnect,
                 cap,
                 on_cc,
             );
@@ -659,13 +684,12 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         for recipient_pub in recipients {
             let oid = recipient_pub.0;
             self.op_log.lock().unwrap_or_else(|e| e.into_inner()).append(&oid, seq, blob.clone());
-            let result =
-                self.client
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .push(&msg, recipient_pub, seq, vec![], &signing);
+            let framed = build_push_blob(&msg, recipient_pub, seq, vec![], &signing);
+            let result = (self.push_factory)()
+                .map_err(|e| crate::relay::RelayError::PushFailed(e))
+                .and_then(|transport| push_send(transport, self.relay_pub_bytes, framed));
             match result {
-                Ok(()) => {
+                Ok(_) => {
                     self.op_log.lock().unwrap_or_else(|e| e.into_inner()).mark_delivered(&oid, seq);
                 }
                 Err(e) => {
@@ -686,11 +710,14 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     ) -> Result<(), SessionError> {
         let seq = self.next_seq();
         let signing = self.signing();
-        self.client
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(msg, recipient_pub, seq, vec![], &signing)
-            .map_err(|e| SessionError::PushFailed(e.to_string()))
+        let framed = build_push_blob(msg, recipient_pub, seq, vec![], &signing);
+        (self.push_factory)()
+            .map_err(|e| SessionError::PushFailed(e))
+            .and_then(|transport| {
+                push_send(transport, self.relay_pub_bytes, framed)
+                    .map(|_| ())
+                    .map_err(|e| SessionError::PushFailed(e.to_string()))
+            })
     }
 
     // ── Destroy Group (ADR-0015) ──────────────────────────────────────────────
@@ -702,11 +729,15 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// `SessionError::GroupDestroyed`. The next `create()` on the same namespace
     /// generates a fresh identity automatically.
     pub fn destroy_group(&self) {
+        let self_noise = self.keys.lock().unwrap_or_else(|e| e.into_inner()).noise_pub;
         let peers: Vec<NoisePublicKey> = {
             let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
             match *guard {
                 None => vec![],
-                Some(ref m) => m.members.iter().map(|mb| mb.noise_pub).collect(),
+                Some(ref m) => m.members.iter()
+                    .filter(|mb| mb.noise_pub != self_noise)
+                    .map(|mb| mb.noise_pub)
+                    .collect(),
             }
         };
         for peer in peers {
@@ -1000,6 +1031,10 @@ impl HushSession<TcpStream> {
     ) -> Result<Self, SessionError> {
         let stream =
             TcpStream::connect(addr).map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
-        Self::connect(stream, relay_pub, keypair, on_message)
+        let addr = addr.to_string();
+        let push_factory = move || {
+            TcpStream::connect(&addr).map_err(|e| e.to_string())
+        };
+        Self::connect(stream, relay_pub, keypair, on_message, push_factory)
     }
 }

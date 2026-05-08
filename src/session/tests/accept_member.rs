@@ -16,7 +16,8 @@ fn pair_inside_window_fires_on_member_request() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -33,6 +34,7 @@ fn pair_inside_window_fires_on_member_request() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session A");
 
@@ -53,6 +55,7 @@ fn pair_inside_window_fires_on_member_request() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session B");
 
@@ -74,7 +77,8 @@ fn accept_member_with_valid_token_returns_true() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -91,6 +95,7 @@ fn accept_member_with_valid_token_returns_true() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session A");
 
@@ -109,6 +114,7 @@ fn accept_member_with_valid_token_returns_true() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session B");
 
@@ -130,10 +136,16 @@ fn accept_member_with_unknown_token_returns_false() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
     {
         let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
             let _ = hush_noise::session_xx::accept(pipe_relay, kp);
+            // drain nk connections
+            while let Ok(p) = nk_rx.recv() {
+                let kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(p, kp2); });
+            }
         });
     }
     let device = DeviceKeypair::generate();
@@ -146,6 +158,7 @@ fn accept_member_with_unknown_token_returns_false() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("connect");
 
@@ -161,7 +174,8 @@ fn pair_outside_window_does_not_fire_callback() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -178,6 +192,7 @@ fn pair_outside_window_does_not_fire_callback() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session A");
 
@@ -195,6 +210,7 @@ fn pair_outside_window_does_not_fire_callback() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session B");
 

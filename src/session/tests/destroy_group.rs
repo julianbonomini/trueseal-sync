@@ -17,10 +17,15 @@ fn destroy_group_fires_on_group_destroyed_on_initiator() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
     {
         let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
             let _ = hush_noise::session_xx::accept(pipe_relay, kp);
+            while let Ok(p) = nk_rx.recv() {
+                let kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(p, kp2); });
+            }
         });
     }
     let device = DeviceKeypair::generate();
@@ -37,6 +42,7 @@ fn destroy_group_fires_on_group_destroyed_on_initiator() {
         move || {
             *dc.lock().unwrap() += 1;
         },
+        nk.factory(),
     )
     .expect("connect");
 
@@ -55,7 +61,8 @@ fn destroy_group_fires_on_group_destroyed_on_all_members() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay);
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -77,6 +84,7 @@ fn destroy_group_fires_on_group_destroyed_on_all_members() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("session A");
 
@@ -91,6 +99,7 @@ fn destroy_group_fires_on_group_destroyed_on_all_members() {
         move || {
             *bdc.lock().unwrap() += 1;
         },
+        nk.factory(),
     )
     .expect("session B");
 
@@ -114,10 +123,15 @@ fn push_sync_after_destroy_returns_group_destroyed() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
     {
         let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
             let _ = hush_noise::session_xx::accept(pipe_relay, kp);
+            while let Ok(p) = nk_rx.recv() {
+                let kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(p, kp2); });
+            }
         });
     }
     let device = DeviceKeypair::generate();
@@ -135,6 +149,7 @@ fn push_sync_after_destroy_returns_group_destroyed() {
         || {},
         |_| {},
         || {},
+        nk.factory(),
     )
     .expect("connect");
     let v1 = make_two_member_manifest(
@@ -204,10 +219,15 @@ fn on_group_destroyed_callback_wipes_store() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
     {
         let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
             let _ = hush_noise::session_xx::accept(pipe_relay, kp);
+            while let Ok(p) = nk_rx.recv() {
+                let kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(p, kp2); });
+            }
         });
     }
 
@@ -250,6 +270,7 @@ fn on_group_destroyed_callback_wipes_store() {
         move || {
             let _ = wipe_store.lock().unwrap().wipe();
         },
+        nk.factory(),
     )
     .expect("connect");
 
@@ -343,6 +364,7 @@ fn destroy_group_stops_outbox_replay() {
                 Err("not yet".to_string())
             }
         },
+        || Err("push factory unused in this test".into()), // destroy_group test never reconnects
         Some(Duration::from_millis(50)),
         None,
     ).expect("session");
