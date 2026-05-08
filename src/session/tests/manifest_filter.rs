@@ -404,3 +404,118 @@ fn tampered_group_manifest_is_rejected() {
         "on_removed_from_group must not fire"
     );
 }
+
+/// Concurrent v2 manifests (A and B both issue v2 for the same group):
+/// C must accept exactly one and end up with a valid v2 manifest.
+/// on_manifest_changed fires exactly once (for whichever is delivered first).
+/// No panic or deadlock.
+#[test]
+fn concurrent_manifest_conflict_last_version_wins() {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+    use ed25519_dalek::SigningKey;
+    use crate::operation_log::MemLog;
+
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+
+    let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
+    let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
+    let (pipe_c_client, pipe_c_relay) = mem_pipe_pair();
+    spawn_tripartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay);
+
+    let device_a = DeviceKeypair::generate();
+    let device_b = DeviceKeypair::generate();
+    let device_c = DeviceKeypair::generate();
+    let a_noise = device_a.public_key();
+    let a_signing = device_a.signing_public_key();
+    let a_sk = SigningKey::from_bytes(&device_a.signing.to_bytes());
+    let b_noise = device_b.public_key();
+    let b_signing = device_b.signing_public_key();
+    let b_sk = SigningKey::from_bytes(&device_b.signing.to_bytes());
+    let c_noise = device_c.public_key();
+    let c_signing = device_c.signing_public_key();
+    let c_sk = SigningKey::from_bytes(&device_c.signing.to_bytes());
+
+    let group_id = new_group_id();
+    let v1_members = vec![
+        ManifestMember { noise_pub: a_noise, signing_pub: a_signing, name: "A".into() },
+        ManifestMember { noise_pub: b_noise, signing_pub: b_signing, name: "B".into() },
+        ManifestMember { noise_pub: c_noise, signing_pub: c_signing, name: "C".into() },
+    ];
+    let v1_a = GroupManifest::new(group_id, 1, v1_members.clone(), &a_sk);
+    let v1_b = GroupManifest::new(group_id, 1, v1_members.clone(), &b_sk);
+    let v1_c = GroupManifest::new(group_id, 1, v1_members.clone(), &c_sk);
+
+    // C counts manifest_changed events.
+    let c_manifest_changed: Arc<(Mutex<u32>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
+    let cmc = c_manifest_changed.clone();
+
+    let session_a =
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("A");
+    let session_b =
+        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}).expect("B");
+    let session_c = HushSession::connect_full(
+        pipe_c_client, relay_pub, device_c,
+        |_, _| {},
+        Box::new(MemLog::new()),
+        || {},
+        move |_| {
+            let (lock, cvar) = &*cmc;
+            *lock.lock().unwrap() += 1;
+            cvar.notify_all();
+        },
+        || {},
+    ).expect("C");
+
+    session_a.set_manifest(v1_a);
+    session_b.set_manifest(v1_b);
+    session_c.set_manifest(v1_c);
+    // Reset counter after set_manifest calls (on_manifest_changed not called by set_manifest).
+
+    // A and B each produce a v2 manifest simultaneously.
+    // A's v2 adds a dummy extra member; B's v2 is a simple bump.
+    let device_d = DeviceKeypair::generate();
+    let d_noise = device_d.public_key();
+    let d_signing = device_d.signing_public_key();
+    let v2_a = GroupManifest::new(group_id, 2, vec![
+        ManifestMember { noise_pub: a_noise, signing_pub: a_signing, name: "A".into() },
+        ManifestMember { noise_pub: b_noise, signing_pub: b_signing, name: "B".into() },
+        ManifestMember { noise_pub: c_noise, signing_pub: c_signing, name: "C".into() },
+        ManifestMember { noise_pub: d_noise, signing_pub: d_signing, name: "D".into() },
+    ], &a_sk);
+    let v2_b = GroupManifest::new(group_id, 2, vec![
+        ManifestMember { noise_pub: a_noise, signing_pub: a_signing, name: "A".into() },
+        ManifestMember { noise_pub: b_noise, signing_pub: b_signing, name: "B".into() },
+        ManifestMember { noise_pub: c_noise, signing_pub: c_signing, name: "C".into() },
+    ], &b_sk);
+
+    // Push both v2 manifests to C simultaneously.
+    session_a
+        .push_message(&crate::message::Message::GroupManifest { manifest: v2_a }, c_noise)
+        .expect("A push v2");
+    session_b
+        .push_message(&crate::message::Message::GroupManifest { manifest: v2_b }, c_noise)
+        .expect("B push v2");
+
+    // Wait for C to process at least one manifest update.
+    let (lock, cvar) = &*c_manifest_changed;
+    let result = cvar
+        .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |n| *n == 0)
+        .unwrap();
+    assert!(!result.1.timed_out(), "C must receive at least one v2 manifest");
+    let fires = *result.0;
+    drop(result);
+
+    // Short additional wait to ensure the second manifest (if any) is processed.
+    std::thread::sleep(Duration::from_millis(100));
+    let final_fires = *c_manifest_changed.0.lock().unwrap();
+
+    // C's manifest must be version 2 (whichever arrived first or last wins).
+    let c_m = session_c.manifest.lock().unwrap();
+    let m = c_m.as_ref().expect("C has a manifest");
+    assert_eq!(m.version, 2, "C's manifest is version 2");
+    assert_eq!(m.group_id, group_id, "same group_id");
+    // on_manifest_changed fired exactly once (second v2 is same version — rejected as not higher).
+    assert_eq!(final_fires, 1, "on_manifest_changed fires exactly once (same-version duplicate rejected)");
+}
