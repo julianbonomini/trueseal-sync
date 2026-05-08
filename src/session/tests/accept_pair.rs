@@ -42,9 +42,7 @@ fn accept_pair_creates_genesis_manifest() {
     let admitted = session_a.accept_pair(b_noise, b_signing);
     assert!(admitted, "accept_pair must return true when window is open");
 
-    std::thread::sleep(Duration::from_millis(150));
-
-    // A's manifest should have 2 members.
+    // accept_pair creates manifest locally — no relay needed, no wait required.
     let a_manifest = session_a.manifest.lock().unwrap();
     assert!(
         a_manifest.is_some(),
@@ -92,7 +90,7 @@ fn accept_pair_sends_manifest_to_new_member() {
     let _token = session_a.pairing_token();
     session_a.accept_pair(b_noise, b_signing);
 
-    std::thread::sleep(Duration::from_millis(150));
+    wait_for(|| b_manifest_arc.lock().unwrap().is_some(), Duration::from_secs(5));
 
     // B should have received and stored the GroupManifest.
     let b_m = b_manifest_arc.lock().unwrap();
@@ -173,7 +171,7 @@ fn accept_pair_extends_existing_manifest() {
     let _token = session_a.pairing_token();
     session_a.accept_pair(c_noise, c_signing);
 
-    std::thread::sleep(Duration::from_millis(150));
+    wait_for(|| c_manifest_arc.lock().unwrap().is_some(), Duration::from_secs(5));
 
     let a_m = session_a.manifest.lock().unwrap();
     assert_eq!(a_m.as_ref().unwrap().members.len(), 3, "A: 3 members");
@@ -232,19 +230,12 @@ fn new_member_bootstrap_can_send_to_existing_members() {
     let _token = session_a.pairing_token();
     session_a.accept_pair(c_noise, c_signing);
 
-    // Give C time to receive the bootstrap GroupManifest from A.
-    std::thread::sleep(Duration::from_millis(200));
+    // C must receive the bootstrap GroupManifest from A before it can push.
+    wait_for(|| session_c.manifest.lock().unwrap().as_ref().map(|m| m.members.len()) == Some(3), Duration::from_secs(5));
 
     // C should now have a 3-member manifest.
     assert_eq!(
-        session_c
-            .manifest
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .members
-            .len(),
+        session_c.manifest.lock().unwrap().as_ref().unwrap().members.len(),
         3,
         "C must have 3-member manifest after bootstrap"
     );
@@ -254,7 +245,7 @@ fn new_member_bootstrap_can_send_to_existing_members() {
         .push_sync(b"hello from C".to_vec())
         .expect("C push_sync");
 
-    std::thread::sleep(Duration::from_millis(500));
+    wait_for(|| !b_received.lock().unwrap().is_empty(), Duration::from_secs(5));
 
     let got = b_received.lock().unwrap();
     assert_eq!(got.len(), 1, "B must receive C's blob");

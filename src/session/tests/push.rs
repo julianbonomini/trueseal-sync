@@ -45,7 +45,7 @@ fn two_sessions_can_exchange_sync_message() {
     session_a
         .push_sync(b"hello from A".to_vec())
         .expect("push_sync");
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for(|| !received.lock().unwrap().is_empty(), Duration::from_secs(5));
 
     let got = received.lock().unwrap();
     assert_eq!(got.len(), 1);
@@ -116,7 +116,7 @@ fn push_sync_increments_sequence() {
 
     session.push_sync(b"first".to_vec()).expect("first");
     session.push_sync(b"second".to_vec()).expect("second");
-    std::thread::sleep(Duration::from_millis(200));
+    wait_for(|| received_envs.lock().unwrap().len() >= 2, Duration::from_secs(5));
 
     let envs = received_envs.lock().unwrap();
     assert_eq!(envs.len(), 2);
@@ -164,7 +164,7 @@ fn on_message_receives_sender_signing_pub() {
     .expect("session B");
 
     session_a.push_sync(b"hello".to_vec()).expect("push");
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for(|| !received.lock().unwrap().is_empty(), Duration::from_secs(5));
 
     let got = received.lock().unwrap();
     assert_eq!(got.len(), 1);

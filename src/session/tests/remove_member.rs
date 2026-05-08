@@ -129,7 +129,8 @@ fn remove_member_issues_new_manifest_excluding_target() {
     // A removes C.
     session_a.remove_member(c_signing).expect("remove_member");
 
-    std::thread::sleep(Duration::from_millis(500));
+    wait_for(|| session_b.manifest.lock().unwrap().as_ref().map(|m| m.version) == Some(2), Duration::from_secs(5));
+    wait_for(|| session_c.manifest.lock().unwrap().as_ref().map(|m| m.version) == Some(2), Duration::from_secs(5));
 
     // A's manifest: 2 members.
     let a_m = session_a.manifest.lock().unwrap();
@@ -422,7 +423,9 @@ fn removed_member_no_longer_receives_fanout_blobs() {
 
     // A removes B.
     session_a.remove_member(b_signing).expect("remove_member");
-    std::thread::sleep(Duration::from_millis(200));
+    // Wait for removal manifest to reach B before asserting.
+    wait_for(|| session_b.manifest.lock().unwrap().as_ref().map(|m| m.members.len()) == Some(1)
+        || session_b.manifest.lock().unwrap().is_none(), Duration::from_secs(5));
 
     // After removal A is the only remaining member — push_sync has no peers to deliver to.
     // Self-only group returns Ok(()) without delivering anything.

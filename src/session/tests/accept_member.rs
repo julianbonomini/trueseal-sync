@@ -59,7 +59,7 @@ fn pair_inside_window_fires_on_member_request() {
     // B sends Pair message to A.
     session_b.join_group(&pairing_token).expect("join");
 
-    std::thread::sleep(Duration::from_millis(200));
+    wait_for(|| !received.lock().unwrap().is_empty(), Duration::from_secs(5));
 
     let calls = received.lock().unwrap().clone();
     assert_eq!(calls.len(), 1, "on_member_request must fire once");
@@ -113,7 +113,7 @@ fn accept_member_with_valid_token_returns_true() {
     .expect("session B");
 
     session_b.join_group(&pairing_token).expect("join");
-    std::thread::sleep(Duration::from_millis(200));
+    wait_for(|| token_received.lock().unwrap().is_some(), Duration::from_secs(5));
 
     let request_token = token_received
         .lock()

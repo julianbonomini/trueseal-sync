@@ -225,6 +225,20 @@ pub(super) fn spawn_bidirectional_relay_parallel(
     });
 }
 
+/// Spin-polls `cond` until it returns `true` or `timeout` elapses.
+/// Replaces `sleep + assert` patterns — reacts to the actual event, not a fixed delay.
+/// Panics with a descriptive message on timeout.
+pub(super) fn wait_for(cond: impl Fn() -> bool, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("wait_for: condition not met within {:?}", timeout);
+}
+
 pub(super) fn relay_pub(relay_kp: &Keypair) -> NoisePublicKey {
     NoisePublicKey(relay_kp.public_key)
 }

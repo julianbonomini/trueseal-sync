@@ -231,7 +231,8 @@ fn destroy_group_fires_on_group_destroyed_for_all_members() {
     ));
 
     session_a.destroy_group();
-    std::thread::sleep(Duration::from_millis(200));
+    wait_for(|| *a_destroyed.lock().unwrap() >= 1, Duration::from_secs(5));
+    wait_for(|| *b_destroyed.lock().unwrap() >= 1, Duration::from_secs(5));
 
     assert_eq!(*a_destroyed.lock().unwrap(), 1, "A on_group_destroyed once");
     assert!(
@@ -311,7 +312,8 @@ fn revoke_from_unknown_device_is_ignored() {
         .push_message(&Message::Revoke, session_a.noise_pub())
         .expect("stranger push");
 
-    std::thread::sleep(Duration::from_millis(100));
+    // Give the message time to arrive, then assert it was dropped.
+    std::thread::sleep(Duration::from_millis(200));
 
     assert_eq!(
         *destroyed.lock().unwrap(),

@@ -94,7 +94,7 @@ fn message_from_member_is_delivered() {
         )
         .expect("push");
 
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for(|| !received.lock().unwrap().is_empty(), Duration::from_secs(5));
     let got = received.lock().unwrap();
     assert_eq!(got.len(), 1, "member message must be delivered");
     assert_eq!(
@@ -153,7 +153,7 @@ fn inbound_group_manifest_replaces_current() {
         .push_message(&Message::GroupManifest { manifest: v2 }, a_noise)
         .expect("push manifest");
 
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for(|| session_a.manifest.lock().unwrap().as_ref().map(|m| m.version) == Some(2), Duration::from_secs(5));
 
     let stored = session_a.manifest.lock().unwrap();
     assert_eq!(
@@ -220,7 +220,8 @@ fn inbound_stale_manifest_is_ignored() {
         .push_message(&Message::GroupManifest { manifest: v1 }, a_noise)
         .expect("push stale manifest");
 
-    std::thread::sleep(Duration::from_millis(100));
+    // Stale manifest (v1 < v3 current) must be ignored — wait a fixed time to confirm.
+    std::thread::sleep(Duration::from_millis(200));
 
     let stored = session_a.manifest.lock().unwrap();
     assert_eq!(
@@ -290,7 +291,7 @@ fn on_removed_from_group_fires_when_excluded_from_manifest() {
         )
         .expect("push excluding manifest");
 
-    std::thread::sleep(Duration::from_millis(300));
+    wait_for(|| *removed_fired.lock().unwrap() >= 1, Duration::from_secs(5));
 
     assert_eq!(
         *removed_fired.lock().unwrap(),

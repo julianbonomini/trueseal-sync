@@ -82,8 +82,8 @@ fn manifest_persists_across_session_restart() {
     let admitted = session_a.accept_pair(b_noise, b_signing);
     assert!(admitted, "accept_pair must return true when window is open");
 
-    // Give B time to receive and persist the GroupManifest.
-    std::thread::sleep(Duration::from_millis(200));
+    // Wait until B has received and persisted the GroupManifest.
+    wait_for(|| store_b.lock().unwrap().load_group_manifest().ok().flatten().is_some(), Duration::from_secs(5));
 
     // ── Phase 2: verify stores have the manifest ─────────────────────────────
     let a_saved = store_a

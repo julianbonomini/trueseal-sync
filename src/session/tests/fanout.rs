@@ -97,7 +97,8 @@ fn push_sync_fans_out_to_all_members() {
         .push_sync(b"broadcast".to_vec())
         .expect("push_sync");
 
-    std::thread::sleep(Duration::from_millis(200));
+    wait_for(|| received_b.lock().unwrap().len() >= 1, Duration::from_secs(5));
+    wait_for(|| received_c.lock().unwrap().len() >= 1, Duration::from_secs(5));
 
     let got_b = received_b.lock().unwrap();
     assert_eq!(got_b.len(), 1, "B should receive 1 message");
