@@ -35,87 +35,45 @@ fn push_sync_no_manifest_returns_not_in_group() {
 }
 
 /// push_sync fans out to all members except self; both B and C receive the blob.
+/// Topology: single tripartite relay routes A's push to both B and C.
 #[test]
 fn push_sync_fans_out_to_all_members() {
-    // Topology: A→B and A→C via two separate relay sessions.
-    // We use two relay threads, each routing A→B and A→C respectively.
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
 
-    // A→B relay
-    let (pipe_a1_client, pipe_a1_relay) = mem_pipe_pair();
+    let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
-    spawn_routing_relay(&relay_kp, pipe_a1_relay, pipe_b_relay, true); // A→B
-
-    // A→C relay (second relay session)
-    let (pipe_a2_client, pipe_a2_relay) = mem_pipe_pair();
     let (pipe_c_client, pipe_c_relay) = mem_pipe_pair();
-    spawn_routing_relay(&relay_kp, pipe_a2_relay, pipe_c_relay, true); // A→C
+    spawn_tripartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay);
 
-    let device_a1 = DeviceKeypair::generate();
-    let device_a2 = DeviceKeypair::generate(); // same logical device A, second pipe
+    let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
     let device_c = DeviceKeypair::generate();
 
-    let a_noise = device_a1.public_key();
-    let a_signing = device_a1.signing_public_key();
-    let a_sk = SigningKey::from_bytes(&device_a1.signing.to_bytes());
+    let a_noise = device_a.public_key();
+    let a_signing = device_a.signing_public_key();
+    let a_sk = SigningKey::from_bytes(&device_a.signing.to_bytes());
     let b_noise = device_b.public_key();
     let b_signing = device_b.signing_public_key();
     let b_sk = SigningKey::from_bytes(&device_b.signing.to_bytes());
     let c_noise = device_c.public_key();
     let c_signing = device_c.signing_public_key();
+    let c_sk = SigningKey::from_bytes(&device_c.signing.to_bytes());
 
     use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
     let group_id = new_group_id();
-    let manifest_a = GroupManifest::new(
-        group_id,
-        1,
-        vec![
-            ManifestMember {
-                noise_pub: a_noise,
-                signing_pub: a_signing,
-                name: "A".into(),
-            },
-            ManifestMember {
-                noise_pub: b_noise,
-                signing_pub: b_signing,
-                name: "B".into(),
-            },
-            ManifestMember {
-                noise_pub: c_noise,
-                signing_pub: c_signing,
-                name: "C".into(),
-            },
-        ],
-        &a_sk,
-    );
-    let manifest_b = GroupManifest::new(
-        group_id,
-        1,
-        vec![
-            ManifestMember {
-                noise_pub: a_noise,
-                signing_pub: a_signing,
-                name: "A".into(),
-            },
-            ManifestMember {
-                noise_pub: b_noise,
-                signing_pub: b_signing,
-                name: "B".into(),
-            },
-            ManifestMember {
-                noise_pub: c_noise,
-                signing_pub: c_signing,
-                name: "C".into(),
-            },
-        ],
-        &b_sk,
-    );
+    let members = vec![
+        ManifestMember { noise_pub: a_noise, signing_pub: a_signing, name: "A".into() },
+        ManifestMember { noise_pub: b_noise, signing_pub: b_signing, name: "B".into() },
+        ManifestMember { noise_pub: c_noise, signing_pub: c_signing, name: "C".into() },
+    ];
+    let manifest_a = GroupManifest::new(group_id, 1, members.clone(), &a_sk);
+    let manifest_b = GroupManifest::new(group_id, 1, members.clone(), &b_sk);
+    let manifest_c = GroupManifest::new(group_id, 1, members.clone(), &c_sk);
 
-    // Connect in relay-accept order (src first for each relay)
     let session_a =
-        HushSession::connect(pipe_a1_client, relay_pub, device_a1, |_, _| {}).expect("session A1");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("session A");
+
     let received_b: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx_b = received_b.clone();
     let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _| {
@@ -124,20 +82,17 @@ fn push_sync_fans_out_to_all_members() {
     .expect("session B");
     session_b.set_manifest(manifest_b);
 
-    let session_a2 =
-        HushSession::connect(pipe_a2_client, relay_pub, device_a2, |_, _| {}).expect("session A2");
     let received_c: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx_c = received_c.clone();
     let session_c = HushSession::connect(pipe_c_client, relay_pub, device_c, move |msg, _| {
         rx_c.lock().unwrap().push(msg);
     })
     .expect("session C");
-    // C doesn't need a manifest for this test — just receives
+    session_c.set_manifest(manifest_c);
 
-    // Set A's manifest (3 members: A, B, C)
-    session_a.set_manifest(manifest_a.clone());
+    session_a.set_manifest(manifest_a);
 
-    // A pushes — should fan out to B and C (skip self A)
+    // A pushes — should fan out to B and C (skip self)
     session_a
         .push_sync(b"broadcast".to_vec())
         .expect("push_sync");
@@ -146,12 +101,11 @@ fn push_sync_fans_out_to_all_members() {
 
     let got_b = received_b.lock().unwrap();
     assert_eq!(got_b.len(), 1, "B should receive 1 message");
-    assert_eq!(
-        got_b[0],
-        Message::Sync {
-            body: b"broadcast".to_vec()
-        }
-    );
+    assert_eq!(got_b[0], Message::Sync { body: b"broadcast".to_vec() });
+
+    let got_c = received_c.lock().unwrap();
+    assert_eq!(got_c.len(), 1, "C should receive 1 message");
+    assert_eq!(got_c[0], Message::Sync { body: b"broadcast".to_vec() });
 }
 
 /// One sequence number is consumed per push_sync call regardless of member count.
