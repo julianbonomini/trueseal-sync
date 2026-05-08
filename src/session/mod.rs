@@ -278,6 +278,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         on_message: impl Fn(Message, [u8; 32]) + Send + 'static + Clone,
         op_log: Box<dyn OperationLog>,
         on_keypair_rotated: impl Fn([u8; 64]) + Send + Sync + 'static,
+        on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
@@ -289,7 +290,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             on_message.clone(),
             op_log,
             on_keypair_rotated,
-            || {},
+            on_removed_from_group,
             on_manifest_changed,
         )?;
         let client_arc = session.client.clone();

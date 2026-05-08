@@ -67,6 +67,14 @@ pub trait KeypairRotatedCallback: Send + Sync {
     fn on_keypair_rotated(&self, keypair_bytes: Vec<u8>);
 }
 
+/// Fired when this device is excluded from an incoming `GroupManifest` update.
+/// Another group member has issued a Soft Removal of this device (ADR-0015).
+/// The session remains connected; the caller decides whether to wipe and re-pair.
+#[uniffi::export(callback_interface)]
+pub trait RemovedFromGroupCallback: Send + Sync {
+    fn on_removed_from_group(&self);
+}
+
 // ── HushFfiSession ────────────────────────────────────────────────────────────
 
 /// A connected hush-sync session over TCP.
@@ -99,6 +107,7 @@ impl HushFfiSession {
         relay_pub: Vec<u8>,
         on_message: Box<dyn MessageCallback>,
         on_keypair_rotated: Box<dyn KeypairRotatedCallback>,
+        on_removed_from_group: Box<dyn RemovedFromGroupCallback>,
     ) -> Result<Arc<Self>, SessionError> {
         let store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
             SessionError::ConnectionFailed {
@@ -168,6 +177,9 @@ impl HushFfiSession {
             Box::new(PersistentLog::new(log_store)),
             move |bytes| {
                 on_keypair_rotated.on_keypair_rotated(bytes.to_vec());
+            },
+            move || {
+                on_removed_from_group.on_removed_from_group();
             },
             move |m: &crate::manifest::GroupManifest| {
                 let _ = manifest_store_save.lock().unwrap().save_group_manifest(m);

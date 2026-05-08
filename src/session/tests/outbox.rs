@@ -112,6 +112,7 @@ fn undelivered_entries_replayed_after_reconnect() {
         |_, _| {},
         Box::new(MemLog::new()),
         |_| {},
+        || {},
         |_| {},
         move || {
             pipe2_slot2
