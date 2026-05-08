@@ -99,7 +99,7 @@ fn destroy_group_fires_on_group_destroyed_on_all_members() {
     session_b.set_manifest(v1);
 
     session_a.destroy_group();
-    std::thread::sleep(Duration::from_millis(200));
+    wait_for(|| *b_destroyed.lock().unwrap() >= 1, Duration::from_secs(5));
 
     assert_eq!(
         *b_destroyed.lock().unwrap(),

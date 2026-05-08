@@ -453,7 +453,12 @@ mod tests {
             )
             .expect("push should succeed");
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Spin-wait: react to actual delivery rather than a fixed delay.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !received.lock().unwrap().is_empty() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
 
         let stored = received.lock().unwrap();
         assert_eq!(stored.len(), 1, "relay should have received one envelope");
@@ -524,7 +529,12 @@ mod tests {
             delivered_clone.lock().unwrap().push(msg);
         });
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Spin-wait for callback.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !delivered.lock().unwrap().is_empty() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
 
         let got = delivered.lock().unwrap();
         assert_eq!(got.len(), 1, "callback should have fired once");
@@ -607,7 +617,12 @@ mod tests {
             )
             .expect("push should succeed");
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Spin-wait for A's callback to fire.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if !received.lock().unwrap().is_empty() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
 
         // A's callback should have received B's Pair message
         let got = received.lock().unwrap();

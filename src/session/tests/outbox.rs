@@ -51,7 +51,7 @@ fn push_sync_appends_and_marks_delivered() {
     ));
 
     session.push_sync(b"hello".to_vec()).expect("push");
-    std::thread::sleep(Duration::from_millis(50));
+    wait_for(|| session.op_log.lock().unwrap().undelivered_entries().is_empty(), Duration::from_secs(5));
 
     let undelivered = session.op_log.lock().unwrap().undelivered_entries();
     assert!(undelivered.is_empty(), "entry should be delivered");

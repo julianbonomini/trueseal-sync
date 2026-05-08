@@ -221,7 +221,7 @@ fn manifest_restore_via_connect_background() {
 
     let _token = session_a.pairing_token();
     assert!(session_a.accept_pair(b_noise, b_signing), "accept_pair");
-    std::thread::sleep(Duration::from_millis(200));
+    wait_for(|| store_a.lock().unwrap().load_group_manifest().ok().flatten().is_some(), Duration::from_secs(5));
 
     let a_saved = store_a.lock().unwrap()
         .load_group_manifest().expect("load").expect("saved");

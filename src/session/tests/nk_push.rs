@@ -124,7 +124,7 @@ fn on_message_fires_via_xx_receive_after_nk_push() {
     // Device B pushes via NK (anonymous, ephemeral)
     push_send(push_pipe_client, relay_pub_key, blob).expect("NK push failed");
 
-    std::thread::sleep(Duration::from_millis(100));
+    wait_for(|| !received.lock().unwrap().is_empty(), Duration::from_secs(5));
 
     let msgs = received.lock().unwrap();
     assert_eq!(msgs.len(), 1, "A should receive one message via XX subscribe");
