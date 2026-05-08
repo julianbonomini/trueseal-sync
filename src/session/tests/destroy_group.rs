@@ -274,3 +274,110 @@ fn on_group_destroyed_callback_wipes_store() {
         "manifest cleared after destroy_group"
     );
 }
+
+/// destroy_group() stops the reconnect loop — undelivered outbox blobs are
+/// NOT replayed after the group is destroyed.
+#[test]
+fn destroy_group_stops_outbox_replay() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+
+    // Relay that counts received pushes.
+    let relay_received: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let rr = relay_received.clone();
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    {
+        let relay_kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        std::thread::spawn(move || {
+            let s = match hush_noise::session_xx::accept(pipe_relay, relay_kp2) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            loop {
+                match s.receive() {
+                    Ok(raw) => {
+                        if let Some((crate::relay::MsgType::Push, _)) = crate::relay::parse(&raw) {
+                            *rr.lock().unwrap() += 1;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Pipe slot: only given to factory after destroy, but loop exits before calling it.
+    let pipe_slot: Arc<Mutex<Option<MemPipe>>> = Arc::new(Mutex::new(Some(pipe_client)));
+    let pipe_slot2 = pipe_slot.clone();
+
+    let destroyed_count: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let dc = destroyed_count.clone();
+
+    let device = DeviceKeypair::generate();
+    let peer = DeviceKeypair::generate();
+    let d_noise = device.public_key();
+    let d_signing = device.signing_public_key();
+    let d_sk = ed25519_dalek::SigningKey::from_bytes(&device.signing.to_bytes());
+    let p_noise = peer.public_key();
+    let p_signing = peer.signing_public_key();
+
+    // Session starts offline; factory initially fails so it never connects.
+    let should_connect = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sc = should_connect.clone();
+    let session: HushSession<MemPipe> = HushSession::connect_background(
+        relay_pub,
+        device,
+        |_, _| {},
+        Box::new(MemLog::new()),
+        || {},
+        |_| {},
+        move || { *dc.lock().unwrap() += 1; },
+        move || {
+            if sc.load(std::sync::atomic::Ordering::Acquire) {
+                pipe_slot2.lock().unwrap().take()
+                    .ok_or_else(|| "exhausted".to_string())
+            } else {
+                Err("not yet".to_string())
+            }
+        },
+        Some(Duration::from_millis(50)),
+        None,
+    ).expect("session");
+
+    session.set_manifest(make_two_member_manifest(
+        d_noise, d_signing, &d_sk, p_noise, p_signing,
+    ));
+
+    // Push 2 blobs while offline.
+    session.push_sync(b"blob-1".to_vec()).expect("push 1");
+    session.push_sync(b"blob-2".to_vec()).expect("push 2");
+    assert_eq!(
+        session.op_log.lock().unwrap().undelivered_entries().len(),
+        2, "2 outbox entries"
+    );
+
+    // Destroy BEFORE allowing reconnect.
+    session.destroy_group();
+    assert_eq!(*destroyed_count.lock().unwrap(), 1, "on_group_destroyed fired");
+    assert!(
+        matches!(
+            session.push_sync(b"after-destroy".to_vec()),
+            Err(super::super::SessionError::GroupDestroyed)
+        ),
+        "session is terminal after destroy"
+    );
+
+    // Now allow the factory to succeed — but the loop has exited (destroyed=true).
+    should_connect.store(true, std::sync::atomic::Ordering::Release);
+
+    // Wait well beyond reconnect backoff — relay must receive nothing.
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        *relay_received.lock().unwrap(),
+        0,
+        "no blobs replayed after destroy_group — reconnect loop exited"
+    );
+}
