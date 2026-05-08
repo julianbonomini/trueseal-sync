@@ -34,6 +34,10 @@ pub trait OperationLog: Send {
     /// Returns undelivered entries sorted by global sequence ascending.
     fn undelivered_entries(&self) -> Vec<LogEntry>;
     fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<LogEntry>;
+    /// Returns the highest sequence number ever stored across all objects,
+    /// or `None` if the log is empty. Used to restore the sequence counter
+    /// after a process restart so it never re-uses a sequence number.
+    fn max_sequence(&self) -> Option<u64>;
 }
 
 /// A single entry in the log.
@@ -114,6 +118,13 @@ impl OperationLog for MemLog {
                 })
                 .collect(),
         }
+    }
+
+    fn max_sequence(&self) -> Option<u64> {
+        self.inner
+            .values()
+            .flat_map(|map| map.keys().copied())
+            .max()
     }
 }
 
@@ -278,5 +289,21 @@ mod tests {
         let mut log = MemLog::new();
         log.mark_delivered(&oid(99), 42);
         assert!(log.undelivered_entries().is_empty());
+    }
+
+    /// max_sequence returns None on empty log, max across all objects otherwise.
+    #[test]
+    fn max_sequence_empty_and_nonempty() {
+        let mut log = MemLog::new();
+        assert_eq!(log.max_sequence(), None);
+
+        log.append(&oid(1), 3, b"a".to_vec());
+        log.append(&oid(2), 7, b"b".to_vec());
+        log.append(&oid(1), 5, b"c".to_vec());
+        assert_eq!(log.max_sequence(), Some(7));
+
+        log.mark_delivered(&oid(2), 7);
+        // Delivered entries still count toward max_sequence.
+        assert_eq!(log.max_sequence(), Some(7));
     }
 }

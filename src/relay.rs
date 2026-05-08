@@ -253,9 +253,13 @@ fn run_loop<T: Read + Write + Send + 'static>(
             Ok(raw) => {
                 if let Some((MsgType::Deliver, body)) = parse(&raw) {
                     if let Ok(env) = Envelope::decode(body) {
-                        if let Ok(plaintext) = crypto::decrypt(my_noise_priv, &env.payload) {
-                            if let Ok(msg) = Message::decode(&plaintext) {
-                                if env.verify().is_ok() {
+                        // Verify the author signature before decrypting — detect
+                        // tampered envelopes at the cheapest possible point (ADR-0005,
+                        // ADR-0013). A tampered ciphertext would also fail AEAD, but
+                        // verify-first is the cryptographically idiomatic ordering.
+                        if env.verify().is_ok() {
+                            if let Ok(plaintext) = crypto::decrypt(my_noise_priv, &env.payload) {
+                                if let Ok(msg) = Message::decode(&plaintext) {
                                     let author_pub = env.author_pub;
                                     let cbs = callbacks.lock().unwrap();
                                     for cb in cbs.iter() {

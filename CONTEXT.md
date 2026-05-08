@@ -13,7 +13,7 @@ A long-term X25519 identity for a Device. Generated once per device, persisted l
 _Avoid_: credentials, identity key, key pair (two words)
 
 **Relay**:
-The infrastructure component that stores and forwards Blobs between Devices. Always in the path for remote sync. Zero-knowledge — it never decrypts content and never learns Sync Group membership. Holds Blobs addressed to offline recipients until they reconnect (30-day TTL), then deletes on delivery. Does not hold anything on behalf of offline senders — that is the sender's local responsibility.
+The infrastructure component that stores and forwards Blobs between Devices. Always in the path for remote sync. Zero-knowledge with respect to *content* — it never decrypts payloads and never learns Sync Group membership. In v0 the relay does observe sender identity: every Envelope carries an unencrypted `author_pub` field (the sender's Ed25519 signing key), so the relay can observe the sender↔recipient communication graph. This is a known gap documented in ADR-0018; moving `author_pub` inside the encrypted payload is deferred to v1. Holds Blobs addressed to offline recipients until they reconnect (30-day TTL), then deletes on delivery. Does not hold anything on behalf of offline senders — that is the sender's local responsibility.
 _Avoid_: server, TURN server, signaling server, hub
 
 **Blob**:

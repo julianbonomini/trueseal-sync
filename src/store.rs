@@ -287,6 +287,18 @@ impl OperationLog for PersistentLog {
             })
             .collect()
     }
+
+    fn max_sequence(&self) -> Option<u64> {
+        self.store
+            .conn
+            .query_row("SELECT MAX(sequence) FROM outbox", [], |row| {
+                let v: Option<i64> = row.get(0)?;
+                Ok(v)
+            })
+            .ok()
+            .flatten()
+            .map(|v| v as u64)
+    }
 }
 
 #[cfg(test)]
@@ -600,5 +612,28 @@ mod tests {
         let dir = tmp_dir();
         let s = Store::open(dir.path(), "ns").expect("open");
         assert!(s.load_group_manifest().expect("load").is_none());
+    }
+
+    /// max_sequence returns None on an empty log, the highest sequence otherwise.
+    /// Used to restore the sequence counter after a process restart (ADR-0011).
+    #[test]
+    fn persistent_log_max_sequence() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+
+        // Empty log → None
+        assert_eq!(log.max_sequence(), None);
+
+        log.append(&oid(1), 3, b"a".to_vec());
+        log.append(&oid(2), 7, b"b".to_vec());
+        log.append(&oid(1), 5, b"c".to_vec());
+
+        // Max across all objects, delivered or not
+        assert_eq!(log.max_sequence(), Some(7));
+
+        log.mark_delivered(&oid(2), 7);
+        // Still 7 even after marking delivered
+        assert_eq!(log.max_sequence(), Some(7));
     }
 }

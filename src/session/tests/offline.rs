@@ -97,11 +97,11 @@ fn offline_session_with_manifest_queues_to_outbox() {
     );
     session.set_manifest(manifest);
 
-    // push_sync should fail with PushFailed (relay disconnected) but queue to outbox.
+    // push_sync while offline returns Ok(()) and queues to outbox (ADR-0017).
     let result = session.push_sync(b"hello".to_vec());
     assert!(
-        matches!(result, Err(SessionError::PushFailed(_))),
-        "offline with manifest → PushFailed (queued to outbox), got {result:?}"
+        result.is_ok(),
+        "offline with manifest → Ok(()) (queued to outbox), got {result:?}"
     );
     // Verify outbox has the entry.
     let undelivered = session.op_log.lock().unwrap().undelivered_entries();

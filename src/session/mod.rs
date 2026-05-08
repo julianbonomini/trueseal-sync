@@ -134,6 +134,153 @@ pub struct HushSession<T: Read + Write + Send + 'static> {
     on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
 }
 
+/// Builds the full manifest-aware subscribe handler.
+///
+/// Extracted so both `connect_full` (initial connection) and `reconnect_loop`
+/// (every reconnect) share identical dispatch logic — any change to message
+/// handling semantics needs to be made exactly once here.
+pub(super) fn build_subscribe_handler(
+    keys: Arc<Mutex<KeyState>>,
+    manifest: Arc<Mutex<Option<GroupManifest>>>,
+    on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static>,
+    on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static>,
+    on_group_destroyed: Arc<dyn Fn() + Send + Sync + 'static>,
+    destroyed: Arc<AtomicBool>,
+    pairing: Arc<Mutex<Option<PairingWindow>>>,
+    pending_members: Arc<Mutex<HashMap<String, PendingMember>>>,
+    on_member_request: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
+    on_member_joined: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
+    on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
+    on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
+) -> impl Fn(Message, [u8; 32]) + Send + 'static {
+    move |msg, author_signing_pub| {
+        // ── Pair (handled before manifest filter — joiner is not yet a member) ──
+        if let Message::Pair {
+            noise_pub,
+            signing_pub,
+        } = &msg
+        {
+            let window_open = pairing
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|w| w.is_open())
+                .unwrap_or(false);
+            if window_open {
+                use base64::Engine as _;
+                let token_bytes: [u8; 16] = rand::random();
+                let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
+                let name = member_name(&SigningPublicKey(*signing_pub));
+                pending_members.lock().unwrap().insert(
+                    token.clone(),
+                    PendingMember {
+                        noise_pub: NoisePublicKey(*noise_pub),
+                        signing_pub: SigningPublicKey(*signing_pub),
+                    },
+                );
+                if let Some(cb) = on_member_request.lock().unwrap().as_ref() {
+                    cb(token, name);
+                }
+            }
+            return;
+        }
+
+        // ── Manifest-based inbound filtering ──────────────────────────────────
+        {
+            let guard = manifest.lock().unwrap();
+            if let Some(ref m) = *guard {
+                if !m.contains_signing_pub(&author_signing_pub) {
+                    return; // not a member — discard
+                }
+            }
+        }
+
+        // ── Revoke ────────────────────────────────────────────────────────────
+        if let Message::Revoke = &msg {
+            let in_group = {
+                let guard = manifest.lock().unwrap();
+                guard
+                    .as_ref()
+                    .map(|m| m.contains_signing_pub(&author_signing_pub))
+                    .unwrap_or(false)
+            };
+            if in_group {
+                *manifest.lock().unwrap() = None;
+                destroyed.store(true, Ordering::Release);
+                (on_group_destroyed)();
+            }
+            return;
+        }
+
+        // ── GroupManifest update ───────────────────────────────────────────────
+        if let Message::GroupManifest { manifest: incoming } = &msg {
+            let local_signing_pub = keys.lock().unwrap().signing_pub.0;
+            let mut guard = manifest.lock().unwrap();
+            let accept = match *guard {
+                None => incoming.verify(None).is_ok(),
+                Some(ref current) => incoming.verify(Some(current)).is_ok(),
+            };
+            if accept {
+                let excluded = !incoming.contains_signing_pub(&local_signing_pub);
+
+                let (joined, left): (Vec<_>, Vec<_>) = {
+                    let prev_pubs: std::collections::HashSet<[u8; 32]> = guard
+                        .as_ref()
+                        .map(|m| m.members.iter().map(|mm| mm.signing_pub.0).collect())
+                        .unwrap_or_default();
+                    let next_pubs: std::collections::HashSet<[u8; 32]> =
+                        incoming.members.iter().map(|mm| mm.signing_pub.0).collect();
+                    let joined = incoming
+                        .members
+                        .iter()
+                        .filter(|mm| !prev_pubs.contains(&mm.signing_pub.0))
+                        .map(|mm| (member_id(&mm.signing_pub), member_name(&mm.signing_pub)))
+                        .collect();
+                    let left = guard
+                        .as_ref()
+                        .map(|m| {
+                            m.members
+                                .iter()
+                                .filter(|mm| {
+                                    !next_pubs.contains(&mm.signing_pub.0)
+                                        // Don't fire onMemberLeft for local device.
+                                        && mm.signing_pub.0 != local_signing_pub
+                                })
+                                .map(|mm| {
+                                    (member_id(&mm.signing_pub), member_name(&mm.signing_pub))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (joined, left)
+                };
+
+                *guard = Some(incoming.clone());
+                (on_manifest_changed)(incoming);
+                drop(guard);
+
+                if let Some(cb) = on_member_joined.lock().unwrap().as_ref() {
+                    for (id, name) in joined {
+                        cb(id, name);
+                    }
+                }
+                if let Some(cb) = on_member_left.lock().unwrap().as_ref() {
+                    for (id, name) in left {
+                        cb(id, name);
+                    }
+                }
+
+                if excluded {
+                    (on_removed_from_group)();
+                }
+            }
+            return;
+        }
+
+        on_message(msg, author_signing_pub);
+    }
+}
+
 impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// Current noise public key for this session.
     pub fn noise_pub(&self) -> NoisePublicKey {
@@ -268,149 +415,29 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let client = RelayClient::connect(transport, relay_pub, noise_kp)
             .map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
 
-        client.subscribe(move |msg, author_signing_pub| {
-            // ── Pair (handled before manifest filter — joiner is not yet a member) ──
-            if let Message::Pair {
-                noise_pub,
-                signing_pub,
-            } = &msg
-            {
-                let window_open = pairing_cb
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|w| w.is_open())
-                    .unwrap_or(false);
-                if window_open {
-                    use base64::Engine as _;
-                    let token_bytes: [u8; 16] = rand::random();
-                    let token =
-                        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
-                    let name = crate::member::member_name(&SigningPublicKey(*signing_pub));
-                    pending_cb.lock().unwrap().insert(
-                        token.clone(),
-                        PendingMember {
-                            noise_pub: NoisePublicKey(*noise_pub),
-                            signing_pub: SigningPublicKey(*signing_pub),
-                        },
-                    );
-                    if let Some(cb) = on_mr_cb.lock().unwrap().as_ref() {
-                        cb(token, name);
-                    }
-                }
-                return;
-            }
+        client.subscribe(build_subscribe_handler(
+            keys_cb,
+            manifest_cb,
+            on_rfg_cb,
+            on_mc_cb,
+            on_gd_cb,
+            destroyed_cb,
+            pairing_cb,
+            pending_cb,
+            on_mr_cb,
+            on_mj_cb,
+            on_ml_cb,
+            on_message,
+        ));
 
-            // ── Manifest-based inbound filtering ──────────────────────────
-            {
-                let guard = manifest_cb.lock().unwrap();
-                if let Some(ref m) = *guard {
-                    if !m.contains_signing_pub(&author_signing_pub) {
-                        return; // not a member — discard
-                    }
-                }
-            }
-
-            // ── Revoke ────────────────────────────────────────────────────
-            if let Message::Revoke = &msg {
-                let in_group = {
-                    let guard = manifest_cb.lock().unwrap();
-                    guard
-                        .as_ref()
-                        .map(|m| m.contains_signing_pub(&author_signing_pub))
-                        .unwrap_or(false)
-                };
-                if in_group {
-                    // Wipe local manifest (keypair rotation is now internal on next create()).
-                    *manifest_cb.lock().unwrap() = None;
-                    destroyed_cb.store(true, Ordering::Release);
-                    (on_gd_cb)();
-                }
-                return;
-            }
-
-            // ── GroupManifest update ───────────────────────────────────────
-            if let Message::GroupManifest { manifest: incoming } = &msg {
-                let local_signing_pub = keys_cb.lock().unwrap().signing_pub.0;
-                let mut guard = manifest_cb.lock().unwrap();
-                let accept = match *guard {
-                    None => incoming.verify(None).is_ok(),
-                    Some(ref current) => incoming.verify(Some(current)).is_ok(),
-                };
-                if accept {
-                    let excluded = !incoming.contains_signing_pub(&local_signing_pub);
-
-                    // Diff previous vs incoming to compute joined/left sets.
-                    let (joined, left): (Vec<_>, Vec<_>) = {
-                        let prev_pubs: std::collections::HashSet<[u8; 32]> = guard
-                            .as_ref()
-                            .map(|m| m.members.iter().map(|mm| mm.signing_pub.0).collect())
-                            .unwrap_or_default();
-                        let next_pubs: std::collections::HashSet<[u8; 32]> =
-                            incoming.members.iter().map(|mm| mm.signing_pub.0).collect();
-                        let joined = incoming
-                            .members
-                            .iter()
-                            .filter(|mm| !prev_pubs.contains(&mm.signing_pub.0))
-                            .map(|mm| {
-                                (
-                                    crate::member::member_id(&mm.signing_pub),
-                                    crate::member::member_name(&mm.signing_pub),
-                                )
-                            })
-                            .collect();
-                        let left = guard
-                            .as_ref()
-                            .map(|m| {
-                                m.members
-                                    .iter()
-                                    .filter(|mm| {
-                                        !next_pubs.contains(&mm.signing_pub.0)
-                                            // Don't fire onMemberLeft for local device.
-                                            && mm.signing_pub.0 != local_signing_pub
-                                    })
-                                    .map(|mm| {
-                                        (
-                                            crate::member::member_id(&mm.signing_pub),
-                                            crate::member::member_name(&mm.signing_pub),
-                                        )
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default();
-                        (joined, left)
-                    };
-
-                    *guard = Some(incoming.clone());
-                    (on_mc_cb)(incoming);
-                    drop(guard);
-
-                    // Fire joined/left callbacks.
-                    if let Some(cb) = on_mj_cb.lock().unwrap().as_ref() {
-                        for (id, name) in joined {
-                            cb(id, name);
-                        }
-                    }
-                    if let Some(cb) = on_ml_cb.lock().unwrap().as_ref() {
-                        for (id, name) in left {
-                            cb(id, name);
-                        }
-                    }
-
-                    if excluded {
-                        (on_rfg_cb)();
-                    }
-                }
-                return;
-            }
-
-            on_message(msg, author_signing_pub);
-        });
+        // Restore sequence counter from the op log so it never re-uses a
+        // sequence number after a process restart (ADR-0011).
+        let initial_seq = op_log.max_sequence().map(|s| s + 1).unwrap_or(0);
 
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
             keys,
-            sequence: Arc::new(Mutex::new(0)),
+            sequence: Arc::new(Mutex::new(initial_seq)),
             pairing,
             op_log: Arc::new(Mutex::new(op_log)),
             manifest,
@@ -534,10 +561,19 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let client: Arc<Mutex<RelayClient<T>>> = Arc::new(Mutex::new(RelayClient::disconnected()));
         let op_log_arc: Arc<Mutex<Box<dyn OperationLog>>> = Arc::new(Mutex::new(op_log));
 
+        // Restore sequence counter from the op log so it never re-uses a
+        // sequence number after a process restart (ADR-0011).
+        let initial_seq = op_log_arc
+            .lock()
+            .unwrap()
+            .max_sequence()
+            .map(|s| s + 1)
+            .unwrap_or(0);
+
         let session = Self {
             client: client.clone(),
             keys: keys.clone(),
-            sequence: Arc::new(Mutex::new(0)),
+            sequence: Arc::new(Mutex::new(initial_seq)),
             pairing: pairing.clone(),
             op_log: op_log_arc.clone(),
             manifest: manifest.clone(),
@@ -605,12 +641,13 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         };
 
         if !self.client.lock().unwrap().is_connected() {
-            // Still append to outbox for each recipient so reconnect can replay.
+            // Blob is durably queued in the outbox; delivery is guaranteed on
+            // reconnect. Return Ok(()) — the caller should not retry (ADR-0017).
             let seq = self.next_seq();
             for r in &recipients {
                 self.op_log.lock().unwrap().append(&r.0, seq, blob.clone());
             }
-            return Err(SessionError::PushFailed("relay disconnected".into()));
+            return Ok(());
         }
 
         let msg = Message::Sync { body: blob.clone() };

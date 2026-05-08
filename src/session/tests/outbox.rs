@@ -143,9 +143,10 @@ fn undelivered_entries_replayed_after_reconnect() {
     assert!(envs[1].sequence < envs[2].sequence);
 }
 
-/// push_sync while disconnected returns PushFailed and entry stays in outbox.
+/// push_sync while disconnected returns Ok(()) and queues the entry in the outbox.
+/// The blob will be delivered on reconnect — callers must not retry (ADR-0017).
 #[test]
-fn push_sync_while_disconnected_returns_error_and_stays_in_outbox() {
+fn push_sync_while_disconnected_queues_and_returns_ok() {
     use std::sync::atomic::Ordering;
 
     let relay_kp = make_relay_kp();
@@ -185,12 +186,14 @@ fn push_sync_while_disconnected_returns_error_and_stays_in_outbox() {
     close_client.store(true, Ordering::Release);
     std::thread::sleep(Duration::from_millis(100));
 
+    // Offline send must succeed — blob is durably queued for reconnect.
     let result = session.push_sync(b"orphaned".to_vec());
     assert!(
-        matches!(result, Err(super::super::SessionError::PushFailed(_))),
-        "should return PushFailed when disconnected"
+        result.is_ok(),
+        "offline send should return Ok(()) — blob queued"
     );
 
+    // Exactly one outbox entry must exist (one recipient, not duplicated by retry).
     let undelivered = session.op_log.lock().unwrap().undelivered_entries();
-    assert_eq!(undelivered.len(), 1, "entry should remain in outbox");
+    assert_eq!(undelivered.len(), 1, "entry should be queued in outbox");
 }
