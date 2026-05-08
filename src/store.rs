@@ -126,7 +126,9 @@ impl Store {
 
     /// Persist a `DeviceKeypair`. Overwrites any existing entry (singleton row).
     pub fn save_keypair(&self, kp: &DeviceKeypair) -> Result<(), StoreError> {
-        let noise_priv: [u8; 32] = kp.noise.private().try_into().unwrap();
+        let noise_priv: [u8; 32] = kp.noise.private()
+            .try_into()
+            .expect("invariant: noise private key is always 32 bytes");
         let signing_priv: [u8; 32] = kp.signing.to_bytes();
         self.save_identity(&noise_priv, &signing_priv)
     }

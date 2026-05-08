@@ -77,8 +77,12 @@ impl Message {
                 if bytes.len() < 1 + 32 + 32 {
                     return Err(MessageError::InvalidPairingPayload);
                 }
-                let noise_pub = bytes[1..33].try_into().unwrap();
-                let signing_pub = bytes[33..65].try_into().unwrap();
+                let noise_pub = bytes[1..33]
+                    .try_into()
+                    .expect("invariant: bytes.len() >= 65 checked above");
+                let signing_pub = bytes[33..65]
+                    .try_into()
+                    .expect("invariant: bytes.len() >= 65 checked above");
                 Ok(Message::Pair {
                     noise_pub,
                     signing_pub,
@@ -114,8 +118,12 @@ pub fn decode_pairing_payload(bytes: &[u8]) -> Result<([u8; 32], [u8; 32]), Mess
     if bytes.len() < 64 {
         return Err(MessageError::InvalidPairingPayload);
     }
-    let noise_pub = bytes[0..32].try_into().unwrap();
-    let signing_pub = bytes[32..64].try_into().unwrap();
+    let noise_pub = bytes[0..32]
+        .try_into()
+        .expect("invariant: bytes.len() >= 64 checked above");
+    let signing_pub = bytes[32..64]
+        .try_into()
+        .expect("invariant: bytes.len() >= 64 checked above");
     Ok((noise_pub, signing_pub))
 }
 
@@ -149,8 +157,12 @@ pub fn decode_pairing_token(token: &str) -> Result<([u8; 32], [u8; 32], String),
     if raw.len() < 64 {
         return Err(MessageError::InvalidPairingPayload);
     }
-    let noise_pub: [u8; 32] = raw[0..32].try_into().unwrap();
-    let signing_pub: [u8; 32] = raw[32..64].try_into().unwrap();
+    let noise_pub: [u8; 32] = raw[0..32]
+        .try_into()
+        .expect("invariant: raw.len() >= 64 checked above");
+    let signing_pub: [u8; 32] = raw[32..64]
+        .try_into()
+        .expect("invariant: raw.len() >= 64 checked above");
     let name =
         String::from_utf8(raw[64..].to_vec()).map_err(|_| MessageError::InvalidPairingPayload)?;
     Ok((noise_pub, signing_pub, name))

@@ -67,7 +67,9 @@ pub fn decrypt(my_priv: [u8; 32], ciphertext: &[u8]) -> Result<([u8; 32], Vec<u8
     if inner.len() < 32 {
         return Err(CryptoError::DecryptionFailed);
     }
-    let author_pub: [u8; 32] = inner[..32].try_into().unwrap();
+    let author_pub: [u8; 32] = inner[..32]
+        .try_into()
+        .expect("invariant: inner.len() >= 32 checked above");
     let message = inner[32..].to_vec();
     Ok((author_pub, message))
 }
@@ -78,8 +80,12 @@ fn decrypt_raw(my_priv: [u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoEr
     }
 
     // Parse wire layout
-    let eph_pub_bytes: [u8; 32] = ciphertext[..EPH_PUB_LEN].try_into().unwrap();
-    let nonce_bytes: [u8; NONCE_LEN] = ciphertext[EPH_PUB_LEN..OVERHEAD].try_into().unwrap();
+    let eph_pub_bytes: [u8; 32] = ciphertext[..EPH_PUB_LEN]
+        .try_into()
+        .expect("invariant: ciphertext.len() >= OVERHEAD checked above");
+    let nonce_bytes: [u8; NONCE_LEN] = ciphertext[EPH_PUB_LEN..OVERHEAD]
+        .try_into()
+        .expect("invariant: ciphertext.len() >= OVERHEAD checked above");
     let ct = &ciphertext[OVERHEAD..];
 
     // DH: my_priv * eph_pub
