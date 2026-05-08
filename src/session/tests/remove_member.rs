@@ -378,3 +378,65 @@ fn on_removed_from_group_does_not_fire_for_unaffected_member() {
         "B's on_removed_from_group must NOT fire when C is removed"
     );
 }
+
+/// After remove_member, push_sync must not deliver to the removed member.
+/// With only self remaining, push_sync returns NotInGroup (no peers to fan out to).
+#[test]
+fn removed_member_no_longer_receives_fanout_blobs() {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
+    let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
+    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, true);
+
+    let device_a = DeviceKeypair::generate();
+    let device_b = DeviceKeypair::generate();
+    let a_noise = device_a.public_key();
+    let a_signing = device_a.signing_public_key();
+    let a_sk = SigningKey::from_bytes(&device_a.signing.to_bytes());
+    let b_noise = device_b.public_key();
+    let b_signing = device_b.signing_public_key();
+    let b_sk = SigningKey::from_bytes(&device_b.signing.to_bytes());
+
+    let b_received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+    let br = b_received.clone();
+
+    // A connects first (relay accepts pipe_a_relay first).
+    let session_a =
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}).expect("A");
+    let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _| {
+        if let crate::message::Message::Sync { body } = msg {
+            br.lock().unwrap().push(body);
+        }
+    })
+    .expect("B");
+
+    let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, b_noise, b_signing);
+    session_a.set_manifest(v1.clone());
+    session_b.set_manifest(make_two_member_manifest(
+        b_noise, b_signing, &b_sk, a_noise, a_signing,
+    ));
+
+    // A removes B.
+    session_a.remove_member(b_signing).expect("remove_member");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // After removal A is the only remaining member — push_sync has no peers to deliver to.
+    // Self-only group returns Ok(()) without delivering anything.
+    let result = session_a.push_sync(b"post-removal".to_vec());
+    // Either NotInGroup (self-only treated as no group) or Ok(()) with empty fanout.
+    assert!(
+        matches!(result, Ok(()) | Err(super::super::SessionError::NotInGroup)),
+        "push_sync after removal must not error unexpectedly, got {:?}",
+        result
+    );
+
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        b_received.lock().unwrap().is_empty(),
+        "B must not receive any blob after being removed"
+    );
+}
