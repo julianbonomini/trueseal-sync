@@ -40,7 +40,7 @@ fn join_group_sends_pair_message_to_initiator() {
     let result = session_b.join_group(&token);
     assert!(result.is_ok(), "join_group failed: {:?}", result);
 
-    std::thread::sleep(Duration::from_millis(200));
+    wait_for(|| req_token.lock().unwrap().is_some(), Duration::from_secs(5));
 
     // A's pairing handler must have fired exactly once.
     let issued = req_token.lock().unwrap().clone();
