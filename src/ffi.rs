@@ -101,6 +101,19 @@ pub trait GroupDestroyedCallback: Send + Sync {
     fn on_group_destroyed(&self);
 }
 
+/// Fired when a new member appears in an incoming manifest update or after `acceptMember` succeeds.
+#[uniffi::export(callback_interface)]
+pub trait MemberJoinedCallback: Send + Sync {
+    fn on_member_joined(&self, member_id: String, member_name: String);
+}
+
+/// Fired when a member disappears from an incoming manifest update (Soft Removal).
+/// Does NOT fire when the local device is the removed one — that fires `onRemovedFromGroup`.
+#[uniffi::export(callback_interface)]
+pub trait MemberLeftCallback: Send + Sync {
+    fn on_member_left(&self, member_id: String, member_name: String);
+}
+
 // ── HushFfiSession ────────────────────────────────────────────────────────────
 
 /// A connected hush-sync session over TCP.
@@ -269,6 +282,25 @@ impl HushFfiSession {
     /// Returns `true` if admitted, `false` if the token is unknown or the pairing window closed.
     pub fn accept_member(&self, token: String) -> bool {
         self.inner.accept_member(&token)
+    }
+
+    /// Register the callback fired when a new member joins the group.
+    ///
+    /// Fires both on the admitting device (after `acceptMember`) and on all other
+    /// current members when they receive the updated manifest.
+    pub fn set_on_member_joined(&self, callback: Box<dyn MemberJoinedCallback>) {
+        self.inner.set_on_member_joined(move |id, name| {
+            callback.on_member_joined(id, name);
+        });
+    }
+
+    /// Register the callback fired when a member is removed from the group (Soft Removal).
+    ///
+    /// Does NOT fire when the local device is removed — that fires `onRemovedFromGroup`.
+    pub fn set_on_member_left(&self, callback: Box<dyn MemberLeftCallback>) {
+        self.inner.set_on_member_left(move |id, name| {
+            callback.on_member_left(id, name);
+        });
     }
 
     /// Admit a device identified by its noise (32 B) and signing (32 B) public keys.

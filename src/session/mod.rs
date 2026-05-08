@@ -60,7 +60,7 @@ pub enum SessionError {
 
 // ── Internal types ────────────────────────────────────────────────────────────
 
-struct PairingWindow {
+pub(super) struct PairingWindow {
     deadline: Instant,
     on_paired: Box<dyn Fn(NoisePublicKey) + Send + 'static>,
 }
@@ -93,11 +93,11 @@ impl KeyState {
 }
 
 /// A pending member request — stored while waiting for `accept_member(token)`.
-struct PendingMember {
-    noise_pub: NoisePublicKey,
-    signing_pub: SigningPublicKey,
+pub(super) struct PendingMember {
+    pub noise_pub: NoisePublicKey,
+    pub signing_pub: SigningPublicKey,
     /// Auto-generated name derived from the signing pub.
-    name: String,
+    pub name: String,
 }
 
 // ── HushSession ───────────────────────────────────────────────────────────────
@@ -133,6 +133,10 @@ pub struct HushSession<T: Read + Write + Send + 'static> {
     /// Fired when a Pair message arrives inside an open pairing window.
     /// `(token, name)` — caller shows UI then calls `accept_member(token)`.
     on_member_request: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
+    /// Fired when a new member appears in an incoming manifest update.
+    on_member_joined: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
+    /// Fired when a member disappears from an incoming manifest update (not for local device).
+    on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
 }
 
 impl<T: Read + Write + Send + 'static> HushSession<T> {
@@ -266,6 +270,12 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let pending_cb_ret = pending_cb.clone();
         let on_mr_cb_ret = on_mr_cb.clone();
         let pairing_cb = pairing.clone();
+        let on_mj_cb: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>> =
+            Arc::new(Mutex::new(None));
+        let on_ml_cb: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>> =
+            Arc::new(Mutex::new(None));
+        let on_mj_cb_ret = on_mj_cb.clone();
+        let on_ml_cb_ret = on_ml_cb.clone();
 
         let client = RelayClient::connect(transport, relay_pub, noise_kp)
             .map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
@@ -342,9 +352,64 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 };
                 if accept {
                     let excluded = !incoming.contains_signing_pub(&local_signing_pub);
+
+                    // Diff previous vs incoming to compute joined/left sets.
+                    let (joined, left): (Vec<_>, Vec<_>) = {
+                        let prev_pubs: std::collections::HashSet<[u8; 32]> = guard
+                            .as_ref()
+                            .map(|m| m.members.iter().map(|mm| mm.signing_pub.0).collect())
+                            .unwrap_or_default();
+                        let next_pubs: std::collections::HashSet<[u8; 32]> =
+                            incoming.members.iter().map(|mm| mm.signing_pub.0).collect();
+                        let joined = incoming
+                            .members
+                            .iter()
+                            .filter(|mm| !prev_pubs.contains(&mm.signing_pub.0))
+                            .map(|mm| {
+                                (
+                                    crate::member::member_id(&mm.signing_pub),
+                                    crate::member::member_name(&mm.signing_pub),
+                                )
+                            })
+                            .collect();
+                        let left = guard
+                            .as_ref()
+                            .map(|m| {
+                                m.members
+                                    .iter()
+                                    .filter(|mm| {
+                                        !next_pubs.contains(&mm.signing_pub.0)
+                                            // Don't fire onMemberLeft for local device.
+                                            && mm.signing_pub.0 != local_signing_pub
+                                    })
+                                    .map(|mm| {
+                                        (
+                                            crate::member::member_id(&mm.signing_pub),
+                                            crate::member::member_name(&mm.signing_pub),
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        (joined, left)
+                    };
+
                     *guard = Some(incoming.clone());
                     (on_mc_cb)(incoming);
                     drop(guard);
+
+                    // Fire joined/left callbacks.
+                    if let Some(cb) = on_mj_cb.lock().unwrap().as_ref() {
+                        for (id, name) in joined {
+                            cb(id, name);
+                        }
+                    }
+                    if let Some(cb) = on_ml_cb.lock().unwrap().as_ref() {
+                        for (id, name) in left {
+                            cb(id, name);
+                        }
+                    }
+
                     if excluded {
                         (on_rfg_cb)();
                     }
@@ -369,6 +434,8 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             destroyed,
             pending_members: pending_cb_ret,
             on_member_request: on_mr_cb_ret,
+            on_member_joined: on_mj_cb_ret,
+            on_member_left: on_ml_cb_ret,
         })
     }
 
@@ -405,6 +472,11 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let on_mc_arc = session.on_manifest_changed.clone();
         let on_gd_arc = session.on_group_destroyed.clone();
         let destroyed_arc = session.destroyed.clone();
+        let pairing_arc = session.pairing.clone();
+        let pending_arc = session.pending_members.clone();
+        let on_mr_arc = session.on_member_request.clone();
+        let on_mj_arc = session.on_member_joined.clone();
+        let on_ml_arc = session.on_member_left.clone();
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
         std::thread::spawn(move || {
             reconnect::reconnect_loop(
@@ -419,6 +491,11 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 on_mc_arc,
                 on_gd_arc,
                 destroyed_arc,
+                pairing_arc,
+                pending_arc,
+                on_mr_arc,
+                on_mj_arc,
+                on_ml_arc,
                 Arc::new(transport_factory),
                 cap,
             );
@@ -673,6 +750,14 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         *self.manifest.lock().unwrap() = Some(new_manifest.clone());
         (self.on_manifest_changed)(&new_manifest);
 
+        // Fire onMemberJoined for the newly admitted device.
+        if let Some(cb) = self.on_member_joined.lock().unwrap().as_ref() {
+            cb(
+                crate::member::member_id(&signing_pub),
+                crate::member::member_name(&signing_pub),
+            );
+        }
+
         // Push GroupManifest to all existing members (excluding self).
         let msg = Message::GroupManifest {
             manifest: new_manifest,
@@ -696,6 +781,19 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// [`Self::accept_member`] to admit the device.
     pub fn set_on_member_request(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
         *self.on_member_request.lock().unwrap() = Some(Box::new(cb));
+    }
+
+    /// Register the callback fired when a new member appears in an incoming manifest update.
+    /// `(id, name)` — same format as [`Self::members`].
+    pub fn set_on_member_joined(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
+        *self.on_member_joined.lock().unwrap() = Some(Box::new(cb));
+    }
+
+    /// Register the callback fired when a member disappears from an incoming manifest update.
+    /// Does NOT fire when the local device is the removed one (that's `on_removed_from_group`).
+    /// `(id, name)` — same format as [`Self::members`].
+    pub fn set_on_member_left(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
+        *self.on_member_left.lock().unwrap() = Some(Box::new(cb));
     }
 
     /// Admit a pending member identified by their opaque `token` from `on_member_request`.

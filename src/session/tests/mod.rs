@@ -5,6 +5,7 @@ mod fanout;
 mod join_group;
 mod manifest_filter;
 mod manifest_persist;
+mod member_events;
 mod members;
 mod outbox;
 mod pairing;
