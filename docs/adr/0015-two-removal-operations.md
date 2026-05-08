@@ -35,10 +35,10 @@ Any current group member may remove any other member by issuing a new Group Mani
 
 Any current group member may destroy the group entirely. This pushes a `REVOKE` message to every known member, then every device:
 
-1. Wipes its local Group Manifest.
-2. Generates a fresh keypair.
-3. Clears all group state.
-4. Fires `onGroupDestroyed()`.
+1. Fires `onGroupDestroyed()`.
+2. Wipes the local SQLite database for that namespace — identity, manifest, and outbox (ADR-0016).
+
+The next `create()` call on that namespace auto-generates a fresh identity. The caller never handles or persists keypair bytes directly — the library owns the full identity lifecycle.
 
 No device in the former group can receive future blobs addressed to any member's old keypair, because no legitimate device addresses blobs to those keys anymore. The relay remains zero-knowledge and enforces nothing — exclusion works by key rotation, not key blocking.
 

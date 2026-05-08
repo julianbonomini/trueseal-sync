@@ -22,7 +22,7 @@ The library owns a three-table schema:
 
 - `identity` — one row: the 64-byte keypair. Written once on first launch (or after `destroyGroup`). Never modified in place.
 - `manifest` — one row: the current Group Manifest as encoded bytes. Replaced atomically on every membership change.
-- `outbox` — one row per undelivered blob: `(recipient_noise_pub, sequence, blob, created_at)`. Entries are deleted on confirmed delivery. Replayed in sequence order on reconnect.
+- `outbox` — one row per undelivered blob: `(object_id, sequence, blob, delivered)`. `object_id` is the recipient's noise public key, used as a per-recipient object identifier. `delivered` is a boolean flag (0/1) set to 1 on confirmed relay delivery. Undelivered entries (where `delivered = 0`) are replayed in sequence order on reconnect.
 
 All writes are wrapped in SQLite transactions. The database is opened with `journal_mode=WAL` for crash safety.
 

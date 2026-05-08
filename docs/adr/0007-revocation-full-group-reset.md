@@ -1,5 +1,9 @@
 # Revocation is full group reset triggered by any paired device
 
+> **Superseded by ADR-0015** — which renames `REVOKE_ALL` to `destroyGroup()`, clarifies the two distinct removal operations (soft removal vs full reset), and updates the session contract. The wire encoding (`Message::Revoke`, tag `0x03`) is unchanged. Read ADR-0015 for the current semantics.
+
+---
+
 When a device is lost or compromised, the operator triggers a "destroy sync" from any remaining trusted device. This pushes a `REVOKE_ALL` envelope — signed by the triggering device's keypair — to every known paired device's public key.
 
 Every device that receives `REVOKE_ALL`:

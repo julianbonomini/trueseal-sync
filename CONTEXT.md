@@ -109,7 +109,7 @@ The general concept of removing cryptographic access to the group. Encompasses b
 _Avoid_: Using "revocation" to mean only Destroy Group — be specific.
 
 **Message**:
-The typed unit of communication in hush-sync's protocol. Five variants: `Pair` (a device requesting to join a Sync Group), `Sync` (an opaque application blob — clipboard entry, secret, or any caller-defined data), `Revoke` (a full Sync Group reset / Destroy Group), `GroupManifest` (a signed membership update), and `MemberRemoved` (a soft removal notification). The message type is a private convention of hush-sync, encoded as a 1-byte tag inside the encrypted payload. The Relay never sees it. Third-party developers may use hush-relay directly with their own protocol — hush-sync is one opinionated client protocol built on the relay, not the only possible one.
+The typed unit of communication in hush-sync's protocol. Four variants: `Pair` (a device requesting to join a Sync Group), `Sync` (an opaque application blob — clipboard entry, secret, or any caller-defined data), `Revoke` (a full Sync Group reset / Destroy Group), and `GroupManifest` (a signed membership update pushed to every member on every membership change). The message type is a private convention of hush-sync, encoded as a 1-byte tag inside the encrypted payload. The Relay never sees it. Third-party developers may use hush-relay directly with their own protocol — hush-sync is one opinionated client protocol built on the relay, not the only possible one.
 _Avoid_: packet, event, command, request
 
 **Pairing Payload**:
@@ -185,4 +185,4 @@ hush-sync exposes two layers:
 
 **Session** (`HushSession`) — opinionated facade. Wires the primitives. Owns relay connection, reconnection, group manifest, message dispatch, soft removal, and destroy group. Caller owns keypair storage, op log, manifest storage, and relay address. UniFFI exposes only the session to Swift and Kotlin.
 
-On keypair rotation (Destroy Group), the session fires `onGroupDestroyed` and `onKeypairRotated` so the caller can re-persist the new keypair bytes.
+On Destroy Group, the session fires `onGroupDestroyed` and wipes the local database for that namespace. The next `create()` call auto-generates a fresh identity — the caller never handles keypair bytes directly (ADR-0016).
