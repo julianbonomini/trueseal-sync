@@ -166,3 +166,143 @@ fn manifest_persists_across_session_restart() {
         "restored sessions share group_id"
     );
 }
+
+/// Mirrors the FFI flow: connect_background → load manifest from store →
+/// set_manifest → reconnect → push_sync succeeds without re-pairing.
+///
+/// The key difference from `manifest_persists_across_session_restart`:
+/// A2 is created via `connect_background` (starts offline), manifest is
+/// restored from the store BEFORE any relay connection is made, then A2
+/// connects and can immediately push to B.
+#[test]
+fn manifest_restore_via_connect_background() {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+    use crate::operation_log::MemLog;
+    use crate::store::PersistentLog;
+
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+
+    // ── Phase 1: pair A and B, persist manifest ───────────────────────────────
+    let (pipe_a1_client, pipe_a1_relay) = mem_pipe_pair();
+    let (pipe_b1_client, pipe_b1_relay) = mem_pipe_pair();
+    spawn_routing_relay(&relay_kp, pipe_a1_relay, pipe_b1_relay, true);
+
+    let device_a = DeviceKeypair::generate();
+    let device_b = DeviceKeypair::generate();
+    let a_noise_priv = device_a.noise.private();
+    let a_signing_priv = device_a.signing.to_bytes();
+    let b_noise = device_b.public_key();
+    let b_signing = device_b.signing_public_key();
+
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let store_a = Arc::new(Mutex::new(Store::open(dir_a.path(), "a").expect("store A")));
+    let store_a_cb = store_a.clone();
+
+    let session_a = HushSession::connect_full(
+        pipe_a1_client,
+        relay_pub,
+        device_a,
+        |_, _| {},
+        Box::new(MemLog::new()),
+        || {},
+        move |m| { let _ = store_a_cb.lock().unwrap().save_group_manifest(m); },
+        || {},
+    )
+    .expect("session A");
+
+    let _session_b1 = HushSession::connect(pipe_b1_client, relay_pub,
+        DeviceKeypair::from_bytes(
+            device_b.noise.private(), device_b.signing.to_bytes()
+        ).unwrap(),
+        |_, _| {},
+    ).expect("session B1");
+
+    let _token = session_a.pairing_token();
+    assert!(session_a.accept_pair(b_noise, b_signing), "accept_pair");
+    std::thread::sleep(Duration::from_millis(200));
+
+    let a_saved = store_a.lock().unwrap()
+        .load_group_manifest().expect("load").expect("saved");
+    assert_eq!(a_saved.members.len(), 2, "manifest saved");
+    drop(session_a);
+    drop(_session_b1);
+
+    // ── Phase 2: A2 via connect_background, manifest from store ──────────────
+    let (pipe_a2_client, pipe_a2_relay) = mem_pipe_pair();
+    let (pipe_b2_client, pipe_b2_relay) = mem_pipe_pair();
+    // A2 connects via reconnect factory (async); B2 connects synchronously.
+    // Use parallel relay so accept order doesn't matter.
+    spawn_bidirectional_relay_parallel(&relay_kp, pipe_a2_relay, pipe_b2_relay);
+
+    // Signal: B2 received a message.
+    let b2_received: Arc<(Mutex<u32>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
+    let br = b2_received.clone();
+
+    let session_b2 = HushSession::connect(
+        pipe_b2_client, relay_pub,
+        DeviceKeypair::from_bytes(device_b.noise.private(), device_b.signing.to_bytes()).unwrap(),
+        move |_, _| {
+            let (lock, cvar) = &*br;
+            *lock.lock().unwrap() += 1;
+            cvar.notify_all();
+        },
+    ).expect("session B2");
+
+    // Store the B2 device private bytes to avoid Clone issue.
+    let b_noise_priv = device_b.noise.private();
+    let b_signing_priv_bytes = device_b.signing.to_bytes();
+
+    // Restore B2's manifest from the pairing so it can receive from A2.
+    // (B2 didn't persist its manifest in phase 1; reconstruct from A's.)
+    // A's manifest contains B — B's manifest also has 2 members.
+    {
+        use ed25519_dalek::SigningKey;
+        use crate::manifest::{GroupManifest, ManifestMember};
+        let loaded = store_a.lock().unwrap()
+            .load_group_manifest().expect("load").expect("manifest");
+        session_b2.set_manifest(loaded);
+    }
+
+    // A2 starts offline (connect_background), manifest restored before connection.
+    let pipe_a2_slot: Arc<Mutex<Option<MemPipeSimple>>> =
+        Arc::new(Mutex::new(Some(pipe_a2_client)));
+    let pipe_a2_slot2 = pipe_a2_slot.clone();
+    let store_a2_cb = store_a.clone();
+    let store_a3 = store_a.clone();
+
+    let session_a2: HushSession<MemPipeSimple> = HushSession::connect_background(
+        relay_pub,
+        DeviceKeypair::from_bytes(a_noise_priv, a_signing_priv).expect("reconstruct A"),
+        |_, _| {},
+        Box::new(MemLog::new()),
+        || {},
+        move |m| { let _ = store_a2_cb.lock().unwrap().save_group_manifest(m); },
+        || {},
+        move || {
+            pipe_a2_slot2.lock().unwrap().take()
+                .ok_or_else(|| "exhausted".to_string())
+        },
+        Some(Duration::from_millis(50)),
+        None,
+    ).expect("session A2");
+
+    // Restore manifest from store BEFORE any relay connection — this is the FFI flow.
+    let restored = store_a3.lock().unwrap()
+        .load_group_manifest().expect("load").expect("manifest for A2");
+    assert_eq!(restored.members.len(), 2, "A2 manifest has 2 members before connect");
+    session_a2.set_manifest(restored);
+
+    // Wait for A2 to reconnect via the factory.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // A2 pushes to the group — B2 must receive it.
+    session_a2.push_sync(b"restored-push".to_vec()).expect("push_sync");
+
+    let (lock, cvar) = &*b2_received;
+    let result = cvar
+        .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |n| *n == 0)
+        .unwrap();
+    assert!(!result.1.timed_out(), "B2 must receive A2's push within 5s");
+}
