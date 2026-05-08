@@ -566,7 +566,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         // sequence number after a process restart (ADR-0011).
         let initial_seq = op_log_arc
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .max_sequence()
             .map(|s| s + 1)
             .unwrap_or(0);
@@ -662,7 +662,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             let result =
                 self.client
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .push(&msg, recipient_pub, seq, vec![], &signing);
             match result {
                 Ok(()) => {
@@ -688,7 +688,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let signing = self.signing();
         self.client
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .push(msg, recipient_pub, seq, vec![], &signing)
             .map_err(|e| SessionError::PushFailed(e.to_string()))
     }
