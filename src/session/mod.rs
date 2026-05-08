@@ -256,8 +256,9 @@ pub(super) fn build_subscribe_handler(
                 };
 
                 *guard = Some(incoming.clone());
+                drop(guard); // release lock BEFORE firing any callback
+
                 (on_manifest_changed)(incoming);
-                drop(guard);
 
                 if let Some(cb) = on_member_joined.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
                     for (id, name) in joined {
