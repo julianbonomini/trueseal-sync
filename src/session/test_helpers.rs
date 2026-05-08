@@ -299,3 +299,64 @@ pub(super) fn spawn_tripartite_relay(
     });
 }
 
+/// Spawn a fully-connected 4-way relay (A↔B↔C↔D).
+/// Any Push from any device is delivered to the other three.
+pub(super) fn spawn_quadpartite_relay(
+    relay_kp: &Keypair,
+    pipe_a: MemPipe,
+    pipe_b: MemPipe,
+    pipe_c: MemPipe,
+    pipe_d: MemPipe,
+) {
+    let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_kp_b = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_kp_c = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_kp_d = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    std::thread::spawn(move || {
+        let sess_a = Arc::new(accept(pipe_a, relay_kp_a).unwrap());
+        let sess_b = Arc::new(accept(pipe_b, relay_kp_b).unwrap());
+        let sess_c = Arc::new(accept(pipe_c, relay_kp_c).unwrap());
+        let sess_d = Arc::new(accept(pipe_d, relay_kp_d).unwrap());
+
+        let (tx_a, rx_a) = mpsc::channel::<Vec<u8>>();
+        let (tx_b, rx_b) = mpsc::channel::<Vec<u8>>();
+        let (tx_c, rx_c) = mpsc::channel::<Vec<u8>>();
+        let (tx_d, rx_d) = mpsc::channel::<Vec<u8>>();
+
+        // Writer threads.
+        for (sess, rx) in [
+            (sess_a.clone(), rx_a),
+            (sess_b.clone(), rx_b),
+            (sess_c.clone(), rx_c),
+            (sess_d.clone(), rx_d),
+        ] {
+            std::thread::spawn(move || {
+                for msg in rx { let _ = sess.send(&msg); }
+            });
+        }
+
+        // Reader threads: each device's push goes to the other three.
+        let make_reader = |src: Arc<hush_noise::session_xx::Session<MemPipe>>,
+                           out1: mpsc::Sender<Vec<u8>>,
+                           out2: mpsc::Sender<Vec<u8>>,
+                           out3: mpsc::Sender<Vec<u8>>| {
+            std::thread::spawn(move || loop {
+                let raw = match src.receive() {
+                    Ok(r) => r,
+                    Err(_) => break,
+                };
+                if let Some((MsgType::Push, body)) = parse(&raw) {
+                    let framed = frame(MsgType::Deliver, body);
+                    let _ = out1.send(framed.clone());
+                    let _ = out2.send(framed.clone());
+                    let _ = out3.send(framed);
+                }
+            })
+        };
+
+        make_reader(sess_a, tx_b.clone(), tx_c.clone(), tx_d.clone());
+        make_reader(sess_b, tx_a.clone(), tx_c.clone(), tx_d.clone());
+        make_reader(sess_c, tx_a.clone(), tx_b.clone(), tx_d.clone());
+        make_reader(sess_d, tx_a.clone(), tx_b.clone(), tx_c.clone());
+    });
+}
