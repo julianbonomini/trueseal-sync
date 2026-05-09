@@ -29,11 +29,11 @@ fn accept_pair_creates_genesis_manifest() {
 
     // A connects first (relay accepts pipe_a_relay first).
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
     // B connects second, collects inbound GroupManifest.
     let b_manifests: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let bm = b_manifests.clone();
-    let _session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _| {
+    let _session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
         bm.lock().unwrap().push(msg);
     }, nk.factory())
     .expect("session B");
@@ -70,7 +70,7 @@ fn accept_pair_sends_manifest_to_new_member() {
     let b_signing = device_b.signing_public_key();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
 
     let b_manifest_received: Arc<Mutex<Option<crate::manifest::GroupManifest>>> =
         Arc::new(Mutex::new(None));
@@ -79,7 +79,7 @@ fn accept_pair_sends_manifest_to_new_member() {
         pipe_b_client,
         relay_pub,
         device_b,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
         |_| {},
@@ -126,7 +126,7 @@ fn accept_pair_without_window_returns_false() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, nk.factory()).expect("connect");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("connect");
 
     let dummy_noise = crate::keys::NoisePublicKey([0xAA; 32]);
     let dummy_signing = crate::keys::SigningPublicKey([0xBB; 32]);
@@ -166,7 +166,7 @@ fn accept_pair_extends_existing_manifest() {
     let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, dummy_b_noise, dummy_b_signing);
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
     session_a.set_manifest(v1);
 
     let c_manifest_arc = {
@@ -174,7 +174,7 @@ fn accept_pair_extends_existing_manifest() {
             pipe_c_client,
             relay_pub,
             device_c,
-            |_, _| {},
+            |_, _, _| {},
             Box::new(MemLog::new()),
             || {},
             |_| {},
@@ -226,13 +226,13 @@ fn new_member_bootstrap_can_send_to_existing_members() {
 
     // A and B already form a 2-member group.
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
     let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, b_noise, b_signing);
     session_a.set_manifest(v1.clone());
 
     let b_received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let br = b_received.clone();
-    let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _| {
+    let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
         if let crate::message::Message::Sync { body } = msg {
             br.lock().unwrap().push(body);
         }
@@ -242,7 +242,7 @@ fn new_member_bootstrap_can_send_to_existing_members() {
 
     // C connects; no manifest yet.
     let session_c =
-        HushSession::connect(pipe_c_client, relay_pub, device_c, |_, _| {}, nk.factory()).expect("session C");
+        HushSession::connect(pipe_c_client, relay_pub, device_c, |_, _, _| {}, nk.factory()).expect("session C");
 
     // A opens pairing window and admits C.
     let _token = session_a.pairing_token();

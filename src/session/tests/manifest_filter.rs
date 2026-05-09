@@ -32,9 +32,9 @@ fn message_from_non_member_is_discarded() {
     let rx = received.clone();
     // Relay accepts src (stranger) first, then dst (a) — connect in same order.
     let session_stranger =
-        HushSession::connect(pipe_stranger_client, relay_pub, device_stranger, |_, _| {}, nk.factory())
+        HushSession::connect(pipe_stranger_client, relay_pub, device_stranger, |_, _, _| {}, nk.factory())
             .expect("stranger");
-    let session_a = HushSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _| {
+    let session_a = HushSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _, _seq| {
         rx.lock().unwrap().push(msg);
     }, nk.factory())
     .expect("session A");
@@ -78,8 +78,8 @@ fn message_from_member_is_delivered() {
     let rx = received.clone();
     // Relay accepts src (b) first — connect b before a.
     let session_b =
-        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}, nk.factory()).expect("session B");
-    let session_a = HushSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _| {
+        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
+    let session_a = HushSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _, _seq| {
         rx.lock().unwrap().push(msg);
     }, nk.factory())
     .expect("session A");
@@ -148,9 +148,9 @@ fn inbound_group_manifest_replaces_current() {
         &b_sk,
     );
     let session_b =
-        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}, nk.factory()).expect("session B");
+        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
     session_a.set_manifest(v1);
     session_b
         .push_message(&Message::GroupManifest { manifest: v2 }, a_noise)
@@ -216,9 +216,9 @@ fn inbound_stale_manifest_is_ignored() {
         &b_sk,
     );
     let session_b =
-        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}, nk.factory()).expect("session B");
+        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
     session_a.set_manifest(v3);
     session_b
         .push_message(&Message::GroupManifest { manifest: v1 }, a_noise)
@@ -272,12 +272,12 @@ fn on_removed_from_group_fires_when_excluded_from_manifest() {
         &b_sk,
     );
     let session_b =
-        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}, nk.factory()).expect("session B");
+        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
     let session_a = HushSession::connect_full(
         pipe_a_client,
         relay_pub,
         device_a,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         move || {
             *rf.lock().unwrap() += 1;
@@ -341,12 +341,12 @@ fn tampered_group_manifest_is_rejected() {
     use crate::operation_log::MemLog;
     // B connects first — relay accepts pipe_b_relay first.
     let session_b =
-        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}, nk.factory()).expect("session B");
+        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
     let session_a = HushSession::connect_full(
         pipe_a_client,
         relay_pub,
         device_a,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         move || {
             *rf.lock().unwrap() += 1;
@@ -462,12 +462,12 @@ fn concurrent_manifest_conflict_last_version_wins() {
     let cmc = c_manifest_changed.clone();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("A");
     let session_b =
-        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}, nk.factory()).expect("B");
+        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("B");
     let session_c = HushSession::connect_full(
         pipe_c_client, relay_pub, device_c,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
         move |_| {

@@ -34,7 +34,7 @@ fn push_sync_no_manifest_returns_not_in_group() {
         });
     }
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, nk.factory()).expect("connect");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("connect");
     let result = session.push_sync(b"hello".to_vec());
     assert!(
         matches!(result, Err(SessionError::NotInGroup)),
@@ -82,11 +82,11 @@ fn push_sync_fans_out_to_all_members() {
     let manifest_c = GroupManifest::new(group_id, 1, members.clone(), &c_sk);
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
 
     let received_b: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx_b = received_b.clone();
-    let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _| {
+    let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
         rx_b.lock().unwrap().push(msg);
     }, nk.factory())
     .expect("session B");
@@ -94,7 +94,7 @@ fn push_sync_fans_out_to_all_members() {
 
     let received_c: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx_c = received_c.clone();
-    let session_c = HushSession::connect(pipe_c_client, relay_pub, device_c, move |msg, _| {
+    let session_c = HushSession::connect(pipe_c_client, relay_pub, device_c, move |msg, _, _seq| {
         rx_c.lock().unwrap().push(msg);
     }, nk.factory())
     .expect("session C");
@@ -174,7 +174,7 @@ fn push_sync_consumes_one_sequence_per_call() {
         pipe_client,
         relay_pub,
         device,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         nk.factory(),
     )
@@ -248,8 +248,8 @@ fn push_sync_fans_out_to_n_recipients() {
     // Helper: condvar-based collector for received messages.
     type Received = Arc<(Mutex<Vec<Message>>, Condvar)>;
     fn make_received() -> Received { Arc::new((Mutex::new(Vec::new()), Condvar::new())) }
-    fn make_cb(r: Received) -> impl Fn(Message, [u8; 32]) + Send + 'static {
-        move |msg, _| {
+    fn make_cb(r: Received) -> impl Fn(Message, [u8; 32], u64) + Send + 'static {
+        move |msg, _, _seq| {
             let (lock, cvar) = &*r;
             lock.lock().unwrap().push(msg);
             cvar.notify_all();
@@ -261,7 +261,7 @@ fn push_sync_fans_out_to_n_recipients() {
     let received_d = make_received();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("A");
     let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, make_cb(received_b.clone()), nk.factory()).expect("B");
     let session_c = HushSession::connect(pipe_c_client, relay_pub, device_c, make_cb(received_c.clone()), nk.factory()).expect("C");
     let session_d = HushSession::connect(pipe_d_client, relay_pub, device_d, make_cb(received_d.clone()), nk.factory()).expect("D");

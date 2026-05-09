@@ -155,9 +155,9 @@ pub(super) fn build_subscribe_handler(
     on_member_request: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
     on_member_joined: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
     on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
-    on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
-) -> impl Fn(Message, [u8; 32]) + Send + 'static {
-    move |msg, author_signing_pub| {
+    on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
+) -> impl Fn(Message, [u8; 32], u64) + Send + 'static {
+    move |msg, author_signing_pub, sequence| {
         // ── Pair (handled before manifest filter — joiner is not yet a member) ──
         if let Message::Pair {
             noise_pub,
@@ -282,7 +282,7 @@ pub(super) fn build_subscribe_handler(
             return;
         }
 
-        on_message(msg, author_signing_pub);
+        on_message(msg, author_signing_pub, sequence);
     }
 }
 
@@ -341,7 +341,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         transport: T,
         relay_pub: NoisePublicKey,
         keypair: DeviceKeypair,
-        on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
+        on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
     ) -> Result<Self, SessionError> {
         Self::connect_with_log(
@@ -358,7 +358,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         transport: T,
         relay_pub: NoisePublicKey,
         keypair: DeviceKeypair,
-        on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
+        on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
         op_log: Box<dyn OperationLog>,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
     ) -> Result<Self, SessionError> {
@@ -379,7 +379,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         transport: T,
         relay_pub: NoisePublicKey,
         keypair: DeviceKeypair,
-        on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
+        on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
         op_log: Box<dyn OperationLog>,
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
@@ -468,7 +468,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         transport: T,
         relay_pub: NoisePublicKey,
         keypair: DeviceKeypair,
-        on_message: impl Fn(Message, [u8; 32]) + Send + 'static + Clone,
+        on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static + Clone,
         op_log: Box<dyn OperationLog>,
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
@@ -545,7 +545,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     pub fn connect_background(
         relay_pub: NoisePublicKey,
         keypair: DeviceKeypair,
-        on_message: impl Fn(Message, [u8; 32]) + Send + 'static + Clone,
+        on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static + Clone,
         op_log: Box<dyn OperationLog>,
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
@@ -1032,7 +1032,7 @@ impl HushSession<TcpStream> {
         addr: &str,
         relay_pub: NoisePublicKey,
         keypair: DeviceKeypair,
-        on_message: impl Fn(Message, [u8; 32]) + Send + 'static,
+        on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
     ) -> Result<Self, SessionError> {
         let stream =
             TcpStream::connect(addr).map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;

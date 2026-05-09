@@ -173,7 +173,7 @@ pub(super) fn spawn_routing_relay(
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
-                                    let _ = dst2.send(&frame(MsgType::Deliver, &body[32..]));
+                                    let _ = dst2.send(&{ let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); frame(MsgType::Deliver, &d) });
                                 }
                                 let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }
@@ -249,7 +249,7 @@ pub(super) fn spawn_bidirectional_relay(relay_kp: &Keypair, pipe_a: MemPipe, pip
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() < 32 { return; }
                                 let recipient_pub = &body[0..32];
-                                let framed = frame(MsgType::Deliver, &body[32..]);
+                                let framed = { let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); frame(MsgType::Deliver, &d) };
                                 if true {
                                     if recipient_pub == a_noise {
                                         let _ = sa2.send(&framed);
@@ -315,7 +315,7 @@ pub(super) fn spawn_bidirectional_relay_parallel(
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() < 32 { return; }
                                 let recipient_pub = &body[0..32];
-                                let framed = frame(MsgType::Deliver, &body[32..]);
+                                let framed = { let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); frame(MsgType::Deliver, &d) };
                                 if true {
                                     if recipient_pub == a_noise {
                                         let _ = sa2.send(&framed);
@@ -419,7 +419,7 @@ pub(super) fn spawn_tripartite_relay(
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() < 32 { return; }
                                 let recipient_pub = &body[0..32];
-                                let framed = frame(MsgType::Deliver, &body[32..]);
+                                let framed = { let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); frame(MsgType::Deliver, &d) };
                                 if true {
                                     if recipient_pub == a_noise { let _ = ta.send(framed); }
                                     else if recipient_pub == b_noise { let _ = tb.send(framed); }
@@ -496,7 +496,7 @@ pub(super) fn spawn_quadpartite_relay(
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() < 32 { return; }
                                 let recipient_pub = &body[0..32];
-                                let framed = frame(MsgType::Deliver, &body[32..]);
+                                let framed = { let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); frame(MsgType::Deliver, &d) };
                                 if true {
                                     if recipient_pub == a_noise { let _ = ta.send(framed); }
                                     else if recipient_pub == b_noise { let _ = tb.send(framed); }

@@ -24,7 +24,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     relay_pub: NoisePublicKey,
     keys: Arc<Mutex<KeyState>>,
     manifest: Arc<Mutex<Option<GroupManifest>>>,
-    on_message: impl Fn(Message, [u8; 32]) + Send + 'static + Clone,
+    on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static + Clone,
     on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static>,
     on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static>,
     on_group_destroyed: Arc<dyn Fn() + Send + Sync + 'static>,
