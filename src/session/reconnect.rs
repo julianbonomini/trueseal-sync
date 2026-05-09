@@ -111,10 +111,12 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             let oid = entry.object_id;
             let recipient_pub = NoisePublicKey(oid);
             let msg = crate::message::Message::Sync { body: entry.blob };
-            let framed = build_push_blob(&msg, recipient_pub, entry.sequence, vec![], &signing);
-            let result = (push_factory)()
-                .map_err(|e| crate::relay::RelayError::PushFailed(e))
-                .and_then(|transport| push_send(transport, relay_pub_bytes, framed));
+            let result = build_push_blob(&msg, recipient_pub, entry.sequence, vec![], &signing)
+                .and_then(|framed| {
+                    (push_factory)()
+                        .map_err(|e| crate::relay::RelayError::PushFailed(e))
+                        .and_then(|transport| push_send(transport, relay_pub_bytes, framed))
+                });
             if result.is_ok() {
                 op_log.lock().unwrap_or_else(|e| e.into_inner()).mark_delivered(&oid, entry.sequence);
             }

@@ -684,10 +684,12 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         for recipient_pub in recipients {
             let oid = recipient_pub.0;
             self.op_log.lock().unwrap_or_else(|e| e.into_inner()).append(&oid, seq, blob.clone());
-            let framed = build_push_blob(&msg, recipient_pub, seq, vec![], &signing);
-            let result = (self.push_factory)()
-                .map_err(|e| crate::relay::RelayError::PushFailed(e))
-                .and_then(|transport| push_send(transport, self.relay_pub_bytes, framed));
+            let result = build_push_blob(&msg, recipient_pub, seq, vec![], &signing)
+                .and_then(|framed| {
+                    (self.push_factory)()
+                        .map_err(|e| crate::relay::RelayError::PushFailed(e))
+                        .and_then(|transport| push_send(transport, self.relay_pub_bytes, framed))
+                });
             match result {
                 Ok(_) => {
                     self.op_log.lock().unwrap_or_else(|e| e.into_inner()).mark_delivered(&oid, seq);
@@ -710,13 +712,16 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     ) -> Result<(), SessionError> {
         let seq = self.next_seq();
         let signing = self.signing();
-        let framed = build_push_blob(msg, recipient_pub, seq, vec![], &signing);
-        (self.push_factory)()
-            .map_err(|e| SessionError::PushFailed(e))
-            .and_then(|transport| {
-                push_send(transport, self.relay_pub_bytes, framed)
-                    .map(|_| ())
-                    .map_err(|e| SessionError::PushFailed(e.to_string()))
+        build_push_blob(msg, recipient_pub, seq, vec![], &signing)
+            .map_err(|e| SessionError::PushFailed(e.to_string()))
+            .and_then(|framed| {
+                (self.push_factory)()
+                    .map_err(|e| SessionError::PushFailed(e))
+                    .and_then(|transport| {
+                        push_send(transport, self.relay_pub_bytes, framed)
+                            .map(|_| ())
+                            .map_err(|e| SessionError::PushFailed(e.to_string()))
+                    })
             })
     }
 

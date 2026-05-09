@@ -108,7 +108,7 @@ fn on_message_fires_via_xx_receive_after_nk_push() {
         1,
         vec![],
         &device_b.signing_keypair(),
-    );
+    ).expect("build_push_blob should succeed");
 
     // Device B pushes via NK (anonymous, ephemeral)
     push_send(push_pipe_client, relay_pub_key, blob).expect("NK push failed");
@@ -198,7 +198,7 @@ fn push_body_starts_with_recipient_pub() {
         0,
         vec![],
         &signing,
-    );
+    ).expect("build_push_blob should succeed");
 
     // blob = [type:u8][len:u32 BE][recipient_pub:32][envelope_proto:...]
     assert!(blob.len() > 5 + 32, "blob too short");
@@ -302,7 +302,7 @@ fn run_loop_silently_drops_ack_on_receive_session() {
             1,
             vec![],
             &device_b.signing_keypair(),
-        );
+        ).expect("build_push_blob should succeed");
         // Deliver = body[32..] (proto only, strip recipient_pub prefix + frame header)
         let _ = sess.send(&frame(MsgType::Deliver, &blob[5 + 32..]));
     });

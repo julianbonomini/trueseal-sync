@@ -15,6 +15,11 @@ use crate::envelope::Envelope;
 use crate::keys::NoisePublicKey;
 use crate::message::Message;
 
+/// Maximum serialised envelope size the client will attempt to push (1 MiB).
+/// hush-sync is the protocol authority — this constant must match the relay's
+/// configurable default (`relay.max_envelope_bytes`).
+pub const MAX_ENVELOPE_BYTES: usize = 1_048_576;
+
 #[derive(Debug, Error)]
 pub enum RelayError {
     #[error("connection failed: {0}")]
@@ -25,6 +30,10 @@ pub enum RelayError {
     ReceiveFailed(String),
     #[error("handshake failed: {0}")]
     HandshakeFailed(String),
+    /// The serialised envelope exceeds MAX_ENVELOPE_BYTES.
+    /// Non-retryable — the outbox must not replay this blob.
+    #[error("envelope too large")]
+    EnvelopeTooLarge,
 }
 
 /// Wire protocol framing over the Noise session.
@@ -35,8 +44,12 @@ pub(crate) enum MsgType {
     Push      = 0x01,
     Deliver   = 0x02,
     Heartbeat = 0x03,
-    /// Relay → client. Body: 8 bytes, u64 BE — sequence of the persisted Envelope.
-    /// Semantic: "persisted to InboxStore" — not "received bytes" (ADR-0019).
+    /// Relay → client. Body: empty (0 bytes).
+    /// Semantic: "persisted to InboxStore" — not "received bytes" (ADR-0008).
+    /// An earlier draft proposed an 8-byte u64 BE sequence in the body —
+    /// rejected: relay never uses sequence numbers; dedup impossible on NK sessions;
+    /// NK already authenticates the relay so a well-formed Ack is sufficient proof.
+    /// hush-sync accepts any body length defensively but the relay always sends 0 bytes.
     Ack       = 0x04,
 }
 
@@ -148,7 +161,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         parents: Vec<[u8; 32]>,
         author_signing: &crate::envelope::SigningKeypair,
     ) -> Result<(), RelayError> {
-        let framed = build_push_blob(message, recipient_pub, sequence, parents, author_signing);
+        let framed = build_push_blob(message, recipient_pub, sequence, parents, author_signing)?;
         self.push_tx
             .send(framed)
             .map_err(|_| RelayError::PushFailed("relay run loop exited".into()))
@@ -199,24 +212,29 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
 ///
 /// Encrypts `message` to `recipient_pub`, wraps it in a signed Envelope, and
 /// returns the wire-framed bytes ready to hand to `push_send` (ADR-0018).
+/// Returns `Err(RelayError::EnvelopeTooLarge)` if the serialised envelope
+/// exceeds `MAX_ENVELOPE_BYTES` — checked after serialisation, before framing.
 pub fn build_push_blob(
     message: &Message,
     recipient_pub: NoisePublicKey,
     sequence: u64,
     parents: Vec<[u8; 32]>,
     author_signing: &crate::envelope::SigningKeypair,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, RelayError> {
     let plaintext = message.encode();
     let author_pub = author_signing.public_key_bytes();
     let payload = crypto::encrypt(recipient_pub, author_pub, &plaintext);
     let envelope = Envelope::build(sequence, parents, recipient_pub, author_signing, payload);
     let envelope_bytes = envelope.encode();
+    if envelope_bytes.len() > MAX_ENVELOPE_BYTES {
+        return Err(RelayError::EnvelopeTooLarge);
+    }
     // Push body layout (ADR-0019): [recipient_pub: 32 bytes][envelope_proto: variable].
     // Relay reads body[0..32] as inbox routing key without proto decode.
     let mut body = Vec::with_capacity(32 + envelope_bytes.len());
     body.extend_from_slice(&recipient_pub.0);
     body.extend_from_slice(&envelope_bytes);
-    frame(MsgType::Push, &body)
+    Ok(frame(MsgType::Push, &body))
 }
 
 /// The actual event loop: runs in a dedicated thread that owns the Session.
@@ -294,7 +312,7 @@ fn run_loop<T: Read + Write + Send + 'static>(
                         }
                     }
                 } else if let Some((MsgType::Heartbeat, _)) = parse(&raw) {
-                    // Echo Heartbeat back to keep the Receive Session alive (ADR-0019).
+                    // Echo Heartbeat back to keep the Receive Session alive (ADR-0006).
                     let _ = session.send(&frame(MsgType::Heartbeat, &[]));
                 }
                 // MsgType::Ack on XX session: silently drop (defensive — all
@@ -324,16 +342,17 @@ impl RelayClient<TcpStream> {
 }
 
 /// Opens a fresh Noise NK push session, sends `blob` as a framed Push message,
-/// waits for an Ack from the relay (ADR-0019), then closes the session.
+/// waits for an Ack from the relay (ADR-0008), then closes the session.
 ///
-/// The relay sends `Ack` after persisting the Envelope to the InboxStore —
-/// "bytes written" is not sufficient; we block until persistence is confirmed.
+/// The relay sends `Ack` (empty body) after persisting the Envelope to the
+/// InboxStore — "bytes written" is not sufficient; we block until persistence
+/// is confirmed. Ack body is ignored defensively.
 ///
 /// The relay is authenticated via NK (client verified relay static key), so a
 /// well-formed Ack is accepted without sequence validation.
 ///
 /// The relay sees only the ephemeral key — a fresh keypair is generated on
-/// every call and discarded after the session (ADR-0018 / #51).
+/// every call and discarded after the session (ADR-0002 / #51).
 pub fn push_send<T: Read + Write + Send>(
     transport: T,
     relay_pub: [u8; 32],
@@ -508,6 +527,28 @@ mod tests {
 
         let stored = received.lock().unwrap();
         assert_eq!(stored.len(), 1, "relay should have received one envelope");
+    }
+
+    /// build_push_blob returns EnvelopeTooLarge when envelope exceeds MAX_ENVELOPE_BYTES.
+    #[test]
+    fn build_push_blob_rejects_oversized_envelope() {
+        let sender = DeviceKeypair::generate();
+        let recipient = DeviceKeypair::generate();
+        // Craft a message whose serialised envelope exceeds MAX_ENVELOPE_BYTES.
+        let huge_body = vec![0u8; MAX_ENVELOPE_BYTES + 1];
+        let msg = Message::Sync { body: huge_body };
+        let result = build_push_blob(
+            &msg,
+            recipient.public_key(),
+            1,
+            vec![],
+            &sender.signing_keypair(),
+        );
+        assert!(
+            matches!(result, Err(RelayError::EnvelopeTooLarge)),
+            "expected EnvelopeTooLarge, got {:?}",
+            result
+        );
     }
 
     /// Connecting with the wrong relay public key is rejected.
