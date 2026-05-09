@@ -85,7 +85,7 @@ The durable local state owned and managed entirely by the library for a given na
 _Avoid_: local storage, persisted state, database (those are implementation details)
 
 **Sequence**:
-A monotonically increasing integer counter owned by a Device. Increments once per Envelope sent, across all Objects. Used by recipients to detect gaps — a jump from sequence 5 to sequence 7 from the same Device means one Envelope was missed, regardless of which Object it belonged to. Not scoped per Object.
+A monotonically increasing integer counter owned by a Device. Increments once per Envelope sent, across all Objects. Used by recipients to detect gaps — a jump from sequence 5 to sequence 7 from the same Device means one Envelope was missed, regardless of which Object it belonged to. Not scoped per Object. Exposed to callers in `on_message` alongside `author_pub` — the pair `(author_pub, sequence)` is the canonical dedup key for callers who need exactly-once semantics.
 _Avoid_: message number, event ID, offset, version (those imply per-object scoping)
 
 **Envelope**:
@@ -97,7 +97,7 @@ A cryptographic hash of a preceding Envelope in the same Object's Operation Log.
 _Avoid_: previous, predecessor, pointer
 
 **Receive Session**:
-A long-lived, authenticated, forward-secret connection between a Device and the Relay, established via a Noise XX handshake using the Device's stable noise keypair. The relay maintains a `noise_pub → active connection` map and delivers inbound Blobs over this channel (push-on-arrival). Each Device holds exactly one Receive Session at a time. Distinct from blob encryption — a Session is a live channel, not a stored payload.
+A long-lived, authenticated, forward-secret connection between a Device and the Relay, established via a Noise XX handshake using the Device's stable noise keypair. The relay maintains a `noise_pub → active connection` map and delivers inbound Blobs over this channel (push-on-arrival). Each Device holds exactly one Receive Session at a time. Distinct from blob encryption — a Session is a live channel, not a stored payload. On each Deliver frame, hush-sync sends a DeliverAck back to the relay immediately on receipt — before decryption — so the relay can delete the stored Blob. If no DeliverAck is sent before disconnect, the relay re-delivers on reconnect (at-least-once guarantee).
 _Avoid_: connection, socket, channel, stream
 
 **Push Session**:

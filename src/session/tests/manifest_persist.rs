@@ -53,7 +53,7 @@ fn manifest_persists_across_session_restart() {
         pipe_a_client,
         relay_pub,
         device_a,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
         move |m| {
@@ -69,7 +69,7 @@ fn manifest_persists_across_session_restart() {
         pipe_b_client,
         relay_pub,
         device_b,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
         move |m| {
@@ -123,7 +123,7 @@ fn manifest_persists_across_session_restart() {
         pipe_a2_client,
         relay_pub,
         DeviceKeypair::from_bytes(a_noise_priv, a_signing_priv).unwrap(),
-        |_, _| {},
+        |_, _, _| {},
         nk2.factory(),
     )
     .expect("session A2");
@@ -131,7 +131,7 @@ fn manifest_persists_across_session_restart() {
         pipe_b2_client,
         relay_pub,
         DeviceKeypair::from_bytes(b_noise_priv, b_signing_priv).unwrap(),
-        |_, _| {},
+        |_, _, _| {},
         nk2.factory(),
     )
     .expect("session B2");
@@ -211,7 +211,7 @@ fn manifest_restore_via_connect_background() {
         pipe_a1_client,
         relay_pub,
         device_a,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
         move |m| { let _ = store_a_cb.lock().unwrap().save_group_manifest(m); },
@@ -224,7 +224,7 @@ fn manifest_restore_via_connect_background() {
         DeviceKeypair::from_bytes(
             device_b.noise.private(), device_b.signing.to_bytes()
         ).unwrap(),
-        |_, _| {},
+        |_, _, _| {},
         nk1.factory(),
     ).expect("session B1");
 
@@ -253,7 +253,7 @@ fn manifest_restore_via_connect_background() {
     let session_b2 = HushSession::connect(
         pipe_b2_client, relay_pub,
         DeviceKeypair::from_bytes(device_b.noise.private(), device_b.signing.to_bytes()).unwrap(),
-        move |_, _| {
+        move |_, _, _| {
             let (lock, cvar) = &*br;
             *lock.lock().unwrap() += 1;
             cvar.notify_all();
@@ -286,7 +286,7 @@ fn manifest_restore_via_connect_background() {
     let session_a2: HushSession<MemPipeSimple> = HushSession::connect_background(
         relay_pub,
         DeviceKeypair::from_bytes(a_noise_priv, a_signing_priv).expect("reconstruct A"),
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
         move |m| { let _ = store_a2_cb.lock().unwrap().save_group_manifest(m); },

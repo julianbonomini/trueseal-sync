@@ -73,7 +73,10 @@ fn on_message_fires_via_xx_receive_after_nk_push() {
             };
             if let Some((MsgType::Push, body)) = parse(&raw) {
                 if body.len() >= 32 {
-                    let deliver = frame(MsgType::Deliver, &body[32..]);
+                    // ADR-0020: Deliver body = [blob_id: 8 bytes][envelope_proto]
+                    let mut deliver_body = 0u64.to_be_bytes().to_vec();
+                    deliver_body.extend_from_slice(&body[32..]);
+                    let deliver = frame(MsgType::Deliver, &deliver_body);
                     let _ = xx_sess.send(&deliver);
                 }
                 let _ = nk_sess.send(&frame(MsgType::Ack, &[]));
@@ -94,7 +97,7 @@ fn on_message_fires_via_xx_receive_after_nk_push() {
         hush_noise::keypair::Keypair::new(device_a.noise.private(), device_a.noise.public_key),
     )
     .expect("A XX connect");
-    client_a.subscribe(move |msg, _| {
+    client_a.subscribe(move |msg, _, _seq| {
         rx.lock().unwrap().push(msg);
     });
 
@@ -303,8 +306,10 @@ fn run_loop_silently_drops_ack_on_receive_session() {
             vec![],
             &device_b.signing_keypair(),
         ).expect("build_push_blob should succeed");
-        // Deliver = body[32..] (proto only, strip recipient_pub prefix + frame header)
-        let _ = sess.send(&frame(MsgType::Deliver, &blob[5 + 32..]));
+        // Deliver = [blob_id: 8 bytes][proto only] (ADR-0020)
+        let mut deliver_body = 0u64.to_be_bytes().to_vec();
+        deliver_body.extend_from_slice(&blob[5 + 32..]);
+        let _ = sess.send(&frame(MsgType::Deliver, &deliver_body));
     });
 
     let client = RelayClient::connect(
@@ -313,8 +318,112 @@ fn run_loop_silently_drops_ack_on_receive_session() {
         hush_noise::keypair::Keypair::new(device_a_noise_priv, device_a_noise_pub),
     )
     .expect("connect");
-    client.subscribe(move |msg, _| { rx.lock().unwrap().push(msg); });
+    client.subscribe(move |msg, _, _seq| { rx.lock().unwrap().push(msg); });
 
     wait_for(|| !received.lock().unwrap().is_empty(), Duration::from_secs(5));
     assert_eq!(received.lock().unwrap()[0], Message::Sync { body: b"still alive".to_vec() });
+}
+
+// ── DeliverAck + sequence in callback (ADR-0020) ─────────────────────────────
+
+/// Relay sends Deliver with blob_id prefix — run_loop must send DeliverAck
+/// back immediately (before decryption), echoing the blob_id.
+#[test]
+fn run_loop_sends_deliver_ack_before_decryption() {
+    use crate::relay::RelayClient;
+
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let (pipe_client, pipe_relay) = mem_pipe_pair_simple();
+    let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+
+    let ack_received: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    let ack_clone = ack_received.clone();
+
+    std::thread::spawn(move || {
+        let sess = hush_noise::session_xx::accept(pipe_relay, relay_kp2).expect("XX accept");
+        // Send a Deliver frame with blob_id prefix — garbage envelope bytes
+        // (decryption will fail, but DeliverAck must still arrive).
+        let blob_id: u64 = 0xDEAD_BEEF_1234_5678;
+        let mut body = Vec::new();
+        body.extend_from_slice(&blob_id.to_be_bytes());
+        body.extend_from_slice(b"not a real envelope");
+        let _ = sess.send(&frame(MsgType::Deliver, &body));
+        // Wait for DeliverAck
+        if let Ok(raw) = sess.receive() {
+            if let Some((MsgType::DeliverAck, ack_body)) = parse(&raw) {
+                if ack_body.len() == 8 {
+                    let echoed = u64::from_be_bytes(ack_body.try_into().unwrap());
+                    *ack_clone.lock().unwrap() = Some(echoed);
+                }
+            }
+        }
+    });
+
+    let device = DeviceKeypair::generate();
+    let _client = RelayClient::connect(
+        pipe_client,
+        relay_pub,
+        hush_noise::keypair::Keypair::new(device.noise.private(), device.noise.public_key),
+    )
+    .expect("connect");
+
+    wait_for(|| ack_received.lock().unwrap().is_some(), Duration::from_secs(5));
+    assert_eq!(
+        *ack_received.lock().unwrap(),
+        Some(0xDEAD_BEEF_1234_5678),
+        "DeliverAck must echo blob_id verbatim"
+    );
+}
+
+/// subscribe callback receives sequence as third argument — relay delivers
+/// an envelope with sequence=42, callback must see 42.
+#[test]
+fn subscribe_callback_receives_sequence() {
+    use crate::relay::RelayClient;
+
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let (pipe_client, pipe_relay) = mem_pipe_pair_simple();
+    let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+
+    let device_a = DeviceKeypair::generate();
+    let device_b = DeviceKeypair::generate();
+    let device_a_pub = device_a.public_key();
+    let device_a_noise_priv = device_a.noise.private();
+    let device_a_noise_pub = device_a.noise.public_key;
+
+    let seq_received: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    let seq_clone = seq_received.clone();
+
+    std::thread::spawn(move || {
+        let sess = hush_noise::session_xx::accept(pipe_relay, relay_kp2).expect("XX accept");
+
+        let msg = Message::Sync { body: b"hello".to_vec() };
+        let blob = crate::relay::build_push_blob(
+            &msg, device_a_pub, 42, vec![], &device_b.signing_keypair(),
+        ).expect("build_push_blob");
+        // Deliver body: [blob_id: 8 bytes][envelope_proto: blob[5+32..]]
+        let blob_id: u64 = 99;
+        let mut body = Vec::new();
+        body.extend_from_slice(&blob_id.to_be_bytes());
+        body.extend_from_slice(&blob[5 + 32..]); // strip frame header + recipient_pub prefix
+        let _ = sess.send(&frame(MsgType::Deliver, &body));
+        // consume DeliverAck so relay stub doesn't block
+        let _ = sess.receive();
+    });
+
+    let client = RelayClient::connect(
+        pipe_client,
+        relay_pub,
+        hush_noise::keypair::Keypair::new(device_a_noise_priv, device_a_noise_pub),
+    )
+    .expect("connect");
+
+    client.subscribe(move |_msg, _author_pub, seq| {
+        *seq_clone.lock().unwrap() = Some(seq);
+    });
+
+    wait_for(|| seq_received.lock().unwrap().is_some(), Duration::from_secs(5));
+    assert_eq!(*seq_received.lock().unwrap(), Some(42), "callback must receive sequence=42");
 }

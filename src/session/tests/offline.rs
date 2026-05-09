@@ -15,7 +15,7 @@ fn create_offline_returns_session_immediately() {
     let session = HushSession::<MemPipe>::connect_background(
         relay_pub,
         device,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
         |_| {},
@@ -42,7 +42,7 @@ fn offline_session_send_returns_not_in_group() {
     let session = HushSession::<MemPipe>::connect_background(
         relay_pub,
         device,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
         |_| {},
@@ -79,7 +79,7 @@ fn offline_session_with_manifest_queues_to_outbox() {
     let session = HushSession::<MemPipe>::connect_background(
         relay_pub,
         device,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
         |_| {},

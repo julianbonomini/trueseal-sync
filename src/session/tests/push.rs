@@ -31,14 +31,14 @@ fn two_sessions_can_exchange_sync_message() {
     let b_signing = device_b.signing_public_key();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
     session_a.set_manifest(make_two_member_manifest(
         a_noise, a_signing, &a_sk, b_noise, b_signing,
     ));
 
     let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx = received.clone();
-    let _session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _| {
+    let _session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
         rx.lock().unwrap().push(msg);
     }, nk.factory())
     .expect("session B");
@@ -121,7 +121,7 @@ fn push_sync_increments_sequence() {
         &sk,
     );
 
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, nk.factory()).expect("connect");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("connect");
     session.set_manifest(manifest);
 
     session.push_sync(b"first".to_vec()).expect("first");
@@ -153,7 +153,7 @@ fn on_message_receives_sender_signing_pub() {
     let b_signing = device_b.signing_public_key();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
     session_a.set_manifest(make_two_member_manifest(
         a_noise,
         a_signing_pub,
@@ -168,7 +168,7 @@ fn on_message_receives_sender_signing_pub() {
         pipe_b_client,
         relay_pub,
         device_b,
-        move |_msg, author_signing_pub| {
+        move |_msg, author_signing_pub, _seq| {
             rx.lock().unwrap().push(author_signing_pub);
         },
         nk.factory(),
@@ -219,7 +219,7 @@ fn envelope_addressed_to_wrong_key_is_silently_dropped() {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
-                                    let _ = sess_a2.send(&crate::relay::frame(MsgType::Deliver, &body[32..]));
+                                    let _ = sess_a2.send(&crate::relay::frame(MsgType::Deliver, &{ let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); d }));
                                 }
                                 let _ = sess.send(&crate::relay::frame(MsgType::Ack, &[]));
                             }
@@ -240,10 +240,10 @@ fn envelope_addressed_to_wrong_key_is_silently_dropped() {
 
     // Sender connects first (relay accepts sender first).
     let session_sender =
-        HushSession::connect(pipe_sender_client, relay_pub, device_sender, |_, _| {}, nk.factory())
+        HushSession::connect(pipe_sender_client, relay_pub, device_sender, |_, _, _| {}, nk.factory())
             .expect("sender");
     // A connects second.
-    let _session_a = HushSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _| {
+    let _session_a = HushSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _, _seq| {
         rx.lock().unwrap().push(msg);
     }, nk.factory())
     .expect("session A");
@@ -354,7 +354,7 @@ fn push_does_not_expose_stable_noise_key_to_relay() {
         pipe_client,
         relay_pub,
         device,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         nk.factory(),
     )

@@ -59,6 +59,7 @@ pub(crate) enum MsgType {
     /// Semantic: the relay permanently rejected the blob (e.g. oversized envelope).
     /// The sender must NOT retry — `push_send` returns `RelayError::PushRejected`.
     Error     = 0x05,
+    DeliverAck = 0x06,
 }
 
 impl MsgType {
@@ -69,6 +70,7 @@ impl MsgType {
             0x03 => Some(Self::Heartbeat),
             0x04 => Some(Self::Ack),
             0x05 => Some(Self::Error),
+            0x06 => Some(Self::DeliverAck),
             _ => None,
         }
     }
@@ -110,7 +112,7 @@ pub struct RelayClient<T: Read + Write + Send + 'static> {
     /// Channel for sending pre-encoded push frames to the run thread.
     push_tx: mpsc::SyncSender<PushBytes>,
     /// Callbacks receive the decoded Message and the sender's signing public key ([u8;32]).
-    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32]) + Send + 'static>>>>,
+    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64) + Send + 'static>>>>,
     /// True while the background run loop is alive; set to false when relay disconnects.
     is_connected: Arc<AtomicBool>,
     _transport: PhantomData<T>,
@@ -135,7 +137,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         // Bounded channel: backpressure if the run thread falls behind.
         let (push_tx, push_rx) = mpsc::sync_channel::<PushBytes>(64);
 
-        let callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32]) + Send + 'static>>>> =
+        let callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64) + Send + 'static>>>> =
             Arc::new(Mutex::new(Vec::new()));
         let callbacks_clone = callbacks.clone();
 
@@ -179,7 +181,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
     /// Register a callback invoked when the relay delivers a Message to this device.
     /// Decryption and type parsing happen inside — callers receive a clean `Message`
     /// and the sender's signing public key (`author_pub` from the Envelope).
-    pub fn subscribe(&self, callback: impl Fn(Message, [u8; 32]) + Send + 'static) {
+    pub fn subscribe(&self, callback: impl Fn(Message, [u8; 32], u64) + Send + 'static) {
         self.callbacks.lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(callback));
     }
 
@@ -251,7 +253,7 @@ pub fn build_push_blob(
 fn run_loop<T: Read + Write + Send + 'static>(
     session: Session<T>,
     push_rx: mpsc::Receiver<PushBytes>,
-    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32]) + Send + 'static>>>>,
+    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64) + Send + 'static>>>>,
     my_noise_priv: [u8; 32],
     is_connected: Arc<AtomicBool>,
 ) {
@@ -305,27 +307,31 @@ fn run_loop<T: Read + Write + Send + 'static>(
             Err(_) => break,
             Ok(raw) => {
                 if let Some((MsgType::Deliver, body)) = parse(&raw) {
-                    if let Ok(env) = Envelope::decode(body) {
-                        // New flow (ADR-0018 / #49): decrypt first to extract
-                        // author_pub from the payload, then verify the signature
-                        // using that key. author_pub is no longer in the clear header.
-                        if let Ok((author_pub, plaintext)) = crypto::decrypt(my_noise_priv, &env.payload) {
-                            if env.verify_with(author_pub).is_ok() {
-                                if let Ok(msg) = Message::decode(&plaintext) {
-                                    let cbs = callbacks.lock().unwrap_or_else(|e| e.into_inner());
-                                    for cb in cbs.iter() {
-                                        cb(msg.clone(), author_pub);
+                    // ADR-0020: Deliver body = [blob_id: 8 bytes][proto Envelope].
+                    // Send DeliverAck immediately on receipt — before decryption —
+                    // so the relay learns nothing about decryption outcome (zero trust).
+                    if body.len() >= 8 {
+                        let blob_id = &body[0..8];
+                        let _ = session.send(&frame(MsgType::DeliverAck, blob_id));
+                        let envelope_bytes = &body[8..];
+                        if let Ok(env) = Envelope::decode(envelope_bytes) {
+                            if let Ok((author_pub, plaintext)) = crypto::decrypt(my_noise_priv, &env.payload) {
+                                if env.verify_with(author_pub).is_ok() {
+                                    if let Ok(msg) = Message::decode(&plaintext) {
+                                        let cbs = callbacks.lock().unwrap_or_else(|e| e.into_inner());
+                                        for cb in cbs.iter() {
+                                            cb(msg.clone(), author_pub, env.sequence);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 } else if let Some((MsgType::Heartbeat, _)) = parse(&raw) {
-                    // Echo Heartbeat back to keep the Receive Session alive (ADR-0006).
+                    // Echo Heartbeat back to keep the Receive Session alive (ADR-0019).
                     let _ = session.send(&frame(MsgType::Heartbeat, &[]));
                 }
-                // MsgType::Ack on XX session: silently drop (defensive — all
-                // pushes use NK sessions; Ack should never appear here).
+                // MsgType::Ack on XX session: silently drop (defensive).
             }
         }
     }
@@ -650,7 +656,10 @@ mod tests {
 
             std::thread::spawn(move || {
                 let session = accept(relay_pipe, relay_kp2).unwrap();
-                let msg = frame(MsgType::Deliver, &env_bytes);
+                // ADR-0020: Deliver body = [blob_id: 8 bytes][envelope_proto]
+                let mut deliver_body = 0u64.to_be_bytes().to_vec();
+                deliver_body.extend_from_slice(&env_bytes);
+                let msg = frame(MsgType::Deliver, &deliver_body);
                 session.send(&msg).unwrap();
             });
         }
@@ -660,7 +669,7 @@ mod tests {
 
         // Connect and subscribe — run loop starts automatically in connect()
         let client = connect_device(&recipient, relay_pub, client_pipe);
-        client.subscribe(move |msg, _author_pub| {
+        client.subscribe(move |msg, _author_pub, _seq| {
             delivered_clone.lock().unwrap().push(msg);
         });
 
@@ -709,7 +718,10 @@ mod tests {
                     };
                     if let Some((MsgType::Push, body)) = parse(&raw) {
                         if body.len() >= 32 {
-                            let deliver = frame(MsgType::Deliver, &body[32..]);
+                            // ADR-0020: Deliver body = [blob_id: 8 bytes][envelope_proto]
+                            let mut deliver_body = 0u64.to_be_bytes().to_vec();
+                            deliver_body.extend_from_slice(&body[32..]);
+                            let deliver = frame(MsgType::Deliver, &deliver_body);
                             let _ = sess_a.send(&deliver);
                         }
                     }
@@ -733,7 +745,7 @@ mod tests {
         let client_a = connect_device(&device_a, relay_pub, pipe_a_client);
         let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
         let received_clone = received.clone();
-        client_a.subscribe(move |msg, _author_pub| {
+        client_a.subscribe(move |msg, _author_pub, _seq| {
             received_clone.lock().unwrap().push(msg);
         });
         // run loop starts automatically in connect()

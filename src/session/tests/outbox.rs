@@ -49,7 +49,7 @@ fn push_sync_appends_and_marks_delivered() {
         pipe_client,
         relay_pub,
         device,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         nk.factory(),
     )
@@ -125,7 +125,7 @@ fn undelivered_entries_replayed_after_reconnect() {
         pipe1_client,
         relay_pub,
         device,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
         |_| {},
@@ -193,7 +193,7 @@ fn push_sync_while_disconnected_queues_and_returns_ok() {
         pipe_client,
         relay_pub,
         device,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || Err("push factory unused: pushes go offline in this test".into()),
     )
@@ -280,7 +280,7 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
         let session1 = HushSession::connect_background(
             relay_pub,
             device1,
-            |_, _| {},
+            |_, _, _| {},
             Box::new(log1),
             || {},
             |_| {},
@@ -327,7 +327,7 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
     let session2 = HushSession::connect_background(
         relay_pub,
         device2,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(log2),
         || {},
         |_| {},
@@ -394,7 +394,7 @@ fn sequence_counter_not_reused_after_restart() {
             // Dummy relay pub — session never connects.
             crate::keys::NoisePublicKey([0u8; 32]),
             device,
-            |_, _| {},
+            |_, _, _| {},
             Box::new(log1),
             || {},
             |_| {},
@@ -436,7 +436,7 @@ fn sequence_counter_not_reused_after_restart() {
         let session2: HushSession<MemPipeSimple> = HushSession::connect_background(
             crate::keys::NoisePublicKey([0u8; 32]),
             device2,
-            |_, _| {},
+            |_, _, _| {},
             Box::new(log2),
             || {},
             |_| {},

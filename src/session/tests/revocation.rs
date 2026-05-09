@@ -62,7 +62,7 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
             pipe_a1_client,
             relay_pub,
             device_a,
-            |_, _| {},
+            |_, _, _| {},
             Box::new(MemLog::new()),
             || {},
             |_| {},
@@ -94,7 +94,7 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
             pipe_b1_client,
             relay_pub,
             device_b,
-            |_, _| {},
+            |_, _, _| {},
             Box::new(MemLog::new()),
             || {},
             |_| {},
@@ -200,7 +200,7 @@ fn destroy_group_fires_on_group_destroyed_for_all_members() {
             pipe_a_client,
             relay_pub,
             device_a,
-            |_, _| {},
+            |_, _, _| {},
             Box::new(MemLog::new()),
             || {},
             |_| {},
@@ -219,7 +219,7 @@ fn destroy_group_fires_on_group_destroyed_for_all_members() {
             pipe_b_client,
             relay_pub,
             device_b,
-            |_, _| {},
+            |_, _, _| {},
             Box::new(MemLog::new()),
             || {},
             |_| {},
@@ -277,7 +277,7 @@ fn revoke_from_unknown_device_is_ignored() {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
-                                    let _ = sess_a2.send(&frame(MsgType::Deliver, &body[32..]));
+                                    let _ = sess_a2.send(&frame(MsgType::Deliver, &{ let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); d }));
                                 }
                                 let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }
@@ -304,7 +304,7 @@ fn revoke_from_unknown_device_is_ignored() {
             pipe_a_client,
             relay_pub,
             device_a,
-            |_, _| {},
+            |_, _, _| {},
             Box::new(MemLog::new()),
             || {},
             |_| {},
@@ -324,7 +324,7 @@ fn revoke_from_unknown_device_is_ignored() {
     ));
 
     let session_stranger =
-        HushSession::connect(pipe_stranger_client, relay_pub, device_stranger, |_, _| {}, nk.factory())
+        HushSession::connect(pipe_stranger_client, relay_pub, device_stranger, |_, _, _| {}, nk.factory())
             .expect("stranger");
     session_stranger
         .push_message(&Message::Revoke, session_a.noise_pub())
@@ -372,7 +372,7 @@ fn destroy_group_with_no_manifest_fires_callback_and_is_terminal() {
         pipe_client,
         relay_pub,
         device,
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
         |_| {},

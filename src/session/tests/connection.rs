@@ -31,7 +31,7 @@ fn connection_changed_fires_true_on_initial_connect() {
     let _session = HushSession::<MemPipe>::connect_background(
         relay_pub,
         DeviceKeypair::generate(),
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
         |_| {},
@@ -95,7 +95,7 @@ fn connection_changed_fires_sequence_on_disconnect_and_reconnect() {
     let _session = HushSession::<MemPipe>::connect_background(
         relay_pub,
         DeviceKeypair::generate(),
-        |_, _| {},
+        |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
         |_| {},

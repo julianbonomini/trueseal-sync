@@ -26,9 +26,9 @@ fn join_group_sends_pair_message_to_initiator() {
 
     // B connects first — matches relay accept order.
     let session_b =
-        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _| {}, nk.factory()).expect("session B");
+        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _| {}, nk.factory()).expect("session A");
+        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
 
     // Capture the opaque token issued when B's Pair arrives.
     let req_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -86,7 +86,7 @@ fn join_group_invalid_token_returns_error() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _| {}, nk2.factory()).expect("connect");
+    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk2.factory()).expect("connect");
 
     let result = session.join_group("not-a-valid-token!!!!");
     assert!(

@@ -213,7 +213,7 @@ impl HushFfiSession {
         let inner = HushSession::connect_background(
             relay_pub_key,
             keypair,
-            move |msg, author_signing_pub| {
+            move |msg, author_signing_pub, _sequence| {
                 if let Message::Sync { body } = msg {
                     let sender_noise_pub = manifest_slot_cb
                         .lock()
