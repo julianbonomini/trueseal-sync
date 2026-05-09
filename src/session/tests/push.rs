@@ -7,7 +7,7 @@ use hush_noise::{keypair::Keypair, session_xx::accept};
 use crate::device::DeviceKeypair;
 use crate::envelope::Envelope;
 use crate::message::Message;
-use crate::relay::{parse, MsgType};
+use crate::relay::{frame, parse, MsgType};
 
 use super::super::test_helpers::*;
 use super::super::HushSession;
@@ -82,9 +82,12 @@ fn push_sync_increments_sequence() {
                     if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
-                                if let Ok(env) = Envelope::decode(body) {
-                                    rx2.lock().unwrap().push(env);
+                                if body.len() >= 32 {
+                                    if let Ok(env) = Envelope::decode(&body[32..]) {
+                                        rx2.lock().unwrap().push(env);
+                                    }
                                 }
+                                let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }
                         }
                     }
@@ -215,7 +218,10 @@ fn envelope_addressed_to_wrong_key_is_silently_dropped() {
                     if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
-                                let _ = sess_a2.send(&crate::relay::frame(MsgType::Deliver, body));
+                                if body.len() >= 32 {
+                                    let _ = sess_a2.send(&crate::relay::frame(MsgType::Deliver, &body[32..]));
+                                }
+                                let _ = sess.send(&crate::relay::frame(MsgType::Ack, &[]));
                             }
                         }
                     }
@@ -314,7 +320,9 @@ fn push_does_not_expose_stable_noise_key_to_relay() {
                         // NK accept succeeded: relay did not need to know the initiator's
                         // stable noise key. Record a sentinel to count successful pushes.
                         spy.lock().unwrap().push([0u8; 32]); // count only, key unknown to relay
-                        let _ = _sess.receive(); // drain
+                        if _sess.receive().is_ok() {
+                            let _ = _sess.send(&frame(MsgType::Ack, &[]));
+                        }
                     }
                 });
             }

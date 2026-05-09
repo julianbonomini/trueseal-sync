@@ -172,7 +172,10 @@ pub(super) fn spawn_routing_relay(
                     if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
-                                let _ = dst2.send(&frame(MsgType::Deliver, body));
+                                if body.len() >= 32 {
+                                    let _ = dst2.send(&frame(MsgType::Deliver, &body[32..]));
+                                }
+                                let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }
                         }
                     }
@@ -198,7 +201,9 @@ pub(super) fn spawn_single_relay(relay_kp: &Keypair, pipe: MemPipe, nk_rx: mpsc:
             let kp = Keypair::new(relay_priv, relay_pub_key);
             std::thread::spawn(move || {
                 if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
-                    let _ = sess.receive();
+                    if sess.receive().is_ok() {
+                        let _ = sess.send(&frame(MsgType::Ack, &[]));
+                    }
                 }
             });
         }
@@ -242,14 +247,17 @@ pub(super) fn spawn_bidirectional_relay(relay_kp: &Keypair, pipe_a: MemPipe, pip
                     if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
-                                let framed = frame(MsgType::Deliver, body.clone());
-                                if let Ok(env) = crate::envelope::Envelope::decode(&body) {
-                                    if env.recipient_pub == a_noise {
+                                if body.len() < 32 { return; }
+                                let recipient_pub = &body[0..32];
+                                let framed = frame(MsgType::Deliver, &body[32..]);
+                                if true {
+                                    if recipient_pub == a_noise {
                                         let _ = sa2.send(&framed);
-                                    } else if env.recipient_pub == b_noise {
+                                    } else if recipient_pub == b_noise {
                                         let _ = sb2.send(&framed);
                                     }
                                 }
+                                let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }
                         }
                     }
@@ -305,14 +313,17 @@ pub(super) fn spawn_bidirectional_relay_parallel(
                     if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
-                                let framed = frame(MsgType::Deliver, body.clone());
-                                if let Ok(env) = crate::envelope::Envelope::decode(&body) {
-                                    if env.recipient_pub == a_noise {
+                                if body.len() < 32 { return; }
+                                let recipient_pub = &body[0..32];
+                                let framed = frame(MsgType::Deliver, &body[32..]);
+                                if true {
+                                    if recipient_pub == a_noise {
                                         let _ = sa2.send(&framed);
-                                    } else if env.recipient_pub == b_noise {
+                                    } else if recipient_pub == b_noise {
                                         let _ = sb2.send(&framed);
                                     }
                                 }
+                                let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }
                         }
                     }
@@ -406,12 +417,15 @@ pub(super) fn spawn_tripartite_relay(
                     if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
-                                let framed = frame(MsgType::Deliver, body.clone());
-                                if let Ok(env) = crate::envelope::Envelope::decode(&body) {
-                                    if env.recipient_pub == a_noise { let _ = ta.send(framed); }
-                                    else if env.recipient_pub == b_noise { let _ = tb.send(framed); }
-                                    else if env.recipient_pub == c_noise { let _ = tc.send(framed); }
+                                if body.len() < 32 { return; }
+                                let recipient_pub = &body[0..32];
+                                let framed = frame(MsgType::Deliver, &body[32..]);
+                                if true {
+                                    if recipient_pub == a_noise { let _ = ta.send(framed); }
+                                    else if recipient_pub == b_noise { let _ = tb.send(framed); }
+                                    else if recipient_pub == c_noise { let _ = tc.send(framed); }
                                 }
+                                let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }
                         }
                     }
@@ -480,13 +494,16 @@ pub(super) fn spawn_quadpartite_relay(
                     if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
-                                let framed = frame(MsgType::Deliver, body.clone());
-                                if let Ok(env) = crate::envelope::Envelope::decode(&body) {
-                                    if env.recipient_pub == a_noise { let _ = ta.send(framed); }
-                                    else if env.recipient_pub == b_noise { let _ = tb.send(framed); }
-                                    else if env.recipient_pub == c_noise { let _ = tc.send(framed); }
-                                    else if env.recipient_pub == d_noise { let _ = td.send(framed); }
+                                if body.len() < 32 { return; }
+                                let recipient_pub = &body[0..32];
+                                let framed = frame(MsgType::Deliver, &body[32..]);
+                                if true {
+                                    if recipient_pub == a_noise { let _ = ta.send(framed); }
+                                    else if recipient_pub == b_noise { let _ = tb.send(framed); }
+                                    else if recipient_pub == c_noise { let _ = tc.send(framed); }
+                                    else if recipient_pub == d_noise { let _ = td.send(framed); }
                                 }
+                                let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }
                         }
                     }

@@ -276,7 +276,10 @@ fn revoke_from_unknown_device_is_ignored() {
                     if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
-                                let _ = sess_a2.send(&frame(MsgType::Deliver, body));
+                                if body.len() >= 32 {
+                                    let _ = sess_a2.send(&frame(MsgType::Deliver, &body[32..]));
+                                }
+                                let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }
                         }
                     }

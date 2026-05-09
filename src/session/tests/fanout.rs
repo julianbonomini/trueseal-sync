@@ -25,7 +25,11 @@ fn push_sync_no_manifest_returns_not_in_group() {
             let _ = accept(pipe_relay, relay_kp2);
             while let Ok(p) = nk_rx.recv() {
                 let kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(p, kp2); });
+                std::thread::spawn(move || { if let Ok(sess) = hush_noise::session_nk::accept(p, kp2) {
+                if sess.receive().is_ok() {
+                    let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                }
+            } });
             }
         });
     }

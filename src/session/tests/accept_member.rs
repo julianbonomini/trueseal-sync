@@ -144,7 +144,11 @@ fn accept_member_with_unknown_token_returns_false() {
             // drain nk connections
             while let Ok(p) = nk_rx.recv() {
                 let kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(p, kp2); });
+                std::thread::spawn(move || { if let Ok(sess) = hush_noise::session_nk::accept(p, kp2) {
+                if sess.receive().is_ok() {
+                    let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                }
+            } });
             }
         });
     }

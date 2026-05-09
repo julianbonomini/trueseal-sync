@@ -7,7 +7,7 @@ use hush_noise::{keypair::Keypair, session_xx::accept};
 use crate::device::DeviceKeypair;
 use crate::envelope::Envelope;
 use crate::operation_log::MemLog;
-use crate::relay::{parse, MsgType};
+use crate::relay::{frame, parse, MsgType};
 use crate::store::{PersistentLog, Store};
 
 use super::super::test_helpers::*;
@@ -29,7 +29,9 @@ fn push_sync_appends_and_marks_delivered() {
                 let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
                 std::thread::spawn(move || {
                     if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
-                        let _ = sess.receive();
+                        if sess.receive().is_ok() {
+                            let _ = sess.send(&frame(MsgType::Ack, &[]));
+                        }
                     }
                 });
             }
@@ -95,9 +97,12 @@ fn undelivered_entries_replayed_after_reconnect() {
                     if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
-                                if let Ok(env) = Envelope::decode(body) {
-                                    rx2.lock().unwrap().push(env);
+                                if body.len() >= 32 {
+                                    if let Ok(env) = Envelope::decode(&body[32..]) {
+                                        rx2.lock().unwrap().push(env);
+                                    }
                                 }
+                                let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }
                         }
                     }
@@ -255,6 +260,7 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
                 std::thread::spawn(move || {
                     if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
                         if sess.receive().is_ok() {
+                            let _ = sess.send(&frame(MsgType::Ack, &[]));
                             let (lock, cvar) = &*rr2;
                             *lock.lock().unwrap() += 1;
                             cvar.notify_all();
@@ -339,15 +345,17 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
     )
     .expect("session2");
 
-    // Wait until relay2 receives both replayed pushes (structural, not sleep).
-    {
-        let (lock, cvar) = &*relay2_received;
-        let result = cvar
-            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |n| *n < 2)
-            .unwrap();
-        assert!(!result.1.timed_out(), "relay must receive both replayed blobs within 5s");
-        assert_eq!(*result.0, 2, "relay received exactly 2 pushes");
-    }
+    // Wait until outbox is empty — both entries marked delivered after replay.
+    // This is the correct signal: outbox drain happens in the reconnect thread
+    // after push_send receives the Ack, which is strictly after the relay
+    // increments relay2_received. Waiting on relay count first would race.
+    wait_for(
+        || session2.op_log.lock().unwrap().undelivered_entries().is_empty(),
+        Duration::from_secs(5),
+    );
+    // Verify the relay also received both replayed blobs.
+    let (lock, _) = &*relay2_received;
+    assert_eq!(*lock.lock().unwrap(), 2, "relay received exactly 2 pushes");
 
     // Outbox must be empty after replay.
     let undelivered = session2.op_log.lock().unwrap().undelivered_entries();

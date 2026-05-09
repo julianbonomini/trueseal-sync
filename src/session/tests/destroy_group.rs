@@ -24,7 +24,11 @@ fn destroy_group_fires_on_group_destroyed_on_initiator() {
             let _ = hush_noise::session_xx::accept(pipe_relay, kp);
             while let Ok(p) = nk_rx.recv() {
                 let kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(p, kp2); });
+                std::thread::spawn(move || { if let Ok(sess) = hush_noise::session_nk::accept(p, kp2) {
+                if sess.receive().is_ok() {
+                    let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                }
+            } });
             }
         });
     }
@@ -130,7 +134,11 @@ fn push_sync_after_destroy_returns_group_destroyed() {
             let _ = hush_noise::session_xx::accept(pipe_relay, kp);
             while let Ok(p) = nk_rx.recv() {
                 let kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(p, kp2); });
+                std::thread::spawn(move || { if let Ok(sess) = hush_noise::session_nk::accept(p, kp2) {
+                if sess.receive().is_ok() {
+                    let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                }
+            } });
             }
         });
     }
@@ -226,7 +234,11 @@ fn on_group_destroyed_callback_wipes_store() {
             let _ = hush_noise::session_xx::accept(pipe_relay, kp);
             while let Ok(p) = nk_rx.recv() {
                 let kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(p, kp2); });
+                std::thread::spawn(move || { if let Ok(sess) = hush_noise::session_nk::accept(p, kp2) {
+                if sess.receive().is_ok() {
+                    let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                }
+            } });
             }
         });
     }

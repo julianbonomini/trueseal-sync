@@ -115,7 +115,13 @@ fn accept_pair_without_window_returns_false() {
         // drain nk_rx so push_factory doesn't block if accidentally called
         while let Ok(pipe) = nk_rx.recv() {
             let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-            std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(pipe, kp); });
+            std::thread::spawn(move || {
+                if let Ok(sess) = hush_noise::session_nk::accept(pipe, kp) {
+                    if sess.receive().is_ok() {
+                        let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                    }
+                }
+            });
         }
     });
 
