@@ -34,6 +34,10 @@ pub enum RelayError {
     /// Non-retryable — the outbox must not replay this blob.
     #[error("envelope too large")]
     EnvelopeTooLarge,
+    /// The relay permanently rejected the blob (e.g. oversized, malformed).
+    /// Non-retryable — the outbox must not replay this blob indefinitely.
+    #[error("push rejected by relay")]
+    PushRejected,
 }
 
 /// Wire protocol framing over the Noise session.
@@ -51,6 +55,10 @@ pub(crate) enum MsgType {
     /// NK already authenticates the relay so a well-formed Ack is sufficient proof.
     /// hush-sync accepts any body length defensively but the relay always sends 0 bytes.
     Ack       = 0x04,
+    /// Relay → client. Body: empty (0 bytes).
+    /// Semantic: the relay permanently rejected the blob (e.g. oversized envelope).
+    /// The sender must NOT retry — `push_send` returns `RelayError::PushRejected`.
+    Error     = 0x05,
 }
 
 impl MsgType {
@@ -60,6 +68,7 @@ impl MsgType {
             0x02 => Some(Self::Deliver),
             0x03 => Some(Self::Heartbeat),
             0x04 => Some(Self::Ack),
+            0x05 => Some(Self::Error),
             _ => None,
         }
     }
@@ -371,6 +380,7 @@ pub fn push_send<T: Read + Write + Send>(
         .map_err(|_| RelayError::PushFailed("expected Ack, connection closed".into()))?;
     match parse(&raw) {
         Some((MsgType::Ack, _)) => {}
+        Some((MsgType::Error, _)) => return Err(RelayError::PushRejected),
         _ => return Err(RelayError::PushFailed("expected Ack".into())),
     }
     session.close().ok();
@@ -547,6 +557,44 @@ mod tests {
         assert!(
             matches!(result, Err(RelayError::EnvelopeTooLarge)),
             "expected EnvelopeTooLarge, got {:?}",
+            result
+        );
+    }
+
+    /// push_send returns PushRejected when relay sends an Error frame.
+    #[test]
+    fn push_send_returns_push_rejected_on_error_frame() {
+        use hush_noise::keypair::generate_keypair;
+        use hush_noise::session_nk::accept as nk_accept;
+
+        let relay_kp = generate_keypair();
+        let relay_pub = relay_kp.public_key;
+
+        let (client_pipe, relay_pipe) = mem_pipe_pair();
+
+        // Stub relay: completes NK handshake, then immediately sends an Error frame.
+        std::thread::spawn(move || {
+            let relay_kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+            let session = nk_accept(relay_pipe, relay_kp2).unwrap();
+            let _ = session.receive(); // drain the Push
+            let _ = session.send(&frame(MsgType::Error, &[]));
+        });
+
+        let sender = DeviceKeypair::generate();
+        let recipient = DeviceKeypair::generate();
+        let msg = Message::Sync { body: b"test".to_vec() };
+        let blob = build_push_blob(
+            &msg,
+            recipient.public_key(),
+            1,
+            vec![],
+            &sender.signing_keypair(),
+        ).expect("build_push_blob should succeed");
+
+        let result = push_send(client_pipe, relay_pub, blob);
+        assert!(
+            matches!(result, Err(RelayError::PushRejected)),
+            "expected PushRejected, got {:?}",
             result
         );
     }
