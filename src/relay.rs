@@ -32,8 +32,12 @@ pub enum RelayError {
 #[repr(u8)]
 #[derive(PartialEq)]
 pub(crate) enum MsgType {
-    Push = 0x01,
-    Deliver = 0x02,
+    Push      = 0x01,
+    Deliver   = 0x02,
+    Heartbeat = 0x03,
+    /// Relay → client. Body: 8 bytes, u64 BE — sequence of the persisted Envelope.
+    /// Semantic: "persisted to InboxStore" — not "received bytes" (ADR-0019).
+    Ack       = 0x04,
 }
 
 impl MsgType {
@@ -41,6 +45,8 @@ impl MsgType {
         match v {
             0x01 => Some(Self::Push),
             0x02 => Some(Self::Deliver),
+            0x03 => Some(Self::Heartbeat),
+            0x04 => Some(Self::Ack),
             _ => None,
         }
     }
@@ -204,7 +210,12 @@ pub fn build_push_blob(
     let author_pub = author_signing.public_key_bytes();
     let payload = crypto::encrypt(recipient_pub, author_pub, &plaintext);
     let envelope = Envelope::build(sequence, parents, recipient_pub, author_signing, payload);
-    let body = envelope.encode();
+    let envelope_bytes = envelope.encode();
+    // Push body layout (ADR-0019): [recipient_pub: 32 bytes][envelope_proto: variable].
+    // Relay reads body[0..32] as inbox routing key without proto decode.
+    let mut body = Vec::with_capacity(32 + envelope_bytes.len());
+    body.extend_from_slice(&recipient_pub.0);
+    body.extend_from_slice(&envelope_bytes);
     frame(MsgType::Push, &body)
 }
 
@@ -282,7 +293,12 @@ fn run_loop<T: Read + Write + Send + 'static>(
                             }
                         }
                     }
+                } else if let Some((MsgType::Heartbeat, _)) = parse(&raw) {
+                    // Echo Heartbeat back to keep the Receive Session alive (ADR-0019).
+                    let _ = session.send(&frame(MsgType::Heartbeat, &[]));
                 }
+                // MsgType::Ack on XX session: silently drop (defensive — all
+                // pushes use NK sessions; Ack should never appear here).
             }
         }
     }
@@ -308,25 +324,38 @@ impl RelayClient<TcpStream> {
 }
 
 /// Opens a fresh Noise NK push session, sends `blob` as a framed Push message,
-/// closes the session immediately, and returns the ephemeral public key used.
+/// waits for an Ack from the relay (ADR-0019), then closes the session.
 ///
-/// The relay sees this ephemeral key but cannot link it to the device's stable
-/// noise identity — a fresh keypair is generated on every call (ADR-0018 / #51).
+/// The relay sends `Ack` after persisting the Envelope to the InboxStore —
+/// "bytes written" is not sufficient; we block until persistence is confirmed.
+///
+/// The relay is authenticated via NK (client verified relay static key), so a
+/// well-formed Ack is accepted without sequence validation.
+///
+/// The relay sees only the ephemeral key — a fresh keypair is generated on
+/// every call and discarded after the session (ADR-0018 / #51).
 pub fn push_send<T: Read + Write + Send>(
     transport: T,
     relay_pub: [u8; 32],
     blob: Vec<u8>,
-) -> Result<[u8; 32], RelayError> {
+) -> Result<(), RelayError> {
     use hush_noise::keypair::generate_keypair;
     let fresh_kp = generate_keypair();
-    let eph_pub = fresh_kp.public_key;
     let session = hush_noise::session_nk::dial(transport, fresh_kp, relay_pub)
         .map_err(|e| RelayError::HandshakeFailed(e))?;
     session
         .send(&blob)
         .map_err(|e| RelayError::PushFailed(e))?;
+    // Block until the relay confirms persistence (ADR-0019).
+    let raw = session
+        .receive()
+        .map_err(|_| RelayError::PushFailed("expected Ack, connection closed".into()))?;
+    match parse(&raw) {
+        Some((MsgType::Ack, _)) => {}
+        _ => return Err(RelayError::PushFailed("expected Ack".into())),
+    }
     session.close().ok();
-    Ok(eph_pub)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -417,8 +446,11 @@ mod tests {
                     Err(_) => break,
                 };
                 if let Some((MsgType::Push, body)) = parse(&raw) {
-                    if let Ok(env) = Envelope::decode(body) {
-                        received_clone.lock().unwrap().push(env);
+                    // Push body layout (ADR-0019): [recipient_pub: 32][envelope_proto: ...]
+                    if body.len() >= 32 {
+                        if let Ok(env) = Envelope::decode(&body[32..]) {
+                            received_clone.lock().unwrap().push(env);
+                        }
                     }
                 }
             }
@@ -587,8 +619,10 @@ mod tests {
                         Err(_) => break,
                     };
                     if let Some((MsgType::Push, body)) = parse(&raw) {
-                        let deliver = frame(MsgType::Deliver, body);
-                        let _ = sess_a.send(&deliver);
+                        if body.len() >= 32 {
+                            let deliver = frame(MsgType::Deliver, &body[32..]);
+                            let _ = sess_a.send(&deliver);
+                        }
                     }
                 }
             });

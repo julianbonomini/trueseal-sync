@@ -75,7 +75,13 @@ fn join_group_invalid_token_returns_error() {
         let _ = hush_noise::session_xx::accept(pipe_relay, relay_kp2);
         while let Ok(p) = nk_rx2.recv() {
             let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-            std::thread::spawn(move || { let _ = hush_noise::session_nk::accept(p, kp); });
+            std::thread::spawn(move || {
+                if let Ok(sess) = hush_noise::session_nk::accept(p, kp) {
+                    if sess.receive().is_ok() {
+                        let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                    }
+                }
+            });
         }
     });
 
