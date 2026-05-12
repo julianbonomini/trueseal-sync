@@ -265,9 +265,13 @@ impl HushFfiSession {
         Ok(Arc::new(Self { inner }))
     }
 
-    /// Opens a 60-second pairing window and returns an opaque base64url token.
+    /// Opens a pairing window and returns an opaque base64url token.
+    /// The window stays open until either `acceptMember()` is called (single-use:
+    /// the window closes after the first accept) or the caller explicitly calls
+    /// `cancelPairing()`. There is no auto-expiry — the caller controls lifetime
+    /// by closing the pairing UI and calling `cancelPairing()` on dismiss (ADR-0021).
     /// The token encodes `noise_pub || signing_pub || device_name` — pass it to
-    /// the peer's `join_group(token)` call.  Single-use; expires with the window.
+    /// the peer's `joinGroup(token)` call.
     pub fn pairing_token(&self) -> String {
         self.inner.pairing_token()
     }

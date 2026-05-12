@@ -73,8 +73,9 @@ fn accept_pair_outside_window_is_noop() {
     assert!(!session.accept_pair(dummy, dummy_signing));
 }
 
+/// Window stays open until cancelled — no auto-expiry (ADR-0021).
 #[test]
-fn accept_pair_after_timeout_is_noop() {
+fn accept_pair_window_stays_open_until_cancelled() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
@@ -86,14 +87,15 @@ fn accept_pair_after_timeout_is_noop() {
     let device = DeviceKeypair::generate();
     let session = HushSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, || Err("push factory unused in pairing test".into())).expect("connect");
 
-    let _token = session.pairing_token_with_duration(Duration::from_millis(1));
+    let _token = session.pairing_token();
+    // Sleep well beyond the old 60-second auto-expiry — window must still be open.
     std::thread::sleep(Duration::from_millis(10));
 
     let dummy = NoisePublicKey(make_relay_kp().public_key);
     let dummy_signing = crate::keys::SigningPublicKey([0u8; 32]);
     assert!(
-        !session.accept_pair(dummy, dummy_signing),
-        "expired window: should return false"
+        session.accept_pair(dummy, dummy_signing),
+        "window must still be open after delay — no auto-expiry"
     );
 }
 

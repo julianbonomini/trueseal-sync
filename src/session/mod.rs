@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use hush_noise::keypair::Keypair as NoiseKeypair;
@@ -24,7 +24,7 @@ use crate::message::{device_name, Message};
 use crate::operation_log::{MemLog, OperationLog};
 use crate::relay::{build_push_blob, push_send, RelayClient};
 
-const DEFAULT_PAIRING_WINDOW: Duration = Duration::from_secs(60);
+
 const DEFAULT_RECONNECT_CAP: Duration = Duration::from_secs(30);
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -60,13 +60,14 @@ pub enum SessionError {
 
 // ── Internal types ────────────────────────────────────────────────────────────
 
-pub(super) struct PairingWindow {
-    deadline: Instant,
-}
+/// An open pairing window — present means open, absent means closed.
+/// Lifetime is caller-controlled: open on `pairing_token()`, closed on
+/// `accept_pair()` (single-use) or explicit `cancel_pairing()` (ADR-0021).
+pub(super) struct PairingWindow;
 
 impl PairingWindow {
     fn is_open(&self) -> bool {
-        Instant::now() < self.deadline
+        true
     }
 }
 
@@ -759,13 +760,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     /// `noise_pub || signing_pub || device_name`.
     /// The token is single-use and expires when the window closes.
     pub fn pairing_token(&self) -> String {
-        self.pairing_token_with_duration(DEFAULT_PAIRING_WINDOW)
-    }
-
-    pub fn pairing_token_with_duration(&self, duration: Duration) -> String {
-        *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = Some(PairingWindow {
-            deadline: Instant::now() + duration,
-        });
+        *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = Some(PairingWindow);
         let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         crate::message::pairing_token(&ks.noise_pub.0, &ks.signing_pub.0)
     }
