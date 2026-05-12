@@ -133,7 +133,7 @@ impl HushFfiSession {
     ///
     /// - `base_dir`: directory where the SQLite database is stored
     /// - `namespace`: scopes the database file; one session per namespace
-    /// - `relay_addr`: TCP address, e.g. `"relay.example.com:4433"`
+    /// - `relay_host`: relay hostname or IP, e.g. `"relay.example.com"` (no port — ports are managed internally)
     /// - `relay_pub`: 32-byte X25519 relay public key (wrong length → `InvalidRelayPublicKey`)
     /// - `on_message`: called for every inbound `Sync` message
     ///
@@ -144,7 +144,7 @@ impl HushFfiSession {
     pub fn create(
         base_dir: String,
         namespace: String,
-        relay_addr: String,
+        relay_host: String,
         relay_pub: Vec<u8>,
         on_message: Box<dyn MessageCallback>,
         on_removed_from_group: Box<dyn RemovedFromGroupCallback>,
@@ -209,7 +209,9 @@ impl HushFfiSession {
             })?,
         ));
 
-        let relay_addr_factory = relay_addr.clone();
+        let receive_addr = format!("{}:7700", relay_host);
+        let push_addr = format!("{}:7701", relay_host);
+        let relay_addr_factory = receive_addr.clone();
         let inner = HushSession::connect_background(
             relay_pub_key,
             keypair,
@@ -243,8 +245,8 @@ impl HushFfiSession {
                 let _ = wipe_store.lock().unwrap_or_else(|e| e.into_inner()).wipe();
                 on_group_destroyed.on_group_destroyed();
             },
-            move || TcpStream::connect(&relay_addr_factory).map_err(|e| e.to_string()), // transport_factory
-            move || TcpStream::connect(&relay_addr).map_err(|e| e.to_string()), // push_factory (NK, ADR-0018)
+            move || TcpStream::connect(&relay_addr_factory).map_err(|e| e.to_string()), // transport_factory (XX, :7700)
+            move || TcpStream::connect(&push_addr).map_err(|e| e.to_string()), // push_factory (NK, :7701)
             None, // use default 30-second cap
             on_connection_changed.map(|cb| -> Box<dyn Fn(bool) + Send + Sync + 'static> {
                 Box::new(move |connected| cb.on_connection_changed(connected))
@@ -456,7 +458,7 @@ mod tests {
             let result = HushFfiSession::create(
                 dir.path().to_string_lossy().into_owned(),
                 bad.to_string(),
-                "relay.example.com:4433".into(),
+                "relay.example.com".into(),
                 relay_pub.clone(),
                 Box::new(NoopMsg),
                 Box::new(NoopRfg),

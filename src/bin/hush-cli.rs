@@ -126,14 +126,19 @@ fn main() {
             io::stdout().flush().ok();
         },
         // transport_factory — opens the XX receive session.
-        // set_nonblocking so the conn Mutex is not held across blocking reads,
-        // allowing concurrent sends (e.g. DeliverAck) to interleave.
+        // Non-blocking mode is required: with a blocking TcpStream the conn
+        // Mutex would be held for the entire duration of each read() syscall,
+        // starving concurrent send() calls (e.g. DeliverAck). In non-blocking
+        // mode read() returns WouldBlock immediately when no data is present,
+        // the lock is released, and send() can proceed.
         move || {
             let s = TcpStream::connect(&recv_addr).map_err(|e| e.to_string())?;
             s.set_nonblocking(true).map_err(|e| e.to_string())?;
             Ok(s)
         },
         // push_factory — opens NK push sessions.
+        // NK sessions are sequential (send then receive), so blocking mode
+        // would also work here, but non-blocking is consistent and harmless.
         move || {
             let s = TcpStream::connect(&push_addr_cb).map_err(|e| e.to_string())?;
             s.set_nonblocking(true).map_err(|e| e.to_string())?;
