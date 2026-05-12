@@ -7,7 +7,7 @@ license = "MIT"
 publish = false
 
 [lib]
-crate-type = ["cdylib", "lib"]
+crate-type = ["cdylib", "staticlib", "lib"]
 
 [dependencies]
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -19,7 +19,13 @@ thiserror = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64 = "0.22"
 prost = "0.13"
-tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "io-util"] }
+tokio = { version = "1", features = [
+  "net",
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "io-util",
+] }
 hush-noise = { path = "../hush-noise/rust" }
 uniffi = { version = "0.28", features = ["tokio", "cli"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
