@@ -166,3 +166,38 @@ fn no_callback_fired_when_window_closed() {
     assert!(!admitted);
     assert!(!*fired.lock().unwrap());
 }
+
+/// cancel_pairing clears pending_members so stale tokens can't be used later.
+#[test]
+fn cancel_pairing_clears_pending_members() {
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+    std::thread::spawn(move || { let _ = accept(pipe_relay, relay_kp2); });
+
+    let device = DeviceKeypair::generate();
+    let session = HushSession::connect(
+        pipe_client, relay_pub, device, |_, _, _| {},
+        || Err("push factory unused".into()),
+    ).expect("connect");
+
+    // Open window, inject a fake pending member directly.
+    let _token = session.pairing_token();
+    let fake_token = "fake-token".to_string();
+    session.pending_members.lock().unwrap().insert(
+        fake_token.clone(),
+        super::super::PendingMember {
+            noise_pub: crate::keys::NoisePublicKey([1u8; 32]),
+            signing_pub: crate::keys::SigningPublicKey([2u8; 32]),
+        },
+    );
+    assert!(!session.pending_members.lock().unwrap().is_empty(), "setup: token must be present");
+
+    session.cancel_pairing();
+
+    assert!(
+        session.pending_members.lock().unwrap().is_empty(),
+        "cancel_pairing must clear pending_members"
+    );
+}

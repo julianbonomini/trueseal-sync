@@ -425,9 +425,7 @@ fn removed_member_no_longer_receives_fanout_blobs() {
 
     let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, b_noise, b_signing);
     session_a.set_manifest(v1.clone());
-    session_b.set_manifest(make_two_member_manifest(
-        b_noise, b_signing, &b_sk, a_noise, a_signing,
-    ));
+    session_b.set_manifest(v1);
 
     // A removes B.
     session_a.remove_member(b_signing).expect("remove_member");

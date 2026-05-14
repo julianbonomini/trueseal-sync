@@ -707,6 +707,7 @@ dependencies = [
  "thiserror",
  "uniffi",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -718,6 +719,7 @@ dependencies = [
  "ed25519-dalek",
  "hkdf",
  "hush-noise",
+ "log",
  "prost",
  "prost-build",
  "protox",

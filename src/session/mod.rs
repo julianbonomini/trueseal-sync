@@ -72,6 +72,13 @@ impl PairingWindow {
 }
 
 /// All mutable key material — replaced atomically on key rotation.
+///
+/// TODO(P4): `noise_priv` and `signing_priv` are plain byte arrays and are NOT
+/// zeroized on drop. An attacker with process-memory read access could extract
+/// the private keys from heap. Fix: derive `zeroize::ZeroizeOnDrop` on this
+/// struct (add `zeroize` crate feature `zeroize_derive`, wrap fields in
+/// `Zeroizing<[u8;32]>`). Low urgency on current platforms (iOS/macOS sandbox
+/// provides OS-level memory protection), but expected by any security audit.
 pub(super) struct KeyState {
     pub noise_priv: [u8; 32],
     pub noise_pub_key: [u8; 32],
@@ -114,10 +121,10 @@ pub struct HushSession<T: Read + Write + Send + 'static> {
     keys: Arc<Mutex<KeyState>>,
     sequence: Arc<Mutex<u64>>,
     pairing: Arc<Mutex<Option<PairingWindow>>>,
-    pub op_log: Arc<Mutex<Box<dyn OperationLog>>>,
+    pub(crate) op_log: Arc<Mutex<Box<dyn OperationLog>>>,
     /// Current group membership record. `None` means not yet in any group.
     /// Updated atomically when a valid higher-version GroupManifest is received.
-    pub manifest: Arc<Mutex<Option<GroupManifest>>>,
+    pub(crate) manifest: Arc<Mutex<Option<GroupManifest>>>,
     /// Fired when an inbound GroupManifest excludes the local device.
     on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static>,
     /// Fired whenever the local manifest changes (inbound update or accept_pair).
@@ -747,6 +754,10 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
             }
         };
         for peer in peers {
+            // TODO(P1): Revoke is not queued to the outbox. If the relay is unreachable
+            // at this moment, peers will never know the group was destroyed. Fix: add
+            // control-plane messages (Revoke, GroupManifest) to the outbox with a
+            // non-Sync message type tag, and replay them on reconnect.
             let _ = self.push_message(&Message::Revoke, peer);
         }
         *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -767,6 +778,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
     pub fn cancel_pairing(&self) {
         *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.pending_members.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Admit a device; requires both noise and signing pub keys.
@@ -857,6 +869,9 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         }
 
         // Push GroupManifest to all existing members (excluding self).
+        // TODO(P1): GroupManifest pushes are not queued to the outbox. If the relay is
+        // unreachable here, the new member never receives the manifest and cannot sync.
+        // Fix: queue control-plane messages to the outbox alongside Sync messages.
         let msg = Message::GroupManifest {
             manifest: new_manifest,
         };
@@ -873,6 +888,14 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
     ///
     /// The callback receives `(token, name)`. The caller passes `token` back to
     /// [`Self::accept_member`] to admit the device.
+    ///
+    /// TODO(P6): This callback is registered post-construction whereas `on_message`,
+    /// `on_removed_from_group`, and `on_group_destroyed` are constructor params. There
+    /// is a window between construction and this call where an inbound Pair message
+    /// would be queued to `pending_members` but `on_member_request` would not fire.
+    /// In practice this window is closed before the relay delivers any message, but
+    /// the asymmetry is surprising. Fix: move all callbacks to the constructor or
+    /// make all of them post-construction setters.
     pub fn set_on_member_request(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
         *self.on_member_request.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(cb));
     }
@@ -964,6 +987,9 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
         let msg = Message::GroupManifest {
             manifest: new_manifest,
         };
+        // TODO(P1): GroupManifest pushes from remove_member are not queued to the
+        // outbox. If delivery fails, the removed member is never notified and
+        // remaining members don't converge. Fix: outbox support for control-plane messages.
         // Push to remaining members (excluding self).
         for peer in &notify {
             let _ = self.push_message(&msg, *peer);
@@ -992,10 +1018,6 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
                 .ok_or(SessionError::MemberNotFound)?
         };
         self.remove_member(target)
-    }
-
-    pub fn cancel_pairing_window(&self) {
-        self.cancel_pairing();
     }
 
     // ── Manifest helpers ──────────────────────────────────────────────────────

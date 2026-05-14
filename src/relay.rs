@@ -207,16 +207,6 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         }
     }
 
-    /// Blocking receive loop — now a no-op since run() is started automatically in connect().
-    /// Kept for API compatibility; returns immediately.
-    ///
-    /// Note: the actual receive loop runs in the background thread started by connect().
-    pub fn run(&self) -> Result<(), RelayError> {
-        // The real loop is in the background thread. This stub exists so callers
-        // that previously called run() in a background thread continue to compile.
-        // They can drop the spawned thread handle — the work happens automatically.
-        Ok(())
-    }
 }
 
 /// Build and frame a Push blob without sending it.

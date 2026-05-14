@@ -41,6 +41,8 @@ pub enum ManifestError {
     InvalidSignature,
     #[error("version regression: incoming {incoming} <= current {current}")]
     VersionRegression { incoming: u64, current: u64 },
+    #[error("group id mismatch: incoming manifest belongs to a different group")]
+    GroupIdMismatch,
     #[error("unknown issuer: issued_by not in previous manifest members")]
     UnknownIssuer,
 }
@@ -92,6 +94,9 @@ impl GroupManifest {
 
         // Check issuer is in previous manifest (skip for genesis)
         if let Some(prev) = previous {
+            if self.group_id != prev.group_id {
+                return Err(ManifestError::GroupIdMismatch);
+            }
             if self.version <= prev.version {
                 return Err(ManifestError::VersionRegression {
                     incoming: self.version,
@@ -332,6 +337,23 @@ mod tests {
         assert!(matches!(
             v1b.verify(Some(&v1a)),
             Err(ManifestError::VersionRegression { .. })
+        ));
+    }
+
+    #[test]
+    fn group_id_mismatch_rejected() {
+        let key_a = make_signing_key();
+        let member_a = make_member(&key_a);
+        let group_id_1 = new_group_id();
+        let group_id_2 = new_group_id();
+
+        let v1 = GroupManifest::new(group_id_1, 1, vec![member_a.clone()], &key_a);
+        // v2 issued by a valid member but with a different group_id — must be rejected.
+        let v2 = GroupManifest::new(group_id_2, 2, vec![member_a.clone()], &key_a);
+
+        assert!(matches!(
+            v2.verify(Some(&v1)),
+            Err(ManifestError::GroupIdMismatch)
         ));
     }
 

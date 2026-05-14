@@ -330,7 +330,11 @@ fn revoke_from_unknown_device_is_ignored() {
         .push_message(&Message::Revoke, session_a.noise_pub())
         .expect("stranger push");
 
-    // Give the message time to arrive, then assert it was dropped.
+    // Negative assertion: we must wait long enough for the message to arrive
+    // and be processed, then confirm the callback never fired.
+    // wait_for() is not usable here (it panics on timeout; we expect timeout).
+    // Instead sleep briefly — the stranger's push + relay round-trip is <10ms
+    // in practice; 200ms is a 20x margin.
     std::thread::sleep(Duration::from_millis(200));
 
     assert_eq!(

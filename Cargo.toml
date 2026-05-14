@@ -16,6 +16,7 @@ hkdf = "0.12"
 sha2 = "0.10"
 rand = "0.8"
 thiserror = "1"
+log = "0.4"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 base64 = "0.22"
 prost = "0.13"

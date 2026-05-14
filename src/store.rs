@@ -1,4 +1,5 @@
 use std::path::Path;
+use log::warn;
 use thiserror::Error;
 
 use crate::device::DeviceKeypair;
@@ -219,19 +220,23 @@ impl PersistentLog {
 impl OperationLog for PersistentLog {
     fn append(&mut self, object_id: &[u8; 32], sequence: u64, blob: Vec<u8>) {
         // UNIQUE(object_id, sequence) ON CONFLICT IGNORE — duplicate is a no-op.
-        let _ = self.store.conn.execute(
+        if let Err(e) = self.store.conn.execute(
             "INSERT INTO outbox (object_id, sequence, blob, delivered)
              VALUES (?1, ?2, ?3, 0)",
             rusqlite::params![object_id.as_slice(), sequence as i64, blob.as_slice()],
-        );
+        ) {
+            warn!("[hush-sync] outbox append failed (seq={sequence}): {e}");
+        }
     }
 
     fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64) {
-        let _ = self.store.conn.execute(
+        if let Err(e) = self.store.conn.execute(
             "UPDATE outbox SET delivered = 1
              WHERE object_id = ?1 AND sequence = ?2",
             rusqlite::params![object_id.as_slice(), sequence as i64],
-        );
+        ) {
+            warn!("[hush-sync] outbox mark_delivered failed (seq={sequence}): {e}");
+        }
     }
 
     fn undelivered_entries(&self) -> Vec<LogEntry> {
