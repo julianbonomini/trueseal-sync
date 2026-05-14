@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::device::DeviceKeypair;
 use crate::keys::NoisePublicKey;
+use crate::member::{member_id, member_name};
 use crate::message::Message;
 use crate::session::{HushSession, SessionError as CoreSessionError};
 use crate::store::{PersistentLog, Store};
@@ -330,6 +331,20 @@ impl HushFfiSession {
     /// Close the pairing window without admitting any device.
     pub fn cancel_pairing(&self) {
         self.inner.cancel_pairing();
+    }
+
+    /// Stable opaque identifier for the local device.
+    /// Derived from the local signing public key — identical to the `id`
+    /// field this device would have in a remote device's `members()` list.
+    pub fn local_node_id(&self) -> String {
+        member_id(&self.inner.signing_pub())
+    }
+
+    /// Auto-generated display name for the local device.
+    /// Derived from the local signing public key — identical to the `name`
+    /// field this device would have in a remote device's `members()` list.
+    pub fn local_device_name(&self) -> String {
+        member_name(&self.inner.signing_pub())
     }
 
     /// List remote group members (excludes the local device).
