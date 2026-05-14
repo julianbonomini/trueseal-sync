@@ -1,10 +1,10 @@
-# hush-sync: Design Philosophy
+# trueseal-sync: Design Philosophy
 
 ## What this is
 
-hush-sync is a sync primitive. Not a messaging app, not a database, not a platform. A primitive — the smallest useful building block for encrypted, local-first data sync between trusted devices.
+trueseal-sync is a sync primitive. Not a messaging app, not a database, not a platform. A primitive — the smallest useful building block for encrypted, local-first data sync between trusted devices.
 
-The measure of a good primitive is not how many features it has. It's how cleanly it disappears. When you build on hush-sync, you should be thinking about your app, not about encryption, not about key management, not about network reliability. hush-sync handles all of that. You handle what your app means.
+The measure of a good primitive is not how many features it has. It's how cleanly it disappears. When you build on trueseal-sync, you should be thinking about your app, not about encryption, not about key management, not about network reliability. trueseal-sync handles all of that. You handle what your app means.
 
 ---
 
@@ -34,7 +34,7 @@ No single device is load-bearing. Any device can be offline. The library detects
 
 ### We started with a working implementation
 
-hush-sync already had E2EE, Noise XX sessions, pairing, revocation, and an outbox. The crypto was correct. The relay was zero-knowledge. The reconnect logic was solid.
+trueseal-sync already had E2EE, Noise XX sessions, pairing, revocation, and an outbox. The crypto was correct. The relay was zero-knowledge. The reconnect logic was solid.
 
 But the caller API was leaking internals. To use the library, you needed to understand the difference between a noise_pub and a signing_pub. You needed to manage 64-byte keypairs yourself. You needed to know what an operation log was and persist it. The first principles were in the implementation, but not in the interface.
 
@@ -70,7 +70,7 @@ Every decision was made by asking: does the caller need to know this? Usually th
 What remained after removing everything the caller does not need to know:
 
 ```swift
-HushFfiSession.create(relayUrl, relayPublicKey, namespace, ...callbacks)
+TruesealFfiSession.create(relayUrl, relayPublicKey, namespace, ...callbacks)
 session.pairingToken() -> String
 session.joinGroup(token: String)
 session.acceptMember(token: String)
@@ -84,11 +84,11 @@ That is the entire surface area. A developer who has never heard of Noise XX, Ed
 
 ### We added namespace for spaces without building spaces
 
-One device, one keypair, one group, one session — that is the v0 model. Spaces (one device in multiple independent groups) are not implemented. But they are not foreclosed. The `namespace` parameter scopes the SQLite database to a string. A caller who wants spaces creates one `HushFfiSession` per namespace. The library does not need to know about spaces. The caller composes multiple sessions. This cost nothing to add and keeps a real use case permanently open.
+One device, one keypair, one group, one session — that is the v0 model. Spaces (one device in multiple independent groups) are not implemented. But they are not foreclosed. The `namespace` parameter scopes the SQLite database to a string. A caller who wants spaces creates one `TruesealFfiSession` per namespace. The library does not need to know about spaces. The caller composes multiple sessions. This cost nothing to add and keeps a real use case permanently open.
 
 ---
 
-## What hush-sync is not
+## What trueseal-sync is not
 
 **Not a messaging primitive.** There is no point-to-point send, no read receipts, no message history API. If you need those things, build them on top using `send()` and your own data model.
 
@@ -96,17 +96,17 @@ One device, one keypair, one group, one session — that is the v0 model. Spaces
 
 **Not an identity system.** There are no accounts, no usernames, no passwords, no registration. A device's identity is its keypair. The library generates and manages it. If you need to associate a human identity with a device, do that in your app.
 
-**Not a relay.** The relay is a separate service (hush-relay, in Go). It is stateless with respect to group membership. It is replaceable. You can self-host it. You can run it behind a CDN. hush-sync does not care which relay you use as long as the public key matches.
+**Not a relay.** The relay is a separate service (trueseal-relay, in Go). It is stateless with respect to group membership. It is replaceable. You can self-host it. You can run it behind a CDN. trueseal-sync does not care which relay you use as long as the public key matches.
 
 ---
 
 ## The boundary
 
-hush-sync is a **transport primitive with E2EE, group membership, delivery, and ordering guarantees**.
+trueseal-sync is a **transport primitive with E2EE, group membership, delivery, and ordering guarantees**.
 
 The caller is responsible for: what the bytes mean, conflict resolution, historical state bootstrapping for new members, permission hierarchies above "any member can do anything," and UI.
 
-Everything else is hush-sync's problem.
+Everything else is trueseal-sync's problem.
 
 ---
 

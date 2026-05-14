@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use hush_noise::keypair::Keypair as NoiseKeypair;
+use trueseal_noise::keypair::Keypair as NoiseKeypair;
 use thiserror::Error;
 
 use crate::device::DeviceKeypair;
@@ -105,14 +105,14 @@ pub(super) struct PendingMember {
     pub signing_pub: SigningPublicKey,
 }
 
-// ── HushSession ───────────────────────────────────────────────────────────────
+// ── TruesealSession ───────────────────────────────────────────────────────────────
 
 /// The opinionated session facade (ADR-0010 / ADR-0014).
 ///
 /// Owns the relay connection, sequence counter, signing keypair, pairing state,
 /// and current GroupManifest.
 /// Transport-generic so tests can inject in-memory pipes.
-pub struct HushSession<T: Read + Write + Send + 'static> {
+pub struct TruesealSession<T: Read + Write + Send + 'static> {
     client: Arc<Mutex<RelayClient<T>>>,
     /// Raw relay public key used as the NK push target (ADR-0018).
     relay_pub_bytes: [u8; 32],
@@ -294,7 +294,7 @@ pub(super) fn build_subscribe_handler(
     }
 }
 
-impl<T: Read + Write + Send + 'static> HushSession<T> {
+impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Current noise public key for this session.
     pub fn noise_pub(&self) -> NoisePublicKey {
         self.keys.lock().unwrap_or_else(|e| e.into_inner()).noise_pub
@@ -1044,7 +1044,7 @@ impl<T: Read + Write + Send + 'static> HushSession<T> {
 
 // ── TCP convenience constructor ───────────────────────────────────────────────
 
-impl HushSession<TcpStream> {
+impl TruesealSession<TcpStream> {
     pub fn connect_tcp(
         addr: &str,
         relay_pub: NoisePublicKey,

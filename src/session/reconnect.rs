@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use hush_noise::keypair::Keypair as NoiseKeypair;
+use trueseal_noise::keypair::Keypair as NoiseKeypair;
 
 use crate::envelope::SigningKeypair;
 use crate::keys::NoisePublicKey;

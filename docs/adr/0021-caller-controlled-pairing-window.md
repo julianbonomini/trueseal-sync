@@ -1,6 +1,6 @@
 # Pairing window is caller-controlled, not timer-based
 
-The pairing window (the period during which an incoming `Pair` message is accepted) used to auto-expire after 60 seconds from the moment `pairingToken()` was called. This caused silent failures in real pairing flows: users spending more than 60 seconds switching between devices or scanning a QR code would have their `Pair` message delivered and ack'd by the relay but silently dropped by hush-sync, with no error and no feedback.
+The pairing window (the period during which an incoming `Pair` message is accepted) used to auto-expire after 60 seconds from the moment `pairingToken()` was called. This caused silent failures in real pairing flows: users spending more than 60 seconds switching between devices or scanning a QR code would have their `Pair` message delivered and ack'd by the relay but silently dropped by trueseal-sync, with no error and no feedback.
 
 The 60-second timer is not a security requirement. Security comes from the explicit `acceptMember()` call — the human decides who to admit. The window only gates whether `onMemberRequest` fires; without an explicit accept, no one joins regardless of window state. Auto-expiry was a safety net, not a cryptographic control.
 

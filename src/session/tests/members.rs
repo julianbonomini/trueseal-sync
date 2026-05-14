@@ -5,7 +5,7 @@ use crate::member::{member_id, member_name};
 use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
-use super::super::HushSession;
+use super::super::TruesealSession;
 use super::make_two_member_manifest;
 
 /// members() returns an empty list when there is no manifest.
@@ -15,13 +15,13 @@ fn members_empty_when_no_manifest() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     {
-        let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
+            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
         });
     }
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect_full(
+    let session = TruesealSession::connect_full(
         pipe_client,
         relay_pub,
         device,
@@ -44,9 +44,9 @@ fn members_excludes_local_device() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     {
-        let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
+            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
         });
     }
 
@@ -56,7 +56,7 @@ fn members_excludes_local_device() {
     let sk = SigningKey::from_bytes(&device.signing.to_bytes());
     let remote = DeviceKeypair::generate();
 
-    let session = HushSession::connect_full(
+    let session = TruesealSession::connect_full(
         pipe_client,
         relay_pub,
         device,
@@ -94,9 +94,9 @@ fn members_id_and_name_are_stable() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     {
-        let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
+            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
         });
     }
 
@@ -106,7 +106,7 @@ fn members_id_and_name_are_stable() {
     let sk = SigningKey::from_bytes(&device.signing.to_bytes());
     let remote = DeviceKeypair::generate();
 
-    let session = HushSession::connect_full(
+    let session = TruesealSession::connect_full(
         pipe_client,
         relay_pub,
         device,

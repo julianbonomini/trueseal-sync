@@ -1,4 +1,4 @@
-# Integrating hush-sync — Concepts & Implementation Guide
+# Integrating trueseal-sync — Concepts & Implementation Guide
 
 A living document. Captures every design decision, edge case, and hard-won
 lesson from the macOS reference integration. Platform-specific notes are
@@ -9,9 +9,9 @@ Update this file whenever a new integration question is resolved.
 
 ---
 
-## 1. What hush-sync is (and isn't)
+## 1. What trueseal-sync is (and isn't)
 
-hush-sync is a **group messaging primitive**. It gives you:
+trueseal-sync is a **group messaging primitive**. It gives you:
 
 - A stable device identity (X25519 + Ed25519 keypair, persisted to SQLite)
 - Encrypted delivery of arbitrary binary blobs to all group members via a relay
@@ -32,7 +32,7 @@ It does **not** give you:
 
 ## 2. Device identity
 
-Every hush-sync session has a **permanent identity** consisting of two keypairs:
+Every trueseal-sync session has a **permanent identity** consisting of two keypairs:
 
 | Keypair | Algorithm | Purpose |
 |---------|-----------|---------|
@@ -55,7 +55,7 @@ name = ADJECTIVES[signing_pub[0] % len(ADJECTIVES)]
 
 Example outputs: `FreeMap`, `SwiftHorizon`, `AmberFalcon`.
 
-The word lists live in `hush-sync/src/member.rs`. The name is stable for the
+The word lists live in `trueseal-sync/src/member.rs`. The name is stable for the
 lifetime of the keypair — it changes only if the keypair is rotated
 (i.e. after `destroyGroup()`).
 
@@ -87,10 +87,10 @@ The relay listens on **two ports** for different Noise handshake patterns:
 | Port | Pattern | Used for |
 |------|---------|----------|
 | `:7700` | XX (mutual auth) | Device ↔ relay sessions |
-| `:7701` | NK (server-only auth) | Internal hush-sync push channel |
+| `:7701` | NK (server-only auth) | Internal trueseal-sync push channel |
 
 **Your `relayURL` should always point to `:7700`.** The `:7701` port is managed
-internally by hush-sync; never reference it in app code.
+internally by trueseal-sync; never reference it in app code.
 
 ### Relay public key
 
@@ -172,7 +172,7 @@ It is **stable for the lifetime of the keypair**. Generate it once and cache it.
 Showing the token in a QR code, displaying it as text, or copying it to the
 clipboard has no side effects.
 
-> **Note:** Early hush-sync documentation described `pairingToken()` as
+> **Note:** Early trueseal-sync documentation described `pairingToken()` as
 > "opening a 60-second pairing window". This is misleading. The token is
 > deterministic and stateless. The acceptance window (if any) is a UX concern
 > on the accepting side, not tied to token generation.
@@ -354,7 +354,7 @@ group for others:
 3. Other devices must manually remove the ghost entry
 
 This is a known limitation. A graceful leave protocol may be added in a future
-hush-sync version.
+trueseal-sync version.
 
 ---
 
@@ -390,14 +390,14 @@ so future contributors do not add FFI calls to the unit test suite.
 
 ### Always scope to your app
 
-Never use the SDK's default storage path — it may be shared across all hush-sync
+Never use the SDK's default storage path — it may be shared across all trueseal-sync
 consumers on the same machine. Two apps using the same storage path would share
 a group identity.
 
 Recommended path pattern:
 
 ```
-<platform app support dir>/<your-app-bundle-id>/HushSync/
+<platform app support dir>/<your-app-bundle-id>/TruesealSync/
 ```
 
 Create the directory before passing it to the SDK constructor.
@@ -416,14 +416,14 @@ fresh keypair and a new identity. This is the correct implementation of both
 
 #### SDK structure
 
-The Swift SDK (`hush-sync-swift`) wraps the Rust FFI (`HushSyncFFI.xcframework`)
-behind a clean public module `HushSync`. Never import `HushSyncBindings` directly
+The Swift SDK (`trueseal-sync-swift`) wraps the Rust FFI (`TruesealSyncFFI.xcframework`)
+behind a clean public module `TruesealSync`. Never import `TruesealSyncBindings` directly
 from app code.
 
 #### Construction
 
 ```swift
-let client = try HushSyncClient(
+let client = try TruesealSyncClient(
     relayURL: URL(string: "tcp://relay-host:7700")!,
     relayPublicKey: Data([/* 32-byte key */]),
     storageDirectory: appScopedStorageURL,
@@ -456,7 +456,7 @@ Both are synchronous computed properties — safe to call on any thread.
 #### Non-blocking sockets (critical)
 
 The Rust TCP transport factories must have non-blocking mode enabled. If you
-build hush-sync from source and sockets are blocking, the connection mutex will
+build trueseal-sync from source and sockets are blocking, the connection mutex will
 be held during `read()`, starving concurrent sends — manifesting as pairing
 messages that never arrive. The fix is `set_nonblocking(true)` on both transport
 factory implementations in `ffi.rs`. This was the root cause of all pairing
@@ -493,12 +493,12 @@ For a `LSUIElement = YES` menu bar app that also has a main window:
 
 **Rust global destructor double-free**: the Rust runtime crashes at test process
 teardown when the static FFI object is freed twice. This is a known issue in the
-xcframework binary. Do not use real `HushSyncClient` instances in unit tests
+xcframework binary. Do not use real `TruesealSyncClient` instances in unit tests
 (see §10).
 
 ### ADRs from the macOS reference integration
 
-Recorded in `hush-clip-macos/docs/adr/` — relevant to any client:
+Recorded in `trueseal-clip-macos/docs/adr/` — relevant to any client:
 
 | ADR | Decision |
 |-----|----------|

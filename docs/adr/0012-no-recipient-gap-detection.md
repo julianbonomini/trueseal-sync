@@ -2,7 +2,7 @@
 
 ## Decision
 
-hush-sync does not buffer or reorder Envelopes on the recipient side. Envelopes are delivered to the caller in arrival order. Gaps (missing sequence numbers from a given sender) are not detected or reported by the recipient.
+trueseal-sync does not buffer or reorder Envelopes on the recipient side. Envelopes are delivered to the caller in arrival order. Gaps (missing sequence numbers from a given sender) are not detected or reported by the recipient.
 
 ## Rationale
 
@@ -16,11 +16,11 @@ If the recipient detects a gap (sequence 5 then sequence 7 from Device A), it co
 
 ### Gap notification (without buffering) tells the caller something they cannot act on
 
-hush-sync has no request/retransmit mechanism. If the caller is told "you missed sequence 6", there is nothing they can do except wait. This is noise, not signal.
+trueseal-sync has no request/retransmit mechanism. If the caller is told "you missed sequence 6", there is nothing they can do except wait. This is noise, not signal.
 
 ### Parent hashes preserve causal ordering without sequence buffering
 
-The DAG parent hash chain (ADR-0004) lets the caller detect causal ordering independently of arrival order. If a blob references a parent the recipient hasn't seen, the caller knows the blob is causally dependent on missing state — without hush-sync needing to buffer anything.
+The DAG parent hash chain (ADR-0004) lets the caller detect causal ordering independently of arrival order. If a blob references a parent the recipient hasn't seen, the caller knows the blob is causally dependent on missing state — without trueseal-sync needing to buffer anything.
 
 ## Consequences
 

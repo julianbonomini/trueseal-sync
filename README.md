@@ -1,9 +1,9 @@
-# hush-sync
+# trueseal-sync
 
 E2EE sync engine for trusted device groups. Handles device identity, pairing, group membership, encrypted fan-out to all members, and guaranteed delivery across disconnects — without a server that can read any of it.
 
 ```
-your app → hush-sync → hush-relay (dumb router; sees only ciphertext)
+your app → trueseal-sync → trueseal-relay (dumb router; sees only ciphertext)
 ```
 
 ---
@@ -12,9 +12,9 @@ your app → hush-sync → hush-relay (dumb router; sees only ciphertext)
 
 | Platform | Repo | Status |
 |---|---|---|
-| Swift (iOS + macOS) | [hush-sync-swift](../hush-sync-swift) | ✅ Available |
-| Kotlin (Android) | [hush-sync-kotlin](../hush-sync-kotlin) | ✅ Available |
-| TypeScript / Node | [hush-sync-ts](../hush-sync-ts) | ✅ Available |
+| Swift (iOS + macOS) | [trueseal-sync-swift](../trueseal-sync-swift) | ✅ Available |
+| Kotlin (Android) | [trueseal-sync-kotlin](../trueseal-sync-kotlin) | ✅ Available |
+| TypeScript / Node | [trueseal-sync-ts](../trueseal-sync-ts) | ✅ Available |
 | Rust (direct) | this repo | ✅ Available |
 
 The SDKs wrap the compiled native library via UniFFI — no Rust toolchain required in your app project.
@@ -63,7 +63,7 @@ destroyGroup()            → full reset: Revoke to all members, local state wip
 
 ## Relay
 
-You need a running [hush-relay](../hush-relay) and its static public key. Pass the hostname and the 32-byte public key to `create()`. The relay is zero-knowledge: it routes ciphertext, holds blobs for offline recipients (30-day TTL), and has no concept of group membership.
+You need a running [trueseal-relay](../trueseal-relay) and its static public key. Pass the hostname and the 32-byte public key to `create()`. The relay is zero-knowledge: it routes ciphertext, holds blobs for offline recipients (30-day TTL), and has no concept of group membership.
 
 ---
 
@@ -77,7 +77,7 @@ cargo test        # runs fully in-process; no relay or network required
 To build the xcframework for Swift:
 
 ```sh
-cd ../hush-sync-swift
+cd ../trueseal-sync-swift
 ./scripts/build-xcframework.sh
 ```
 
@@ -85,9 +85,9 @@ cd ../hush-sync-swift
 
 ## Integration guide
 
-[docs/integrating-hush-sync.md](docs/integrating-hush-sync.md) — design decisions, edge cases, and platform notes from the reference integration.
+[docs/integrating-trueseal-sync.md](docs/integrating-trueseal-sync.md) — design decisions, edge cases, and platform notes from the reference integration.
 
-Ecosystem overview and full protocol documentation → **[hush-docs](../docs)**
+Ecosystem overview and full protocol documentation → **[trueseal-docs](../docs)**
 
 ---
 

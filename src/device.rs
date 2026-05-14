@@ -1,5 +1,5 @@
 use ed25519_dalek::SigningKey;
-use hush_noise::keypair::{generate_keypair as noise_generate, Keypair as NoiseKeypair};
+use trueseal_noise::keypair::{generate_keypair as noise_generate, Keypair as NoiseKeypair};
 use rand::thread_rng;
 use thiserror::Error;
 

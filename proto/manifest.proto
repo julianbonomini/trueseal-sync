@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-package hush.sync.v0;
+package trueseal.sync.v0;
 
 // GroupManifest is the authoritative, signed membership record for a Sync Group.
 // Every Device in the group holds the current version locally.

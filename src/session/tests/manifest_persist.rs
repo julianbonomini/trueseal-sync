@@ -12,7 +12,7 @@ use crate::operation_log::MemLog;
 use crate::store::Store;
 
 use super::super::test_helpers::*;
-use super::super::HushSession;
+use super::super::TruesealSession;
 
 /// Pairing A→B with store-backed on_manifest_changed saves the manifest; a
 /// fresh session loaded from the same store has the 2-member group.
@@ -49,7 +49,7 @@ fn manifest_persists_across_session_restart() {
     let store_b_cb = store_b.clone();
 
     // A connects first (relay accepts pipe_a_relay first).
-    let session_a = HushSession::connect_full(
+    let session_a = TruesealSession::connect_full(
         pipe_a_client,
         relay_pub,
         device_a,
@@ -65,7 +65,7 @@ fn manifest_persists_across_session_restart() {
     .expect("session A");
 
     // B connects second, persists received manifests.
-    let _session_b = HushSession::connect_full(
+    let _session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -119,7 +119,7 @@ fn manifest_persists_across_session_restart() {
     let (nk_rx2, nk2) = nk_push_channel();
     spawn_routing_relay(&relay_kp, pipe_a2_relay, pipe_b2_relay, nk_rx2, true);
 
-    let session_a2 = HushSession::connect(
+    let session_a2 = TruesealSession::connect(
         pipe_a2_client,
         relay_pub,
         DeviceKeypair::from_bytes(a_noise_priv, a_signing_priv).unwrap(),
@@ -127,7 +127,7 @@ fn manifest_persists_across_session_restart() {
         nk2.factory(),
     )
     .expect("session A2");
-    let session_b2 = HushSession::connect(
+    let session_b2 = TruesealSession::connect(
         pipe_b2_client,
         relay_pub,
         DeviceKeypair::from_bytes(b_noise_priv, b_signing_priv).unwrap(),
@@ -207,7 +207,7 @@ fn manifest_restore_via_connect_background() {
     let store_a = Arc::new(Mutex::new(Store::open(dir_a.path(), "a").expect("store A")));
     let store_a_cb = store_a.clone();
 
-    let session_a = HushSession::connect_full(
+    let session_a = TruesealSession::connect_full(
         pipe_a1_client,
         relay_pub,
         device_a,
@@ -220,7 +220,7 @@ fn manifest_restore_via_connect_background() {
     )
     .expect("session A");
 
-    let _session_b1 = HushSession::connect(pipe_b1_client, relay_pub,
+    let _session_b1 = TruesealSession::connect(pipe_b1_client, relay_pub,
         DeviceKeypair::from_bytes(
             device_b.noise.private(), device_b.signing.to_bytes()
         ).unwrap(),
@@ -250,7 +250,7 @@ fn manifest_restore_via_connect_background() {
     let b2_received: Arc<(Mutex<u32>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
     let br = b2_received.clone();
 
-    let session_b2 = HushSession::connect(
+    let session_b2 = TruesealSession::connect(
         pipe_b2_client, relay_pub,
         DeviceKeypair::from_bytes(device_b.noise.private(), device_b.signing.to_bytes()).unwrap(),
         move |_, _, _| {
@@ -283,7 +283,7 @@ fn manifest_restore_via_connect_background() {
     let store_a2_cb = store_a.clone();
     let store_a3 = store_a.clone();
 
-    let session_a2: HushSession<MemPipeSimple> = HushSession::connect_background(
+    let session_a2: TruesealSession<MemPipeSimple> = TruesealSession::connect_background(
         relay_pub,
         DeviceKeypair::from_bytes(a_noise_priv, a_signing_priv).expect("reconstruct A"),
         |_, _, _| {},

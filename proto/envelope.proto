@@ -1,8 +1,8 @@
 syntax = "proto3";
 
-package hush.sync.v0;
+package trueseal.sync.v0;
 
-// Envelope is the wire format for all sync traffic in hush-sync.
+// Envelope is the wire format for all sync traffic in trueseal-sync.
 // It is the only thing the Relay ever sees. The Relay uses recipient_pub
 // for routing and sequence for ordering. All other fields are forwarded
 // blindly — the Relay never decrypts or interprets them.

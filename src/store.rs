@@ -12,10 +12,10 @@ pub enum StoreError {
     Sqlite(#[from] rusqlite::Error),
 }
 
-/// Persistent local state for a single hush-sync session.
+/// Persistent local state for a single trueseal-sync session.
 ///
 /// All group state — identity keypair, current GroupManifest, and outbox
-/// entries — lives in a single SQLite database at `{base_dir}/hush_{namespace}.db`.
+/// entries — lives in a single SQLite database at `{base_dir}/trueseal_{namespace}.db`.
 /// The caller never touches storage; the Store owns it entirely.
 pub struct Store {
     conn: rusqlite::Connection,
@@ -27,7 +27,7 @@ impl Store {
     /// Idempotent: calling twice with the same args returns equivalent stores.
     /// Runs all schema migrations in a single transaction on first open.
     pub fn open(base_dir: &Path, namespace: &str) -> Result<Self, StoreError> {
-        let path = base_dir.join(format!("hush_{}.db", namespace));
+        let path = base_dir.join(format!("trueseal_{}.db", namespace));
         let conn = rusqlite::Connection::open(path)?;
 
         // WAL mode for better concurrent read performance
@@ -225,7 +225,7 @@ impl OperationLog for PersistentLog {
              VALUES (?1, ?2, ?3, 0)",
             rusqlite::params![object_id.as_slice(), sequence as i64, blob.as_slice()],
         ) {
-            warn!("[hush-sync] outbox append failed (seq={sequence}): {e}");
+            warn!("[trueseal-sync] outbox append failed (seq={sequence}): {e}");
         }
     }
 
@@ -235,7 +235,7 @@ impl OperationLog for PersistentLog {
              WHERE object_id = ?1 AND sequence = ?2",
             rusqlite::params![object_id.as_slice(), sequence as i64],
         ) {
-            warn!("[hush-sync] outbox mark_delivered failed (seq={sequence}): {e}");
+            warn!("[trueseal-sync] outbox mark_delivered failed (seq={sequence}): {e}");
         }
     }
 
@@ -322,7 +322,7 @@ mod tests {
         let _s1 = Store::open(dir.path(), "alpha").expect("first open");
         let _s2 = Store::open(dir.path(), "alpha").expect("second open");
         // Both succeed; the DB file exists once
-        assert!(dir.path().join("hush_alpha.db").exists());
+        assert!(dir.path().join("trueseal_alpha.db").exists());
     }
 
     /// Different namespaces produce separate database files.
@@ -331,8 +331,8 @@ mod tests {
         let dir = tmp_dir();
         let _sa = Store::open(dir.path(), "alpha").expect("alpha");
         let _sb = Store::open(dir.path(), "beta").expect("beta");
-        assert!(dir.path().join("hush_alpha.db").exists());
-        assert!(dir.path().join("hush_beta.db").exists());
+        assert!(dir.path().join("trueseal_alpha.db").exists());
+        assert!(dir.path().join("trueseal_beta.db").exists());
     }
 
     /// wipe() removes all data but leaves schema intact.

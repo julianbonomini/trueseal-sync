@@ -1,8 +1,8 @@
 [package]
-name = "hush-sync"
+name = "trueseal-sync"
 version = "0.1.0"
 edition = "2021"
-description = "E2EE sync engine built on hush-noise"
+description = "E2EE sync engine built on trueseal-noise"
 license = "MIT"
 publish = false
 
@@ -27,7 +27,7 @@ tokio = { version = "1", features = [
   "sync",
   "io-util",
 ] }
-hush-noise = { path = "../hush-noise/rust" }
+trueseal-noise = { path = "../hush-noise/rust" }
 uniffi = { version = "0.28", features = ["tokio", "cli"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 

@@ -2,7 +2,7 @@ use crate::device::DeviceKeypair;
 use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
-use super::super::{HushSession, SessionError};
+use super::super::{TruesealSession, SessionError};
 
 /// create_offline() succeeds with an unreachable relay — returns a session immediately.
 #[test]
@@ -12,7 +12,7 @@ fn create_offline_returns_session_immediately() {
     let device = DeviceKeypair::generate();
 
     // Use a factory that always fails (unreachable relay).
-    let session = HushSession::<MemPipe>::connect_background(
+    let session = TruesealSession::<MemPipe>::connect_background(
         relay_pub,
         device,
         |_, _, _| {},
@@ -39,7 +39,7 @@ fn offline_session_send_returns_not_in_group() {
     let relay_pub = relay_pub(&relay_kp);
     let device = DeviceKeypair::generate();
 
-    let session = HushSession::<MemPipe>::connect_background(
+    let session = TruesealSession::<MemPipe>::connect_background(
         relay_pub,
         device,
         |_, _, _| {},
@@ -76,7 +76,7 @@ fn offline_session_with_manifest_queues_to_outbox() {
     let sk = SigningKey::from_bytes(&device.signing.to_bytes());
     let remote = DeviceKeypair::generate();
 
-    let session = HushSession::<MemPipe>::connect_background(
+    let session = TruesealSession::<MemPipe>::connect_background(
         relay_pub,
         device,
         |_, _, _| {},

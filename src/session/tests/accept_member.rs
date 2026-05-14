@@ -5,7 +5,7 @@ use crate::device::DeviceKeypair;
 use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
-use super::super::HushSession;
+use super::super::TruesealSession;
 use super::make_two_member_manifest;
 
 /// When a Pair message arrives inside an open pairing window,
@@ -25,7 +25,7 @@ fn pair_inside_window_fires_on_member_request() {
     let received: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(vec![]));
     let rc = received.clone();
 
-    let session_a = HushSession::connect_full(
+    let session_a = TruesealSession::connect_full(
         pipe_a_client,
         relay_pub,
         device_a,
@@ -46,7 +46,7 @@ fn pair_inside_window_fires_on_member_request() {
     // Open a pairing window and give B the token to send a Pair message.
     let pairing_token = session_a.pairing_token();
 
-    let session_b = HushSession::connect_full(
+    let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -86,7 +86,7 @@ fn accept_member_with_valid_token_returns_true() {
     let token_received: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let tr = token_received.clone();
 
-    let session_a = HushSession::connect_full(
+    let session_a = TruesealSession::connect_full(
         pipe_a_client,
         relay_pub,
         device_a,
@@ -105,7 +105,7 @@ fn accept_member_with_valid_token_returns_true() {
 
     let pairing_token = session_a.pairing_token();
 
-    let session_b = HushSession::connect_full(
+    let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -138,13 +138,13 @@ fn accept_member_with_unknown_token_returns_false() {
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let (nk_rx, nk) = nk_push_channel();
     {
-        let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
+            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
             // drain nk connections
             while let Ok(p) = nk_rx.recv() {
-                let kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { if let Ok(sess) = hush_noise::session_nk::accept(p, kp2) {
+                let kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || { if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
                 if sess.receive().is_ok() {
                     let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
                 }
@@ -153,7 +153,7 @@ fn accept_member_with_unknown_token_returns_false() {
         });
     }
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect_full(
+    let session = TruesealSession::connect_full(
         pipe_client,
         relay_pub,
         device,
@@ -187,7 +187,7 @@ fn pair_outside_window_does_not_fire_callback() {
     let fired: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let fc = fired.clone();
 
-    let session_a = HushSession::connect_full(
+    let session_a = TruesealSession::connect_full(
         pipe_a_client,
         relay_pub,
         device_a,
@@ -205,7 +205,7 @@ fn pair_outside_window_does_not_fire_callback() {
     });
 
     // Do NOT open a pairing window — B's Pair message should be discarded.
-    let session_b = HushSession::connect_full(
+    let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,

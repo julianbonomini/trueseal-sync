@@ -1,6 +1,6 @@
 // PROTOTYPE — throwaway
 // ─────────────────────────────────────────────────────────────────────────────
-// Question: "What is the right mutex error-handling strategy for HushSession?
+// Question: "What is the right mutex error-handling strategy for TruesealSession?
 //
 // The session has ~66 Mutex::lock().unwrap() calls. If any thread panics while
 // holding a lock, every subsequent .lock().unwrap() on that mutex also panics.
@@ -54,7 +54,7 @@ struct Manifest {
     members: Vec<String>,
 }
 
-/// Mirrors HushSession's locking structure.
+/// Mirrors TruesealSession's locking structure.
 /// Every Arc<Mutex<_>> here matches a field in the real session.
 struct MiniSession {
     manifest: Arc<Mutex<Option<Manifest>>>,
@@ -169,7 +169,7 @@ fn render(session: &MiniSession, log: &[String]) {
     // Clear screen
     print!("\x1b[2J\x1b[H");
 
-    println!("{}", bold("━━ hush-sync · error handling prototype ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+    println!("{}", bold("━━ trueseal-sync · error handling prototype ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
     println!();
 
     // ── State ─────────────────────────────────────────────────────────────────

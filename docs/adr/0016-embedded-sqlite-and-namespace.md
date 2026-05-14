@@ -12,9 +12,9 @@ The library embeds SQLite (via `rusqlite`) and owns all session state internally
 
 ### Namespace
 
-`namespace` is an optional string parameter on `HushFfiSession.create()` that defaults to `"default"`. The library names the database file `hush_{namespace}.db` in the platform's app data directory. Each namespace is a fully independent session with its own identity, manifest, and outbox.
+`namespace` is an optional string parameter on `TruesealFfiSession.create()` that defaults to `"default"`. The library names the database file `trueseal_{namespace}.db` in the platform's app data directory. Each namespace is a fully independent session with its own identity, manifest, and outbox.
 
-This makes multi-group apps (spaces) trivially composable: the caller creates one `HushFfiSession` per namespace. The library does not need to know about spaces. Most callers pass no namespace and never think about it.
+This makes multi-group apps (spaces) trivially composable: the caller creates one `TruesealFfiSession` per namespace. The library does not need to know about spaces. Most callers pass no namespace and never think about it.
 
 ### Schema
 
@@ -41,13 +41,13 @@ The caller can read group membership via `session.members() -> [(id, name)]` —
 - The caller implements zero storage code. The entire persistence concern is inside the library.
 - The Operation Log (outbox) survives crashes and OS kills — undelivered blobs are replayed automatically on next connect.
 - `onIdentityCreated` and `onManifestChanged` callbacks are removed from the API — they are no longer needed.
-- Multi-group apps (spaces) are supported by creating multiple `HushFfiSession` instances with different namespaces.
+- Multi-group apps (spaces) are supported by creating multiple `TruesealFfiSession` instances with different namespaces.
 - The library binary is larger due to the SQLite dependency. This is acceptable — SQLite is ~600KB, well within mobile app norms.
 - Database migration is the library's responsibility. Callers are insulated from schema changes.
 
 ## Considered alternatives
 
-**Caller-managed storage via a `HushStorage` callback interface**
+**Caller-managed storage via a `TruesealStorage` callback interface**
 Rejected. Requires the caller to implement platform-specific secure storage, understand the semantics of each persisted value, and handle atomic writes. Violates the "black box" principle. Puts crash-safety and migration burden on the caller.
 
 **Platform-specific storage adapters (keychain on iOS, EncryptedSharedPreferences on Android)**

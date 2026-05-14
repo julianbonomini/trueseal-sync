@@ -1,9 +1,9 @@
-wing: hush
+wing: trueseal
 rooms:
-- name: hush_sync
-  description: Files from hush-sync/
+- name: trueseal_sync
+  description: Files from trueseal-sync/
   keywords:
-  - hush_sync
-  - hush-sync
+  - trueseal_sync
+  - trueseal-sync
   - sync engine
   - pairing

@@ -7,7 +7,7 @@ use crate::device::DeviceKeypair;
 use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
-use super::super::HushSession;
+use super::super::TruesealSession;
 use super::make_two_member_manifest;
 
 // ── #65 ───────────────────────────────────────────────────────────────────────
@@ -37,8 +37,8 @@ fn subscribe_handler_survives_poisoned_manifest_mutex() {
     let rc = received.clone();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
-    let session_b = HushSession::connect_full(
+        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -99,7 +99,7 @@ fn push_sync_survives_poisoned_manifest_mutex() {
 
     let device = DeviceKeypair::generate();
     let session =
-        HushSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("session");
+        TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("session");
 
     let manifest_arc = session.manifest.clone();
     let _ = std::panic::catch_unwind(|| {
@@ -126,7 +126,7 @@ fn members_survives_poisoned_manifest_mutex() {
 
     let device = DeviceKeypair::generate();
     let session =
-        HushSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("session");
+        TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("session");
 
     let manifest_arc = session.manifest.clone();
     let _ = std::panic::catch_unwind(|| {
@@ -163,9 +163,9 @@ fn on_manifest_changed_panic_does_not_poison_manifest_mutex() {
     let b_signing = device_b.signing_public_key();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
     // B's on_manifest_changed panics — simulates a failing SQLite write.
-    let session_b = HushSession::connect_full(
+    let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,

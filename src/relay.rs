@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use hush_noise::{
+use trueseal_noise::{
     keypair::Keypair as NoiseKeypair,
     session_xx::{dial, Session},
 };
@@ -16,7 +16,7 @@ use crate::keys::NoisePublicKey;
 use crate::message::Message;
 
 /// Maximum serialised envelope size the client will attempt to push (1 MiB).
-/// hush-sync is the protocol authority — this constant must match the relay's
+/// trueseal-sync is the protocol authority — this constant must match the relay's
 /// configurable default (`relay.max_envelope_bytes`).
 pub const MAX_ENVELOPE_BYTES: usize = 1_048_576;
 
@@ -53,7 +53,7 @@ pub(crate) enum MsgType {
     /// An earlier draft proposed an 8-byte u64 BE sequence in the body —
     /// rejected: relay never uses sequence numbers; dedup impossible on NK sessions;
     /// NK already authenticates the relay so a well-formed Ack is sufficient proof.
-    /// hush-sync accepts any body length defensively but the relay always sends 0 bytes.
+    /// trueseal-sync accepts any body length defensively but the relay always sends 0 bytes.
     Ack       = 0x04,
     /// Relay → client. Body: empty (0 bytes).
     /// Semantic: the relay permanently rejected the blob (e.g. oversized envelope).
@@ -101,7 +101,7 @@ pub(crate) fn parse(raw: &[u8]) -> Option<(MsgType, &[u8])> {
 /// A pre-encoded framed push message, ready to send over the Noise session.
 type PushBytes = Vec<u8>;
 
-/// Client-side connection to a hush-relay server.
+/// Client-side connection to a trueseal-relay server.
 /// Transport-generic: uses any Read+Write+Send stream (TCP in production,
 /// in-memory pipes in tests).
 ///
@@ -256,13 +256,13 @@ fn run_loop<T: Read + Write + Send + 'static>(
     // and handle pushes in this thread before blocking on channel recv.
     // This works because Session locks conn per-call; sends/receives interleave.
     //
-    // HOWEVER: hush-noise Session holds conn:Arc<Mutex<T>>. Both send() and
+    // HOWEVER: trueseal-noise Session holds conn:Arc<Mutex<T>>. Both send() and
     // receive() lock conn. If receive() is blocking, send() blocks too.
     // To truly decouple, we use a thread that only does receive(), and this
     // thread handles push sends when receive() is not holding the lock.
     //
     // Simplest correct approach: alternate between draining push_rx and calling
-    // receive() with a non-blocking receive attempt. Since hush-noise doesn't
+    // receive() with a non-blocking receive attempt. Since trueseal-noise doesn't
     // support non-blocking receives, we use a dedicated send thread.
 
     let session = Arc::new(session);
@@ -363,9 +363,9 @@ pub fn push_send<T: Read + Write + Send>(
     relay_pub: [u8; 32],
     blob: Vec<u8>,
 ) -> Result<(), RelayError> {
-    use hush_noise::keypair::generate_keypair;
+    use trueseal_noise::keypair::generate_keypair;
     let fresh_kp = generate_keypair();
-    let session = hush_noise::session_nk::dial(transport, fresh_kp, relay_pub)
+    let session = trueseal_noise::session_nk::dial(transport, fresh_kp, relay_pub)
         .map_err(|e| RelayError::HandshakeFailed(e))?;
     session
         .send(&blob)
@@ -390,7 +390,7 @@ mod tests {
     use crate::envelope::SigningKeypair;
     use crate::keys::NoisePublicKey;
     use crate::message::Message;
-    use hush_noise::{
+    use trueseal_noise::{
         keypair::{generate_keypair, Keypair},
         session_xx::accept,
     };
@@ -560,8 +560,8 @@ mod tests {
     /// push_send returns PushRejected when relay sends an Error frame.
     #[test]
     fn push_send_returns_push_rejected_on_error_frame() {
-        use hush_noise::keypair::generate_keypair;
-        use hush_noise::session_nk::accept as nk_accept;
+        use trueseal_noise::keypair::generate_keypair;
+        use trueseal_noise::session_nk::accept as nk_accept;
 
         let relay_kp = generate_keypair();
         let relay_pub = relay_kp.public_key;
@@ -570,7 +570,7 @@ mod tests {
 
         // Stub relay: completes NK handshake, then immediately sends an Error frame.
         std::thread::spawn(move || {
-            let relay_kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+            let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
             let session = nk_accept(relay_pipe, relay_kp2).unwrap();
             let _ = session.receive(); // drain the Push
             let _ = session.send(&frame(MsgType::Error, &[]));

@@ -14,13 +14,13 @@ pub enum MessageError {
     InvalidManifest(#[from] ManifestError),
 }
 
-// 1-byte type tags — private to hush-sync, invisible to the Relay
+// 1-byte type tags — private to trueseal-sync, invisible to the Relay
 const TAG_PAIR: u8 = 0x01;
 const TAG_SYNC: u8 = 0x02;
 const TAG_REVOKE: u8 = 0x03;
 const TAG_GROUP_MANIFEST: u8 = 0x04;
 
-/// The message types hush-sync defines.
+/// The message types trueseal-sync defines.
 /// Callers receive this from subscribe callbacks after decryption and parsing.
 /// The Relay never sees the type tag — it lives inside the encrypted payload.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,7 +32,7 @@ pub enum Message {
         signing_pub: [u8; 32],
     },
     /// An opaque application blob — clipboard entry, secret, or any caller data.
-    /// hush-sync delivers the body verbatim; the caller interprets it.
+    /// trueseal-sync delivers the body verbatim; the caller interprets it.
     Sync { body: Vec<u8> },
     /// Full Sync Group reset. Recipients wipe their group state and rotate keypairs.
     Revoke,
@@ -103,7 +103,7 @@ impl Message {
 
 /// Produce pairing payload bytes for a QR code.
 /// Contains this device's noise public key and signing public key.
-/// The caller encodes these bytes as a QR image — hush-sync never does that.
+/// The caller encodes these bytes as a QR image — trueseal-sync never does that.
 pub fn pairing_payload(noise_pub: &[u8; 32], signing_pub: &[u8; 32]) -> Vec<u8> {
     // Same encoding as a Pair message body — the receiver decodes it as such
     let mut out = Vec::with_capacity(64);

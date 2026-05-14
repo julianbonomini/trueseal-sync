@@ -1,8 +1,8 @@
-# hush-sync Manifesto
+# trueseal-sync Manifesto
 
 ## Purpose
 
-There is no free, easy primitive for private and secure sync. Developers who care about user privacy have no default building block — so they either build it themselves at great cost, or default to infrastructure that can spy on users. hush-sync exists to remove that excuse.
+There is no free, easy primitive for private and secure sync. Developers who care about user privacy have no default building block — so they either build it themselves at great cost, or default to infrastructure that can spy on users. trueseal-sync exists to remove that excuse.
 
 ## Principles
 
@@ -10,7 +10,7 @@ There is no free, easy primitive for private and secure sync. Developers who car
 The relay cannot be trusted — not because it is malicious, but because trust should never be required. Data is encrypted before it leaves the device. The relay is structurally incapable of reading it. This is not a promise. It is a constraint.
 
 **Anonymity**
-The system has no concept of human identity. No accounts. No registration. No email, no phone number, no username. A device is identified only by its keypair. Who owns that device is never part of the protocol. hush-sync will never know who you are — and is designed so that it cannot.
+The system has no concept of human identity. No accounts. No registration. No email, no phone number, no username. A device is identified only by its keypair. Who owns that device is never part of the protocol. trueseal-sync will never know who you are — and is designed so that it cannot.
 
 **Fault tolerant**
 The primitive must survive the environment it runs in: devices go offline, networks drop, processes crash. No human intervention required. Any device can be offline indefinitely and return current. No single device is load-bearing.

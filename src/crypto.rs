@@ -40,7 +40,7 @@ fn encrypt_raw(recipient_pub: NoisePublicKey, plaintext: &[u8]) -> Vec<u8> {
     // Derive symmetric key via HKDF-SHA256
     let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
     let mut key = [0u8; 32];
-    hk.expand(b"hush-sync addressed encryption v0", &mut key)
+    hk.expand(b"trueseal-sync addressed encryption v0", &mut key)
         .expect("HKDF expand failed");
 
     // Encrypt with ChaCha20-Poly1305. Zero nonce is safe here because the
@@ -95,7 +95,7 @@ fn decrypt_raw(my_priv: [u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoEr
     // Derive same symmetric key
     let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
     let mut key = [0u8; 32];
-    hk.expand(b"hush-sync addressed encryption v0", &mut key)
+    hk.expand(b"trueseal-sync addressed encryption v0", &mut key)
         .expect("HKDF expand failed");
 
     // Decrypt
@@ -123,7 +123,7 @@ mod tests {
     fn encrypted_blob_with_author_pub_round_trips() {
         let (priv_b, pub_b) = generate_keypair();
         let author_pub = [0x42u8; 32];
-        let plaintext = b"hello hush-sync";
+        let plaintext = b"hello trueseal-sync";
 
         let ciphertext = encrypt(pub_b, author_pub, plaintext);
         let (got_author, got_plain) = decrypt(priv_b, &ciphertext).expect("decryption should succeed");
@@ -137,7 +137,7 @@ mod tests {
     fn encrypted_blob_round_trips() {
         let (priv_b, pub_b) = generate_keypair();
         let author_pub = [0x01u8; 32];
-        let plaintext = b"hello hush-sync";
+        let plaintext = b"hello trueseal-sync";
 
         let ciphertext = encrypt(pub_b, author_pub, plaintext);
         let (_, recovered) = decrypt(priv_b, &ciphertext).expect("decryption should succeed");

@@ -1,7 +1,7 @@
 use std::io;
 use std::sync::{mpsc, Arc, Mutex};
 
-use hush_noise::{
+use trueseal_noise::{
     keypair::{generate_keypair, Keypair},
     session_nk,
     session_xx::accept,
@@ -169,7 +169,7 @@ pub(super) fn spawn_routing_relay(
                 let kp = Keypair::new(relay_priv, relay_pub_key);
                 let dst2 = dst_nk.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
@@ -200,7 +200,7 @@ pub(super) fn spawn_single_relay(relay_kp: &Keypair, pipe: MemPipe, nk_rx: mpsc:
         while let Ok(nk_pipe) = nk_rx.recv() {
             let kp = Keypair::new(relay_priv, relay_pub_key);
             std::thread::spawn(move || {
-                if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                     if sess.receive().is_ok() {
                         let _ = sess.send(&frame(MsgType::Ack, &[]));
                     }
@@ -244,7 +244,7 @@ pub(super) fn spawn_bidirectional_relay(relay_kp: &Keypair, pipe_a: MemPipe, pip
                 let sa2 = sa_nk.clone();
                 let sb2 = sb_nk.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() < 32 { return; }
@@ -310,7 +310,7 @@ pub(super) fn spawn_bidirectional_relay_parallel(
                 let sa2 = sa_nk.clone();
                 let sb2 = sb_nk.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() < 32 { return; }
@@ -414,7 +414,7 @@ pub(super) fn spawn_tripartite_relay(
                 let tb = txb2.clone();
                 let tc = txc2.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() < 32 { return; }
@@ -491,7 +491,7 @@ pub(super) fn spawn_quadpartite_relay(
                 let tc = txc2.clone();
                 let td = txd2.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() < 32 { return; }

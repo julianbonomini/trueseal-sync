@@ -8,7 +8,7 @@ Accepted
 
 Three independent problems share a single wire-level change.
 
-**Heartbeat.** Receive Sessions are persistent TCP connections (hush-relay ADR-0006). NAT and firewall middleboxes silently drop idle TCP connections — typically after 30–300 seconds. Without application-level keepalives, a Device may believe its Receive Session is live when the relay has already discarded it. The Device misses incoming Envelopes until it reconnects. hush-sync has no mechanism today to detect a silently-dead connection.
+**Heartbeat.** Receive Sessions are persistent TCP connections (trueseal-relay ADR-0006). NAT and firewall middleboxes silently drop idle TCP connections — typically after 30–300 seconds. Without application-level keepalives, a Device may believe its Receive Session is live when the relay has already discarded it. The Device misses incoming Envelopes until it reconnects. trueseal-sync has no mechanism today to detect a silently-dead connection.
 
 **Push Ack.** `push_sync` currently calls `mark_delivered` as soon as `push_send` returns `Ok` — meaning "bytes were written to the NK session." The relay may still lose the Envelope between receiving the bytes and persisting it to the InboxStore (crash, OOM, network teardown mid-write). The outbox correctly survives crashes and replays on reconnect, but `mark_delivered` fires too early: if the process crashes between the successful `send` and the relay persisting, the entry is marked delivered and will not be replayed. The guarantee should be "relay confirmed persistence," not "bytes written."
 
@@ -27,7 +27,7 @@ Heartbeat = 0x03   body: empty (0 bytes)
 Ack       = 0x04   body: empty (0 bytes)
 ```
 
-The wire framing (`[type:u8][len:u32 BE][body]`) is unchanged. hush-sync owns this type tag table as the protocol authority (hush-relay ADR-0005).
+The wire framing (`[type:u8][len:u32 BE][body]`) is unchanged. trueseal-sync owns this type tag table as the protocol authority (trueseal-relay ADR-0005).
 
 ### Push body layout
 
@@ -49,7 +49,7 @@ The Deliver body (relay → client on XX session) is `body[32:]` — identical t
 
 The relay sends `Heartbeat` on idle Receive Sessions (XX) to prevent NAT timeout. The client echoes `Heartbeat` back from the receive dispatch loop. No payload. No application semantics — pure keepalive.
 
-The dispatch loop (`run_loop`) handles `MsgType::Heartbeat` by calling `session.send(&frame(MsgType::Heartbeat, &[]))` directly. Two send paths exist (push send thread + dispatch thread), both serialised on the conn Mutex in hush-noise Session. No ordering guarantee between heartbeat echoes and push frames — not required.
+The dispatch loop (`run_loop`) handles `MsgType::Heartbeat` by calling `session.send(&frame(MsgType::Heartbeat, &[]))` directly. Two send paths exist (push send thread + dispatch thread), both serialised on the conn Mutex in trueseal-noise Session. No ordering guarantee between heartbeat echoes and push frames — not required.
 
 ### Push Ack
 

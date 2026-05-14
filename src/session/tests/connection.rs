@@ -5,7 +5,7 @@ use crate::device::DeviceKeypair;
 use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
-use super::super::HushSession;
+use super::super::TruesealSession;
 
 /// connect_background fires on_connection_changed(true) once the relay connects.
 #[test]
@@ -16,9 +16,9 @@ fn connection_changed_fires_true_on_initial_connect() {
     // Relay will accept one connection.
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     {
-        let relay_kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session_xx::accept(pipe_relay, relay_kp2);
+            let _ = trueseal_noise::session_xx::accept(pipe_relay, relay_kp2);
         });
     }
 
@@ -28,7 +28,7 @@ fn connection_changed_fires_true_on_initial_connect() {
     let pipe_slot: Arc<Mutex<Option<MemPipe>>> = Arc::new(Mutex::new(Some(pipe_client)));
     let pipe_slot2 = pipe_slot.clone();
 
-    let _session = HushSession::<MemPipe>::connect_background(
+    let _session = TruesealSession::<MemPipe>::connect_background(
         relay_pub,
         DeviceKeypair::generate(),
         |_, _, _| {},
@@ -70,18 +70,18 @@ fn connection_changed_fires_sequence_on_disconnect_and_reconnect() {
     // First connection: will be closed after session starts.
     let (pipe1_client, pipe1_relay, _close_relay1, close_client1) = mem_pipe_pair_with_close();
     {
-        let relay_kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session_xx::accept(pipe1_relay, relay_kp2);
+            let _ = trueseal_noise::session_xx::accept(pipe1_relay, relay_kp2);
         });
     }
 
     // Second connection for reconnect.
     let (pipe2_client, pipe2_relay) = mem_pipe_pair();
     {
-        let relay_kp3 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let relay_kp3 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session_xx::accept(pipe2_relay, relay_kp3);
+            let _ = trueseal_noise::session_xx::accept(pipe2_relay, relay_kp3);
         });
     }
 
@@ -92,7 +92,7 @@ fn connection_changed_fires_sequence_on_disconnect_and_reconnect() {
     let events: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(vec![]));
     let ec = events.clone();
 
-    let _session = HushSession::<MemPipe>::connect_background(
+    let _session = TruesealSession::<MemPipe>::connect_background(
         relay_pub,
         DeviceKeypair::generate(),
         |_, _, _| {},

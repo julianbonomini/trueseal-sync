@@ -1,6 +1,6 @@
-# hush-sync
+# trueseal-sync
 
-A Rust client library providing E2EE, local-first sync between devices. Built on a Rust port of hush-noise. hush-sync is the protocol authority for the hush stack — it owns the Envelope format, addressed encryption, pairing, and operation log semantics. Rust enables native Swift (iOS/macOS) and Kotlin (Android) bindings via UniFFI, as well as Linux and Go consumers via FFI. The relay infrastructure lives in [hush-relay](https://github.com/julianbonomini/hush-relay), which stays in Go.
+A Rust client library providing E2EE, local-first sync between devices. Built on a Rust port of trueseal-noise. trueseal-sync is the protocol authority for the trueseal stack — it owns the Envelope format, addressed encryption, pairing, and operation log semantics. Rust enables native Swift (iOS/macOS) and Kotlin (Android) bindings via UniFFI, as well as Linux and Go consumers via FFI. The relay infrastructure lives in [trueseal-relay](https://github.com/julianbonomini/trueseal-relay), which stays in Go.
 
 ## Language
 
@@ -57,7 +57,7 @@ The operation by which any current member triggers a full Sync Group reset. Push
 _Avoid_: revoke all, nuclear option, hard reset (use Destroy Group as the canonical term)
 
 **Revocation**:
-The general concept of removing cryptographic access to the group. Encompasses both Soft Removal (cooperative, no key rotation) and Destroy Group (cryptographic, full key rotation). In earlier versions of hush-sync, revocation meant only Destroy Group — the distinction is now explicit.
+The general concept of removing cryptographic access to the group. Encompasses both Soft Removal (cooperative, no key rotation) and Destroy Group (cryptographic, full key rotation). In earlier versions of trueseal-sync, revocation meant only Destroy Group — the distinction is now explicit.
 _Avoid_: Using "revocation" to mean only Destroy Group — be specific.
 
 **Push**:
@@ -97,7 +97,7 @@ A cryptographic hash of a preceding Envelope in the same Object's Operation Log.
 _Avoid_: previous, predecessor, pointer
 
 **Receive Session**:
-A long-lived, authenticated, forward-secret connection between a Device and the Relay, established via a Noise XX handshake using the Device's stable noise keypair. The relay maintains a `noise_pub → active connection` map and delivers inbound Blobs over this channel (push-on-arrival). Each Device holds exactly one Receive Session at a time. Distinct from blob encryption — a Session is a live channel, not a stored payload. On each Deliver frame, hush-sync sends a DeliverAck back to the relay immediately on receipt — before decryption — so the relay can delete the stored Blob. If no DeliverAck is sent before disconnect, the relay re-delivers on reconnect (at-least-once guarantee).
+A long-lived, authenticated, forward-secret connection between a Device and the Relay, established via a Noise XX handshake using the Device's stable noise keypair. The relay maintains a `noise_pub → active connection` map and delivers inbound Blobs over this channel (push-on-arrival). Each Device holds exactly one Receive Session at a time. Distinct from blob encryption — a Session is a live channel, not a stored payload. On each Deliver frame, trueseal-sync sends a DeliverAck back to the relay immediately on receipt — before decryption — so the relay can delete the stored Blob. If no DeliverAck is sent before disconnect, the relay re-delivers on reconnect (at-least-once guarantee).
 _Avoid_: connection, socket, channel, stream
 
 **Push Session**:
@@ -113,15 +113,15 @@ The scheme used to encrypt Blob content for a specific recipient Device. Raw X25
 _Avoid_: Noise (Noise is for Sessions, not Blobs), asymmetric encryption (too generic)
 
 **Revocation**:
-The general concept of removing cryptographic access to the group. Encompasses both Soft Removal (cooperative, no key rotation) and Destroy Group (cryptographic, full key rotation). In earlier versions of hush-sync, revocation meant only Destroy Group — the distinction is now explicit.
+The general concept of removing cryptographic access to the group. Encompasses both Soft Removal (cooperative, no key rotation) and Destroy Group (cryptographic, full key rotation). In earlier versions of trueseal-sync, revocation meant only Destroy Group — the distinction is now explicit.
 _Avoid_: Using "revocation" to mean only Destroy Group — be specific.
 
 **Message**:
-The typed unit of communication in hush-sync's protocol. Four variants: `Pair` (a device requesting to join a Sync Group), `Sync` (an opaque application blob — clipboard entry, secret, or any caller-defined data), `Revoke` (a full Sync Group reset / Destroy Group), and `GroupManifest` (a signed membership update pushed to every member on every membership change). The message type is a private convention of hush-sync, encoded as a 1-byte tag inside the encrypted payload. The Relay never sees it. Third-party developers may use hush-relay directly with their own protocol — hush-sync is one opinionated client protocol built on the relay, not the only possible one.
+The typed unit of communication in trueseal-sync's protocol. Four variants: `Pair` (a device requesting to join a Sync Group), `Sync` (an opaque application blob — clipboard entry, secret, or any caller-defined data), `Revoke` (a full Sync Group reset / Destroy Group), and `GroupManifest` (a signed membership update pushed to every member on every membership change). The message type is a private convention of trueseal-sync, encoded as a 1-byte tag inside the encrypted payload. The Relay never sees it. Third-party developers may use trueseal-relay directly with their own protocol — trueseal-sync is one opinionated client protocol built on the relay, not the only possible one.
 _Avoid_: packet, event, command, request
 
 **Pairing Payload**:
-The bytes produced by an initiating Device to bootstrap a Pairing ceremony. Contains the initiator's noise public key and signing public key. Intended to be encoded as a QR code by the caller — hush-sync produces and parses the raw bytes only, never the QR image itself. A Device that receives a Pairing Payload can push a `Pair` Message back to the initiator via the Relay.
+The bytes produced by an initiating Device to bootstrap a Pairing ceremony. Contains the initiator's noise public key and signing public key. Intended to be encoded as a QR code by the caller — trueseal-sync produces and parses the raw bytes only, never the QR image itself. A Device that receives a Pairing Payload can push a `Pair` Message back to the initiator via the Relay.
 _Avoid_: invite, token, code (acceptable in UX copy, not in protocol docs)
 
 ## Relationships
@@ -155,9 +155,9 @@ _Avoid_: invite, token, code (acceptable in UX copy, not in protocol docs)
 > **Dev:** "Who decides what the group membership is?"
 > **Domain expert:** "Any current member can issue a new Group Manifest. The highest version number wins. There's no admin, no coordinator."
 
-## What hush-sync is and is not responsible for
+## What trueseal-sync is and is not responsible for
 
-**hush-sync is responsible for:**
+**trueseal-sync is responsible for:**
 - Encrypting and delivering blobs to all Sync Group members via the Relay
 - Pairing (key exchange ceremony) and Group Manifest maintenance
 - Soft Removal and Destroy Group
@@ -167,7 +167,7 @@ _Avoid_: invite, token, code (acceptable in UX copy, not in protocol docs)
 - Auto-generating member display names from public keys
 - Notifying the caller of membership events (`onMemberRequest`, `onMemberJoined`, `onMemberLeft`, `onRemovedFromGroup`, `onGroupDestroyed`)
 
-**hush-sync is NOT responsible for:**
+**trueseal-sync is NOT responsible for:**
 - What the bytes in a blob mean — that is the caller's data model
 - Conflict resolution — the caller decides what to do when two devices diverge
 - Bootstrapping a new device with historical state — the caller decides what to send after `onMemberJoined` fires
@@ -176,21 +176,21 @@ _Avoid_: invite, token, code (acceptable in UX copy, not in protocol docs)
 - Cryptographically enforced single-member removal without key rotation — that is a v2 concern (see ADR-0015)
 - Display name customisation — names are derived from public keys; callers may layer their own nickname system on top
 
-This boundary means hush-sync is a **transport primitive with ordering, encryption, and group membership guarantees**, not an application protocol. The caller builds the application protocol on top.
+This boundary means trueseal-sync is a **transport primitive with ordering, encryption, and group membership guarantees**, not an application protocol. The caller builds the application protocol on top.
 
 ## Flagged ambiguities
 
-- "handshake" — reserved for the Noise Protocol layer (hush-noise). Do not use for the Pairing ceremony. Pairing uses a Pairing Token; the underlying Noise XX handshake is an implementation detail.
+- "handshake" — reserved for the Noise Protocol layer (trueseal-noise). Do not use for the Pairing ceremony. Pairing uses a Pairing Token; the underlying Noise XX handshake is an implementation detail.
 - "server" — avoided in favour of Relay to be precise about what the server does and does not know.
 - "revocation" — previously meant only Destroy Group. Now encompasses both Soft Removal and Destroy Group. Be specific.
 - "paired" / "pairing" — pairing is the key exchange ceremony. Being in the group is defined by the Group Manifest, not by having run the pairing ceremony. A device can be paired (keys exchanged) but not in any group manifest if it was removed. Use "group member" to mean "in the current manifest."
 
 ## API layers
 
-hush-sync exposes two layers:
+trueseal-sync exposes two layers:
 
 **Primitives** — `DeviceKeypair`, `RelayClient`, `GroupManifest`, `OperationLog`, `Message`, `Envelope`. Pure Rust. No lifecycle. For advanced callers: Go via C FFI, custom transports, testing.
 
-**Session** (`HushSession`) — opinionated facade. Wires the primitives. Owns relay connection, reconnection, group manifest, message dispatch, soft removal, and destroy group. Caller owns keypair storage, op log, manifest storage, and relay address. UniFFI exposes only the session to Swift and Kotlin.
+**Session** (`TruesealSession`) — opinionated facade. Wires the primitives. Owns relay connection, reconnection, group manifest, message dispatch, soft removal, and destroy group. Caller owns keypair storage, op log, manifest storage, and relay address. UniFFI exposes only the session to Swift and Kotlin.
 
 On Destroy Group, the session fires `onGroupDestroyed` and wipes the local database for that namespace. The next `create()` call auto-generates a fresh identity — the caller never handles keypair bytes directly (ADR-0016).

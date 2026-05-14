@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use hush_noise::{keypair::Keypair, session_xx::accept};
+use trueseal_noise::{keypair::Keypair, session_xx::accept};
 
 use crate::device::DeviceKeypair;
 use crate::envelope::Envelope;
@@ -10,7 +10,7 @@ use crate::message::Message;
 use crate::relay::{frame, parse, MsgType};
 
 use super::super::test_helpers::*;
-use super::super::HushSession;
+use super::super::TruesealSession;
 use super::make_two_member_manifest;
 
 #[test]
@@ -31,14 +31,14 @@ fn two_sessions_can_exchange_sync_message() {
     let b_signing = device_b.signing_public_key();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
     session_a.set_manifest(make_two_member_manifest(
         a_noise, a_signing, &a_sk, b_noise, b_signing,
     ));
 
     let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx = received.clone();
-    let _session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
+    let _session_b = TruesealSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
         rx.lock().unwrap().push(msg);
     }, nk.factory())
     .expect("session B");
@@ -79,7 +79,7 @@ fn push_sync_increments_sequence() {
                 let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
                 let rx2 = rx.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
@@ -121,7 +121,7 @@ fn push_sync_increments_sequence() {
         &sk,
     );
 
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("connect");
+    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("connect");
     session.set_manifest(manifest);
 
     session.push_sync(b"first".to_vec()).expect("first");
@@ -153,7 +153,7 @@ fn on_message_receives_sender_signing_pub() {
     let b_signing = device_b.signing_public_key();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
     session_a.set_manifest(make_two_member_manifest(
         a_noise,
         a_signing_pub,
@@ -164,7 +164,7 @@ fn on_message_receives_sender_signing_pub() {
 
     let received: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
     let rx = received.clone();
-    let _session_b = HushSession::connect(
+    let _session_b = TruesealSession::connect(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -192,7 +192,7 @@ fn on_message_receives_sender_signing_pub() {
 /// to the wrong recipient.
 #[test]
 fn envelope_addressed_to_wrong_key_is_silently_dropped() {
-    use hush_noise::session_xx::accept;
+    use trueseal_noise::session_xx::accept;
 
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
@@ -205,17 +205,17 @@ fn envelope_addressed_to_wrong_key_is_silently_dropped() {
     // Raw relay: accepts sender first (XX), then A (XX).
     // NK pushes from sender are routed to A's XX deliver (deliberate mis-routing to test drop).
     {
-        let relay_kp_s = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-        let relay_kp_a = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let relay_kp_s = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let relay_kp_a = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
             let _sess_sender = accept(pipe_sender_relay, relay_kp_s).unwrap();
             let sess_a = std::sync::Arc::new(accept(pipe_a_relay, relay_kp_a).unwrap());
             // Route all NK pushes to A (deliberate mis-routing).
             while let Ok(nk_pipe) = nk_rx.recv() {
-                let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
                 let sess_a2 = sess_a.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
@@ -240,10 +240,10 @@ fn envelope_addressed_to_wrong_key_is_silently_dropped() {
 
     // Sender connects first (relay accepts sender first).
     let session_sender =
-        HushSession::connect(pipe_sender_client, relay_pub, device_sender, |_, _, _| {}, nk.factory())
+        TruesealSession::connect(pipe_sender_client, relay_pub, device_sender, |_, _, _| {}, nk.factory())
             .expect("sender");
     // A connects second.
-    let _session_a = HushSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _, _seq| {
+    let _session_a = TruesealSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _, _seq| {
         rx.lock().unwrap().push(msg);
     }, nk.factory())
     .expect("session A");
@@ -274,14 +274,14 @@ fn push_does_not_expose_stable_noise_key_to_relay() {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use hush_noise::keypair::Keypair;
+    use trueseal_noise::keypair::Keypair;
 
     use crate::device::DeviceKeypair;
     use crate::message::Message;
     use crate::operation_log::MemLog;
     use crate::relay::{frame, MsgType};
     use crate::session::test_helpers::*;
-    use crate::session::HushSession;
+    use crate::session::TruesealSession;
     use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
     use crate::keys::{NoisePublicKey, SigningPublicKey};
 
@@ -302,7 +302,7 @@ fn push_does_not_expose_stable_noise_key_to_relay() {
     {
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _xx = hush_noise::session_xx::accept(pipe_relay, relay_kp2).unwrap();
+            let _xx = trueseal_noise::session_xx::accept(pipe_relay, relay_kp2).unwrap();
             while let Ok(nk_pipe) = nk_rx.recv() {
                 let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
                 let spy = spy_keys_c.clone();
@@ -312,11 +312,11 @@ fn push_does_not_expose_stable_noise_key_to_relay() {
                     // To spy, we accept the NK session and record the first 32 bytes of
                     // what the initiator sent (the ephemeral key in the Noise NK -> e, es msg).
                     // For simplicity: we verify the property at the `push_send` level by
-                    // using hush_noise::session_nk::accept and checking via relay_pub_bytes.
+                    // using trueseal_noise::session_nk::accept and checking via relay_pub_bytes.
                     // The real check: after accept, the remote static key is UNKNOWN (NK =
                     // no initiator static). We record that accept succeeded without needing
                     // the remote static key — confirming relay received no stable identity.
-                    if let Ok(_sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(_sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         // NK accept succeeded: relay did not need to know the initiator's
                         // stable noise key. Record a sentinel to count successful pushes.
                         spy.lock().unwrap().push([0u8; 32]); // count only, key unknown to relay
@@ -350,7 +350,7 @@ fn push_does_not_expose_stable_noise_key_to_relay() {
         &sk,
     );
 
-    let session = HushSession::connect_with_log(
+    let session = TruesealSession::connect_with_log(
         pipe_client,
         relay_pub,
         device,

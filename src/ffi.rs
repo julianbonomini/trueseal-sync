@@ -1,6 +1,6 @@
 // FFI surface for Swift and Kotlin via UniFFI (proc-macro mode).
 //
-// Exposes a single `HushFfiSession` object over TCP transport.
+// Exposes a single `TruesealFfiSession` object over TCP transport.
 // All key material crosses the boundary as `Vec<u8>`; wrong-length inputs
 // return `SessionError` — no silent failures.
 
@@ -12,7 +12,7 @@ use crate::device::DeviceKeypair;
 use crate::keys::NoisePublicKey;
 use crate::member::{member_id, member_name};
 use crate::message::Message;
-use crate::session::{HushSession, SessionError as CoreSessionError};
+use crate::session::{TruesealSession, SessionError as CoreSessionError};
 use crate::store::{PersistentLog, Store};
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -118,18 +118,18 @@ pub trait ConnectionChangedCallback: Send + Sync {
     fn on_connection_changed(&self, connected: bool);
 }
 
-// ── HushFfiSession ────────────────────────────────────────────────────────────
+// ── TruesealFfiSession ────────────────────────────────────────────────────────────
 
-/// A connected hush-sync session over TCP.
+/// A connected trueseal-sync session over TCP.
 ///
-/// Create via `HushFfiSession.create(...)`.  All key arguments are raw bytes.
+/// Create via `TruesealFfiSession.create(...)`.  All key arguments are raw bytes.
 #[derive(uniffi::Object)]
-pub struct HushFfiSession {
-    inner: HushSession<TcpStream>,
+pub struct TruesealFfiSession {
+    inner: TruesealSession<TcpStream>,
 }
 
 #[uniffi::export]
-impl HushFfiSession {
+impl TruesealFfiSession {
     /// Create a session. Always succeeds — the relay connects in the background.
     ///
     /// - `base_dir`: directory where the SQLite database is stored
@@ -213,7 +213,7 @@ impl HushFfiSession {
         let receive_addr = format!("{}:7700", relay_host);
         let push_addr = format!("{}:7701", relay_host);
         let relay_addr_factory = receive_addr.clone();
-        let inner = HushSession::connect_background(
+        let inner = TruesealSession::connect_background(
             relay_pub_key,
             keypair,
             move |msg, author_signing_pub, _sequence| {
@@ -482,7 +482,7 @@ mod tests {
         let relay_pub = vec![0u8; 32];
 
         for bad in &["", "bad namespace", "no/slash", "dot.bad", "sp ace"] {
-            let result = HushFfiSession::create(
+            let result = TruesealFfiSession::create(
                 dir.path().to_string_lossy().into_owned(),
                 bad.to_string(),
                 "relay.example.com".into(),

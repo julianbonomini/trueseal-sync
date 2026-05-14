@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues live in GitHub Issues (`julianbonomini/hush-sync`). See `docs/agents/issue-tracker.md`.
+Issues live in GitHub Issues (`julianbonomini/trueseal-sync`). See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

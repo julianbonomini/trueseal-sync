@@ -8,7 +8,7 @@ use crate::member::member_id;
 use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
-use super::super::HushSession;
+use super::super::TruesealSession;
 use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
 
 use super::make_two_member_manifest;
@@ -32,7 +32,7 @@ fn on_member_joined_fires_on_admitting_device() {
     let token_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let ts = token_slot.clone();
 
-    let session_a = HushSession::connect_full(
+    let session_a = TruesealSession::connect_full(
         pipe_a_client,
         relay_pub,
         device_a,
@@ -55,7 +55,7 @@ fn on_member_joined_fires_on_admitting_device() {
 
     let pairing_token = session_a.pairing_token();
 
-    let _session_b = HushSession::connect_full(
+    let _session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -102,7 +102,7 @@ fn on_member_joined_fires_on_existing_members_via_manifest() {
     let b_joined: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let bjc = b_joined.clone();
 
-    let session_a = HushSession::connect_full(
+    let session_a = TruesealSession::connect_full(
         pipe_a_client,
         relay_pub,
         device_a,
@@ -115,7 +115,7 @@ fn on_member_joined_fires_on_existing_members_via_manifest() {
     )
     .expect("session A");
 
-    let session_b = HushSession::connect_full(
+    let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -204,7 +204,7 @@ fn on_member_left_fires_when_member_removed() {
     let b_left: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let blc = b_left.clone();
 
-    let session_a = HushSession::connect_full(
+    let session_a = TruesealSession::connect_full(
         pipe_a_client,
         relay_pub,
         device_a,
@@ -217,7 +217,7 @@ fn on_member_left_fires_when_member_removed() {
     )
     .expect("session A");
 
-    let session_b = HushSession::connect_full(
+    let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -311,7 +311,7 @@ fn on_member_left_does_not_fire_for_local_device() {
     let b_removed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let brc = b_removed.clone();
 
-    let session_a = HushSession::connect_full(
+    let session_a = TruesealSession::connect_full(
         pipe_a_client,
         relay_pub,
         device_a,
@@ -324,7 +324,7 @@ fn on_member_left_does_not_fire_for_local_device() {
     )
     .expect("session A");
 
-    let session_b = HushSession::connect_full(
+    let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,

@@ -8,7 +8,7 @@ use crate::operation_log::MemLog;
 use crate::store::Store;
 
 use super::super::test_helpers::*;
-use super::super::{HushSession, SessionError};
+use super::super::{TruesealSession, SessionError};
 use super::make_two_member_manifest;
 
 /// destroy_group() fires on_group_destroyed on the initiating device.
@@ -19,12 +19,12 @@ fn destroy_group_fires_on_group_destroyed_on_initiator() {
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let (nk_rx, nk) = nk_push_channel();
     {
-        let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
+            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
             while let Ok(p) = nk_rx.recv() {
-                let kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { if let Ok(sess) = hush_noise::session_nk::accept(p, kp2) {
+                let kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || { if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
                 if sess.receive().is_ok() {
                     let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
                 }
@@ -35,7 +35,7 @@ fn destroy_group_fires_on_group_destroyed_on_initiator() {
     let device = DeviceKeypair::generate();
     let destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let dc = destroyed.clone();
-    let session = HushSession::connect_full(
+    let session = TruesealSession::connect_full(
         pipe_client,
         relay_pub,
         device,
@@ -79,7 +79,7 @@ fn destroy_group_fires_on_group_destroyed_on_all_members() {
     let b_destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let bdc = b_destroyed.clone();
 
-    let session_a = HushSession::connect_full(
+    let session_a = TruesealSession::connect_full(
         pipe_a_client,
         relay_pub,
         device_a,
@@ -92,7 +92,7 @@ fn destroy_group_fires_on_group_destroyed_on_all_members() {
     )
     .expect("session A");
 
-    let session_b = HushSession::connect_full(
+    let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -129,12 +129,12 @@ fn push_sync_after_destroy_returns_group_destroyed() {
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let (nk_rx, nk) = nk_push_channel();
     {
-        let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
+            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
             while let Ok(p) = nk_rx.recv() {
-                let kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { if let Ok(sess) = hush_noise::session_nk::accept(p, kp2) {
+                let kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || { if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
                 if sess.receive().is_ok() {
                     let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
                 }
@@ -148,7 +148,7 @@ fn push_sync_after_destroy_returns_group_destroyed() {
     let sk = SigningKey::from_bytes(&device.signing.to_bytes());
     let dummy = DeviceKeypair::generate();
 
-    let session = HushSession::connect_full(
+    let session = TruesealSession::connect_full(
         pipe_client,
         relay_pub,
         device,
@@ -229,12 +229,12 @@ fn on_group_destroyed_callback_wipes_store() {
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let (nk_rx, nk) = nk_push_channel();
     {
-        let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = hush_noise::session_xx::accept(pipe_relay, kp);
+            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
             while let Ok(p) = nk_rx.recv() {
-                let kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { if let Ok(sess) = hush_noise::session_nk::accept(p, kp2) {
+                let kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || { if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
                 if sess.receive().is_ok() {
                     let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
                 }
@@ -271,7 +271,7 @@ fn on_group_destroyed_callback_wipes_store() {
 
     let wipe_store = Arc::new(Mutex::new(wipe_store));
 
-    let session = HushSession::connect_full(
+    let session = TruesealSession::connect_full(
         pipe_client,
         relay_pub,
         device,
@@ -323,9 +323,9 @@ fn destroy_group_stops_outbox_replay() {
     let rr = relay_received.clone();
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     {
-        let relay_kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let s = match hush_noise::session_xx::accept(pipe_relay, relay_kp2) {
+            let s = match trueseal_noise::session_xx::accept(pipe_relay, relay_kp2) {
                 Ok(s) => s,
                 Err(_) => return,
             };
@@ -360,7 +360,7 @@ fn destroy_group_stops_outbox_replay() {
     // Session starts offline; factory initially fails so it never connects.
     let should_connect = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sc = should_connect.clone();
-    let session: HushSession<MemPipe> = HushSession::connect_background(
+    let session: TruesealSession<MemPipe> = TruesealSession::connect_background(
         relay_pub,
         device,
         |_, _, _| {},

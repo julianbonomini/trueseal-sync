@@ -1,4 +1,4 @@
-//! hush-cli — interactive PoC CLI for hush-sync
+//! trueseal-cli — interactive PoC CLI for trueseal-sync
 //!
 //! Starts a session connected to a live relay and drops into a REPL.
 //! All state (keypair, manifest, outbox) is persisted in a SQLite database
@@ -6,7 +6,7 @@
 //! reconnect — demonstrating guaranteed delivery.
 //!
 //! Usage:
-//!   hush-cli --dir ./device-a --relay 127.0.0.1 --relay-pub <64-char-hex>
+//!   trueseal-cli --dir ./device-a --relay 127.0.0.1 --relay-pub <64-char-hex>
 //!
 //! Commands:
 //!   token              print your pairing token (share with another device)
@@ -23,11 +23,11 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use hush_sync::{
+use trueseal_sync::{
     device::DeviceKeypair,
     keys::NoisePublicKey,
     message::Message,
-    session::HushSession,
+    session::TruesealSession,
     store::{PersistentLog, Store},
 };
 
@@ -92,7 +92,7 @@ fn main() {
     let recv_addr = receive_addr.clone();
     let push_addr_cb = push_addr.clone();
 
-    let session = HushSession::<TcpStream>::connect_background(
+    let session = TruesealSession::<TcpStream>::connect_background(
         relay_pub,
         keypair,
         // on_message — fires for every decrypted Sync blob delivered by the relay.
@@ -292,7 +292,7 @@ fn require_flag(args: &[String], flag: &str) -> String {
         .map(|w| w[1].clone())
         .unwrap_or_else(|| {
             eprintln!("missing required flag: {}", flag);
-            eprintln!("usage: hush-cli --dir <path> --relay <host> --relay-pub <64-char-hex>");
+            eprintln!("usage: trueseal-cli --dir <path> --relay <host> --relay-pub <64-char-hex>");
             std::process::exit(1);
         })
 }

@@ -67,7 +67,7 @@ The protocol is: decrypt first to learn who claims to be the author; verify the 
 
 ### Caller transparency
 
-These changes are entirely below the `HushSession` facade. The caller-facing API is unchanged:
+These changes are entirely below the `TruesealSession` facade. The caller-facing API is unchanged:
 
 - `send(blob)` — unchanged
 - `on_message(blob, sender_noise_pub)` — unchanged; sender identity is still resolved by looking up the extracted `author_pub` (signing key) in the current manifest to find the corresponding noise pub

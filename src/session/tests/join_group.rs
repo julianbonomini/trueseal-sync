@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::device::DeviceKeypair;
 
 use super::super::test_helpers::*;
-use super::super::HushSession;
+use super::super::TruesealSession;
 
 /// B calls join_group(A.pairing_token()) — A's pairing handler receives B's Pair.
 /// Pair messages are consumed by the pairing handler (not forwarded to on_message),
@@ -26,9 +26,9 @@ fn join_group_sends_pair_message_to_initiator() {
 
     // B connects first — matches relay accept order.
     let session_b =
-        HushSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
+        TruesealSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
 
     // Capture the opaque token issued when B's Pair arrives.
     let req_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -69,14 +69,14 @@ fn join_group_invalid_token_returns_error() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
-    let relay_kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
     let (nk_rx2, nk2) = nk_push_channel();
     std::thread::spawn(move || {
-        let _ = hush_noise::session_xx::accept(pipe_relay, relay_kp2);
+        let _ = trueseal_noise::session_xx::accept(pipe_relay, relay_kp2);
         while let Ok(p) = nk_rx2.recv() {
-            let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+            let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
             std::thread::spawn(move || {
-                if let Ok(sess) = hush_noise::session_nk::accept(p, kp) {
+                if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp) {
                     if sess.receive().is_ok() {
                         let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
                     }
@@ -86,7 +86,7 @@ fn join_group_invalid_token_returns_error() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk2.factory()).expect("connect");
+    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk2.factory()).expect("connect");
 
     let result = session.join_group("not-a-valid-token!!!!");
     assert!(

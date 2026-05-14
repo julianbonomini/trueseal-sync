@@ -2,7 +2,7 @@
 
 ## Context
 
-Prior to this decision, hush-sync had no first-class concept of a Sync Group. Each Device maintained a flat `PairedList` populated one device at a time through pairwise pairing ceremonies. Those lists were never synchronised between devices, so membership was inconsistent by construction:
+Prior to this decision, trueseal-sync had no first-class concept of a Sync Group. Each Device maintained a flat `PairedList` populated one device at a time through pairwise pairing ceremonies. Those lists were never synchronised between devices, so membership was inconsistent by construction:
 
 - Device A paired with B and C meant A knew both, but B and C had no knowledge of each other.
 - If A went offline, B and C could not reach each other.

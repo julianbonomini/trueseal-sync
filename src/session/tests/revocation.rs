@@ -2,7 +2,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use hush_noise::{keypair::Keypair, session_xx::accept};
+use trueseal_noise::{keypair::Keypair, session_xx::accept};
 
 use crate::device::DeviceKeypair;
 use crate::message::Message;
@@ -10,7 +10,7 @@ use crate::operation_log::MemLog;
 use crate::relay::{frame, parse, MsgType};
 
 use super::super::test_helpers::*;
-use super::super::{HushSession, SessionError};
+use super::super::{TruesealSession, SessionError};
 use super::make_two_member_manifest;
 
 /// Regression: after B reconnects, A's destroy_group must still fire B's on_group_destroyed.
@@ -58,7 +58,7 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
     let pipe_a2_slot: Arc<Mutex<Option<MemPipe>>> = Arc::new(Mutex::new(Some(pipe_a2_client)));
     let pipe_a2_slot2 = pipe_a2_slot.clone();
     let session_a = Arc::new(
-        HushSession::connect_with_reconnect(
+        TruesealSession::connect_with_reconnect(
             pipe_a1_client,
             relay_pub,
             device_a,
@@ -90,7 +90,7 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
     let pipe_b2_slot: Arc<Mutex<Option<MemPipe>>> = Arc::new(Mutex::new(Some(pipe_b2_client)));
     let pipe_b2_slot2 = pipe_b2_slot.clone();
     let session_b = Arc::new(
-        HushSession::connect_with_reconnect(
+        TruesealSession::connect_with_reconnect(
             pipe_b1_client,
             relay_pub,
             device_b,
@@ -196,7 +196,7 @@ fn destroy_group_fires_on_group_destroyed_for_all_members() {
     let a_destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let ad = a_destroyed.clone();
     let session_a = Arc::new(
-        HushSession::connect_full(
+        TruesealSession::connect_full(
             pipe_a_client,
             relay_pub,
             device_a,
@@ -215,7 +215,7 @@ fn destroy_group_fires_on_group_destroyed_for_all_members() {
     let b_destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let bd = b_destroyed.clone();
     let session_b = Arc::new(
-        HushSession::connect_full(
+        TruesealSession::connect_full(
             pipe_b_client,
             relay_pub,
             device_b,
@@ -273,7 +273,7 @@ fn revoke_from_unknown_device_is_ignored() {
                 let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
                 let sess_a2 = sess_a.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
@@ -300,7 +300,7 @@ fn revoke_from_unknown_device_is_ignored() {
     let destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let dc = destroyed.clone();
     let session_a = Arc::new(
-        HushSession::connect_full(
+        TruesealSession::connect_full(
             pipe_a_client,
             relay_pub,
             device_a,
@@ -324,7 +324,7 @@ fn revoke_from_unknown_device_is_ignored() {
     ));
 
     let session_stranger =
-        HushSession::connect(pipe_stranger_client, relay_pub, device_stranger, |_, _, _| {}, nk.factory())
+        TruesealSession::connect(pipe_stranger_client, relay_pub, device_stranger, |_, _, _| {}, nk.factory())
             .expect("stranger");
     session_stranger
         .push_message(&Message::Revoke, session_a.noise_pub())
@@ -372,7 +372,7 @@ fn destroy_group_with_no_manifest_fires_callback_and_is_terminal() {
 
     let destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let dc = destroyed.clone();
-    let session = HushSession::connect_full(
+    let session = TruesealSession::connect_full(
         pipe_client,
         relay_pub,
         device,

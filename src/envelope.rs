@@ -7,7 +7,7 @@ use crate::keys::{NoisePublicKey, SigningPublicKey};
 
 // Include the prost-generated types from proto/envelope.proto
 mod proto {
-    include!(concat!(env!("OUT_DIR"), "/hush.sync.v0.rs"));
+    include!(concat!(env!("OUT_DIR"), "/trueseal.sync.v0.rs"));
 }
 
 #[derive(Debug, Error)]

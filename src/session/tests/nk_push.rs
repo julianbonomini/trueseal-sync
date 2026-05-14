@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hush_noise::keypair::Keypair;
+use trueseal_noise::keypair::Keypair;
 
 use crate::device::DeviceKeypair;
 use crate::message::Message;
@@ -29,7 +29,7 @@ fn relay_observer_confirms_different_ephemeral_keys_per_push() {
     // Stub relays: accept NK, receive Push, send Ack.
     for (pipe_r, kp) in [(pipe1_r, relay_kp1), (pipe2_r, relay_kp2)] {
         std::thread::spawn(move || {
-            let sess = hush_noise::session_nk::accept(pipe_r, kp).expect("NK accept");
+            let sess = trueseal_noise::session_nk::accept(pipe_r, kp).expect("NK accept");
             if let Ok(raw) = sess.receive() {
                 if let Some((MsgType::Push, _)) = parse(&raw) {
                     let _ = sess.send(&frame(MsgType::Ack, &[]));
@@ -62,10 +62,10 @@ fn on_message_fires_via_xx_receive_after_nk_push() {
     // Fake relay: accepts A's XX, then NK push; routes Push → Deliver to A's XX; sends Ack back.
     std::thread::spawn(move || {
         let xx_sess = Arc::new(
-            hush_noise::session_xx::accept(pipe_a_relay, relay_kp_xx).expect("XX accept"),
+            trueseal_noise::session_xx::accept(pipe_a_relay, relay_kp_xx).expect("XX accept"),
         );
         let nk_sess =
-            hush_noise::session_nk::accept(push_pipe_relay, relay_kp_nk).expect("NK accept");
+            trueseal_noise::session_nk::accept(push_pipe_relay, relay_kp_nk).expect("NK accept");
         loop {
             let raw = match nk_sess.receive() {
                 Ok(r) => r,
@@ -94,7 +94,7 @@ fn on_message_fires_via_xx_receive_after_nk_push() {
     let client_a = RelayClient::connect(
         pipe_a_client,
         relay_pub,
-        hush_noise::keypair::Keypair::new(device_a.noise.private(), device_a.noise.public_key),
+        trueseal_noise::keypair::Keypair::new(device_a.noise.private(), device_a.noise.public_key),
     )
     .expect("A XX connect");
     client_a.subscribe(move |msg, _, _seq| {
@@ -140,7 +140,7 @@ fn push_send_returns_ok_when_relay_acks() {
 
     // Stub relay: accepts NK, receives Push, sends Ack with sequence 0.
     std::thread::spawn(move || {
-        let sess = hush_noise::session_nk::accept(pipe_r, relay_kp2).expect("NK accept");
+        let sess = trueseal_noise::session_nk::accept(pipe_r, relay_kp2).expect("NK accept");
         if let Ok(raw) = sess.receive() {
             if let Some((MsgType::Push, _)) = parse(&raw) {
                 let seq: u64 = 0;
@@ -164,7 +164,7 @@ fn push_send_errors_on_missing_ack() {
 
     // Stub relay: accepts NK, receives Push, sends wrong response type (not Ack).
     std::thread::spawn(move || {
-        let sess = hush_noise::session_nk::accept(pipe_r, relay_kp2).expect("NK accept");
+        let sess = trueseal_noise::session_nk::accept(pipe_r, relay_kp2).expect("NK accept");
         if let Ok(_) = sess.receive() {
             // Send Deliver instead of Ack — wrong type.
             let _ = sess.send(&frame(MsgType::Deliver, b"wrong"));
@@ -220,7 +220,7 @@ fn push_send_accepts_zero_byte_ack() {
 
     // Stub relay: sends 0-byte Ack (ADR-0019 locked body length).
     std::thread::spawn(move || {
-        let sess = hush_noise::session_nk::accept(pipe_r, relay_kp2).expect("NK accept");
+        let sess = trueseal_noise::session_nk::accept(pipe_r, relay_kp2).expect("NK accept");
         if let Ok(_) = sess.receive() {
             let _ = sess.send(&frame(MsgType::Ack, &[]));
         }
@@ -251,7 +251,7 @@ fn run_loop_echoes_heartbeat_on_receive_session() {
 
     // Relay: accepts XX, sends Heartbeat, waits for echo back.
     std::thread::spawn(move || {
-        let sess = hush_noise::session_xx::accept(pipe_relay, relay_kp2).expect("XX accept");
+        let sess = trueseal_noise::session_xx::accept(pipe_relay, relay_kp2).expect("XX accept");
         let _ = sess.send(&frame(MsgType::Heartbeat, &[]));
         if let Ok(raw) = sess.receive() {
             if let Some((MsgType::Heartbeat, _)) = parse(&raw) {
@@ -264,7 +264,7 @@ fn run_loop_echoes_heartbeat_on_receive_session() {
     let _client = RelayClient::connect(
         pipe_client,
         relay_pub,
-        hush_noise::keypair::Keypair::new(device.noise.private(), device.noise.public_key),
+        trueseal_noise::keypair::Keypair::new(device.noise.private(), device.noise.public_key),
     )
     .expect("connect");
 
@@ -294,7 +294,7 @@ fn run_loop_silently_drops_ack_on_receive_session() {
     let rx = received.clone();
 
     std::thread::spawn(move || {
-        let sess = hush_noise::session_xx::accept(pipe_relay, relay_kp2).expect("XX accept");
+        let sess = trueseal_noise::session_xx::accept(pipe_relay, relay_kp2).expect("XX accept");
         // Send a spurious Ack — run_loop must not crash or close.
         let _ = sess.send(&frame(MsgType::Ack, &[]));
         // Then deliver a real message — proves session is still alive.
@@ -315,7 +315,7 @@ fn run_loop_silently_drops_ack_on_receive_session() {
     let client = RelayClient::connect(
         pipe_client,
         relay_pub,
-        hush_noise::keypair::Keypair::new(device_a_noise_priv, device_a_noise_pub),
+        trueseal_noise::keypair::Keypair::new(device_a_noise_priv, device_a_noise_pub),
     )
     .expect("connect");
     client.subscribe(move |msg, _, _seq| { rx.lock().unwrap().push(msg); });
@@ -341,7 +341,7 @@ fn run_loop_sends_deliver_ack_before_decryption() {
     let ack_clone = ack_received.clone();
 
     std::thread::spawn(move || {
-        let sess = hush_noise::session_xx::accept(pipe_relay, relay_kp2).expect("XX accept");
+        let sess = trueseal_noise::session_xx::accept(pipe_relay, relay_kp2).expect("XX accept");
         // Send a Deliver frame with blob_id prefix — garbage envelope bytes
         // (decryption will fail, but DeliverAck must still arrive).
         let blob_id: u64 = 0xDEAD_BEEF_1234_5678;
@@ -364,7 +364,7 @@ fn run_loop_sends_deliver_ack_before_decryption() {
     let _client = RelayClient::connect(
         pipe_client,
         relay_pub,
-        hush_noise::keypair::Keypair::new(device.noise.private(), device.noise.public_key),
+        trueseal_noise::keypair::Keypair::new(device.noise.private(), device.noise.public_key),
     )
     .expect("connect");
 
@@ -397,7 +397,7 @@ fn subscribe_callback_receives_sequence() {
     let seq_clone = seq_received.clone();
 
     std::thread::spawn(move || {
-        let sess = hush_noise::session_xx::accept(pipe_relay, relay_kp2).expect("XX accept");
+        let sess = trueseal_noise::session_xx::accept(pipe_relay, relay_kp2).expect("XX accept");
 
         let msg = Message::Sync { body: b"hello".to_vec() };
         let blob = crate::relay::build_push_blob(
@@ -416,7 +416,7 @@ fn subscribe_callback_receives_sequence() {
     let client = RelayClient::connect(
         pipe_client,
         relay_pub,
-        hush_noise::keypair::Keypair::new(device_a_noise_priv, device_a_noise_pub),
+        trueseal_noise::keypair::Keypair::new(device_a_noise_priv, device_a_noise_pub),
     )
     .expect("connect");
 

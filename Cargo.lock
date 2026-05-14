@@ -699,41 +699,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hush-noise"
-version = "0.1.0"
-dependencies = [
- "rand",
- "snow",
- "thiserror",
- "uniffi",
- "x25519-dalek",
- "zeroize",
-]
-
-[[package]]
-name = "hush-sync"
-version = "0.1.0"
-dependencies = [
- "base64",
- "chacha20poly1305",
- "ed25519-dalek",
- "hkdf",
- "hush-noise",
- "log",
- "prost",
- "prost-build",
- "protox",
- "rand",
- "rusqlite",
- "sha2",
- "tempfile",
- "thiserror",
- "tokio",
- "uniffi",
- "x25519-dalek",
-]
-
-[[package]]
 name = "id-arena"
 version = "2.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1525,6 +1490,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "trueseal-noise"
+version = "0.1.0"
+dependencies = [
+ "rand",
+ "snow",
+ "thiserror",
+ "uniffi",
+ "x25519-dalek",
+ "zeroize",
+]
+
+[[package]]
+name = "trueseal-sync"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "hkdf",
+ "log",
+ "prost",
+ "prost-build",
+ "protox",
+ "rand",
+ "rusqlite",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "trueseal-noise",
+ "uniffi",
+ "x25519-dalek",
 ]
 
 [[package]]

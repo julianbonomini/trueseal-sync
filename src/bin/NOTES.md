@@ -1,6 +1,6 @@
 # Prototype: error handling strategy
 
-**Question:** What is the right mutex error-handling strategy for HushSession?
+**Question:** What is the right mutex error-handling strategy for TruesealSession?
 The session has ~66 `Mutex::lock().unwrap()` calls. Three approaches are modelled.
 
 **Run:** `cargo run --bin prototype_error_handling`

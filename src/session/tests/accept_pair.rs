@@ -8,7 +8,7 @@ use crate::message::Message;
 use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
-use super::super::HushSession;
+use super::super::TruesealSession;
 use super::{make_one_member_manifest, make_two_member_manifest};
 
 /// A admits B into an empty group → both have a 2-member manifest.
@@ -29,11 +29,11 @@ fn accept_pair_creates_genesis_manifest() {
 
     // A connects first (relay accepts pipe_a_relay first).
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
     // B connects second, collects inbound GroupManifest.
     let b_manifests: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let bm = b_manifests.clone();
-    let _session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
+    let _session_b = TruesealSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
         bm.lock().unwrap().push(msg);
     }, nk.factory())
     .expect("session B");
@@ -70,12 +70,12 @@ fn accept_pair_sends_manifest_to_new_member() {
     let b_signing = device_b.signing_public_key();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
 
     let b_manifest_received: Arc<Mutex<Option<crate::manifest::GroupManifest>>> =
         Arc::new(Mutex::new(None));
     let bmr = b_manifest_received.clone();
-    let _session_b = HushSession::connect_full(
+    let _session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -109,14 +109,14 @@ fn accept_pair_without_window_returns_false() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let (nk_rx, nk) = nk_push_channel();
-    let relay_kp2 = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
     std::thread::spawn(move || {
-        let _ = hush_noise::session_xx::accept(pipe_relay, relay_kp2);
+        let _ = trueseal_noise::session_xx::accept(pipe_relay, relay_kp2);
         // drain nk_rx so push_factory doesn't block if accidentally called
         while let Ok(pipe) = nk_rx.recv() {
-            let kp = hush_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+            let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
             std::thread::spawn(move || {
-                if let Ok(sess) = hush_noise::session_nk::accept(pipe, kp) {
+                if let Ok(sess) = trueseal_noise::session_nk::accept(pipe, kp) {
                     if sess.receive().is_ok() {
                         let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
                     }
@@ -126,7 +126,7 @@ fn accept_pair_without_window_returns_false() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("connect");
+    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("connect");
 
     let dummy_noise = crate::keys::NoisePublicKey([0xAA; 32]);
     let dummy_signing = crate::keys::SigningPublicKey([0xBB; 32]);
@@ -166,11 +166,11 @@ fn accept_pair_extends_existing_manifest() {
     let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, dummy_b_noise, dummy_b_signing);
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
     session_a.set_manifest(v1);
 
     let c_manifest_arc = {
-        let _session_c = HushSession::connect_full(
+        let _session_c = TruesealSession::connect_full(
             pipe_c_client,
             relay_pub,
             device_c,
@@ -226,13 +226,13 @@ fn new_member_bootstrap_can_send_to_existing_members() {
 
     // A and B already form a 2-member group.
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
     let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, b_noise, b_signing);
     session_a.set_manifest(v1.clone());
 
     let b_received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let br = b_received.clone();
-    let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
+    let session_b = TruesealSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
         if let crate::message::Message::Sync { body } = msg {
             br.lock().unwrap().push(body);
         }
@@ -242,7 +242,7 @@ fn new_member_bootstrap_can_send_to_existing_members() {
 
     // C connects; no manifest yet.
     let session_c =
-        HushSession::connect(pipe_c_client, relay_pub, device_c, |_, _, _| {}, nk.factory()).expect("session C");
+        TruesealSession::connect(pipe_c_client, relay_pub, device_c, |_, _, _| {}, nk.factory()).expect("session C");
 
     // A opens pairing window and admits C.
     let _token = session_a.pairing_token();

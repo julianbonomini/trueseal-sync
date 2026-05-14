@@ -2,7 +2,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use hush_noise::{keypair::Keypair, session_xx::accept};
+use trueseal_noise::{keypair::Keypair, session_xx::accept};
 
 use crate::device::DeviceKeypair;
 use crate::envelope::Envelope;
@@ -11,7 +11,7 @@ use crate::relay::{frame, parse, MsgType};
 use crate::store::{PersistentLog, Store};
 
 use super::super::test_helpers::*;
-use super::super::HushSession;
+use super::super::TruesealSession;
 use super::make_two_member_manifest;
 
 #[test]
@@ -28,7 +28,7 @@ fn push_sync_appends_and_marks_delivered() {
             while let Ok(nk_pipe) = nk_rx.recv() {
                 let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
                 std::thread::spawn(move || {
-                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if sess.receive().is_ok() {
                             let _ = sess.send(&frame(MsgType::Ack, &[]));
                         }
@@ -45,7 +45,7 @@ fn push_sync_appends_and_marks_delivered() {
     let d_sk = SigningKey::from_bytes(&device.signing.to_bytes());
     let r_noise = recipient.public_key();
     let r_signing = recipient.signing_public_key();
-    let session = HushSession::connect_with_log(
+    let session = TruesealSession::connect_with_log(
         pipe_client,
         relay_pub,
         device,
@@ -94,7 +94,7 @@ fn undelivered_entries_replayed_after_reconnect() {
                 let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
                 let rx2 = rx.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
@@ -121,7 +121,7 @@ fn undelivered_entries_replayed_after_reconnect() {
     let d_sk = SigningKey::from_bytes(&device.signing.to_bytes());
     let r_noise = recipient.public_key();
     let r_signing = recipient.signing_public_key();
-    let session = HushSession::connect_with_reconnect(
+    let session = TruesealSession::connect_with_reconnect(
         pipe1_client,
         relay_pub,
         device,
@@ -189,7 +189,7 @@ fn push_sync_while_disconnected_queues_and_returns_ok() {
     let d_sk = SigningKey::from_bytes(&device.signing.to_bytes());
     let r_noise = recipient.public_key();
     let r_signing = recipient.signing_public_key();
-    let session = HushSession::connect_with_log(
+    let session = TruesealSession::connect_with_log(
         pipe_client,
         relay_pub,
         device,
@@ -258,7 +258,7 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
                 let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
                 let rr2 = rr.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = hush_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if sess.receive().is_ok() {
                             let _ = sess.send(&frame(MsgType::Ack, &[]));
                             let (lock, cvar) = &*rr2;
@@ -277,7 +277,7 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
         let pipe2_slot2 = pipe2_slot.clone();
         let device1 = DeviceKeypair::from_bytes(device_noise_priv, device_signing_priv)
             .expect("reconstruct device1");
-        let session1 = HushSession::connect_background(
+        let session1 = TruesealSession::connect_background(
             relay_pub,
             device1,
             |_, _, _| {},
@@ -324,7 +324,7 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
     // ── Step 3: new session with same DB, reconnect loop replays outbox ───────
     let device2 = DeviceKeypair::from_bytes(device_noise_priv, device_signing_priv)
         .expect("reconstruct device");
-    let session2 = HushSession::connect_background(
+    let session2 = TruesealSession::connect_background(
         relay_pub,
         device2,
         |_, _, _| {},
@@ -390,7 +390,7 @@ fn sequence_counter_not_reused_after_restart() {
         p_signing = peer.signing_public_key();
 
         // Use connect_background (offline) to avoid needing a relay.
-        let session1: HushSession<MemPipeSimple> = HushSession::connect_background(
+        let session1: TruesealSession<MemPipeSimple> = TruesealSession::connect_background(
             // Dummy relay pub — session never connects.
             crate::keys::NoisePublicKey([0u8; 32]),
             device,
@@ -433,7 +433,7 @@ fn sequence_counter_not_reused_after_restart() {
         let d_noise2 = device2.public_key();
         let d_signing2 = device2.signing_public_key();
 
-        let session2: HushSession<MemPipeSimple> = HushSession::connect_background(
+        let session2: TruesealSession<MemPipeSimple> = TruesealSession::connect_background(
             crate::keys::NoisePublicKey([0u8; 32]),
             device2,
             |_, _, _| {},

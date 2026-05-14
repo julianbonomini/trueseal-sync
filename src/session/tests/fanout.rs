@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use hush_noise::{keypair::Keypair, session_xx::accept};
+use trueseal_noise::{keypair::Keypair, session_xx::accept};
 
 use crate::device::DeviceKeypair;
 use crate::message::Message;
@@ -10,7 +10,7 @@ use crate::operation_log::MemLog;
 use crate::session::SessionError;
 
 use super::super::test_helpers::*;
-use super::super::HushSession;
+use super::super::TruesealSession;
 
 /// push_sync with no manifest returns NotInGroup.
 #[test]
@@ -25,7 +25,7 @@ fn push_sync_no_manifest_returns_not_in_group() {
             let _ = accept(pipe_relay, relay_kp2);
             while let Ok(p) = nk_rx.recv() {
                 let kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { if let Ok(sess) = hush_noise::session_nk::accept(p, kp2) {
+                std::thread::spawn(move || { if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
                 if sess.receive().is_ok() {
                     let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
                 }
@@ -34,7 +34,7 @@ fn push_sync_no_manifest_returns_not_in_group() {
         });
     }
     let device = DeviceKeypair::generate();
-    let session = HushSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("connect");
+    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("connect");
     let result = session.push_sync(b"hello".to_vec());
     assert!(
         matches!(result, Err(SessionError::NotInGroup)),
@@ -82,11 +82,11 @@ fn push_sync_fans_out_to_all_members() {
     let manifest_c = GroupManifest::new(group_id, 1, members.clone(), &c_sk);
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
 
     let received_b: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx_b = received_b.clone();
-    let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
+    let session_b = TruesealSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
         rx_b.lock().unwrap().push(msg);
     }, nk.factory())
     .expect("session B");
@@ -94,7 +94,7 @@ fn push_sync_fans_out_to_all_members() {
 
     let received_c: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx_c = received_c.clone();
-    let session_c = HushSession::connect(pipe_c_client, relay_pub, device_c, move |msg, _, _seq| {
+    let session_c = TruesealSession::connect(pipe_c_client, relay_pub, device_c, move |msg, _, _seq| {
         rx_c.lock().unwrap().push(msg);
     }, nk.factory())
     .expect("session C");
@@ -170,7 +170,7 @@ fn push_sync_consumes_one_sequence_per_call() {
         &sk,
     );
 
-    let session = HushSession::connect_with_log(
+    let session = TruesealSession::connect_with_log(
         pipe_client,
         relay_pub,
         device,
@@ -261,10 +261,10 @@ fn push_sync_fans_out_to_n_recipients() {
     let received_d = make_received();
 
     let session_a =
-        HushSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("A");
-    let session_b = HushSession::connect(pipe_b_client, relay_pub, device_b, make_cb(received_b.clone()), nk.factory()).expect("B");
-    let session_c = HushSession::connect(pipe_c_client, relay_pub, device_c, make_cb(received_c.clone()), nk.factory()).expect("C");
-    let session_d = HushSession::connect(pipe_d_client, relay_pub, device_d, make_cb(received_d.clone()), nk.factory()).expect("D");
+        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("A");
+    let session_b = TruesealSession::connect(pipe_b_client, relay_pub, device_b, make_cb(received_b.clone()), nk.factory()).expect("B");
+    let session_c = TruesealSession::connect(pipe_c_client, relay_pub, device_c, make_cb(received_c.clone()), nk.factory()).expect("C");
+    let session_d = TruesealSession::connect(pipe_d_client, relay_pub, device_d, make_cb(received_d.clone()), nk.factory()).expect("D");
 
     session_a.set_manifest(manifest_a);
     session_b.set_manifest(manifest_b);

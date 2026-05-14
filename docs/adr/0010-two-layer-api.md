@@ -1,12 +1,12 @@
-# hush-sync exposes two layers: primitives and an opinionated session
+# trueseal-sync exposes two layers: primitives and an opinionated session
 
 ## Decision
 
-hush-sync exposes two distinct API layers:
+trueseal-sync exposes two distinct API layers:
 
-**Primitives** (`hush_sync::*`) — `DeviceKeypair`, `RelayClient`, `GroupManifest`, `OperationLog`, `Message`, `Envelope`. Pure Rust. No lifecycle management. Available for advanced callers: Go via C FFI, custom relay implementations, testing harnesses, and future protocol extensions.
+**Primitives** (`trueseal_sync::*`) — `DeviceKeypair`, `RelayClient`, `GroupManifest`, `OperationLog`, `Message`, `Envelope`. Pure Rust. No lifecycle management. Available for advanced callers: Go via C FFI, custom relay implementations, testing harnesses, and future protocol extensions.
 
-**Session** (`HushFfiSession` via UniFFI; `HushSession` in Rust) — an opinionated facade that wires the primitives together. Owns: session state persistence (identity, manifest, outbox via SQLite — ADR-0016), relay connection lifecycle, reconnection with backoff, group manifest maintenance, message dispatch, soft removal, and destroy group. The caller provides nothing for storage.
+**Session** (`TruesealFfiSession` via UniFFI; `TruesealSession` in Rust) — an opinionated facade that wires the primitives together. Owns: session state persistence (identity, manifest, outbox via SQLite — ADR-0016), relay connection lifecycle, reconnection with backoff, group manifest maintenance, message dispatch, soft removal, and destroy group. The caller provides nothing for storage.
 
 UniFFI exposes **only the session layer** to Swift and Kotlin. The primitives are Rust-only and not part of the cross-language surface.
 
@@ -14,7 +14,7 @@ UniFFI exposes **only the session layer** to Swift and Kotlin. The primitives ar
 
 ```swift
 // Construction — always succeeds; relay connects in background (ADR-0017)
-HushFfiSession.create(
+TruesealFfiSession.create(
     baseDir: String,                              // platform app data directory
     namespace: String,                            // scopes SQLite DB; defaults to "default"
     relayAddr: String,                            // "host:port"
@@ -23,7 +23,7 @@ HushFfiSession.create(
     onRemovedFromGroup: RemovedFromGroupCallback, // fired when local device is excluded from a manifest
     onGroupDestroyed: GroupDestroyedCallback,     // fired on destroyGroup() local or remote
     onConnectionChanged: ConnectionChangedCallback? // optional; fired on relay connect/disconnect
-) throws -> HushFfiSession
+) throws -> TruesealFfiSession
 
 // Errors from create(): InvalidKeyLength, InvalidRelayPublicKey, InvalidNamespace
 // Runtime errors (from operations below): PushFailed, NotInGroup, InvalidToken,
@@ -64,7 +64,7 @@ The two-layer pattern gives both: a sharp tool for protocol-level work, and a sa
 
 ## Consequences
 
-- `src/ffi.rs` exposes only `HushFfiSession` (and its error/callback types) via UniFFI. The primitives remain `pub` in Rust but are not in the UniFFI surface.
+- `src/ffi.rs` exposes only `TruesealFfiSession` (and its error/callback types) via UniFFI. The primitives remain `pub` in Rust but are not in the UniFFI surface.
 - The primitives must remain public Rust API (not `pub(crate)`) so that advanced callers can use them directly.
 - All session state is managed by the library. The caller implements zero storage code.
 - Documentation must clearly distinguish the two layers. The session docs are the primary entry point; the primitives docs are the advanced reference.
