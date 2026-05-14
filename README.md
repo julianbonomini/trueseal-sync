@@ -6,97 +6,88 @@ E2EE sync engine for trusted device groups. Handles device identity, pairing, gr
 your app → hush-sync → hush-relay (dumb router; sees only ciphertext)
 ```
 
-**Used by:** [hush-clip](../hush-clip-macos) (macOS) · [hush-clip iOS](../hush-clip-ios)  
-**Part of:** [hush ecosystem](../docs)
+---
+
+## SDKs
+
+| Platform | Repo | Status |
+|---|---|---|
+| Swift (iOS + macOS) | [hush-sync-swift](../hush-sync-swift) | ✅ Available |
+| Kotlin (Android) | [hush-sync-kotlin](../hush-sync-kotlin) | ✅ Available |
+| TypeScript / Node | [hush-sync-ts](../hush-sync-ts) | ✅ Available |
+| Rust (direct) | this repo | ✅ Available |
+
+The SDKs wrap the compiled native library via UniFFI — no Rust toolchain required in your app project.
 
 ---
 
 ## What you get
 
-| | |
-|---|---|
-| **Device identity** | X25519 + Ed25519 keypair, auto-generated on first launch, persisted to SQLite. You never handle key bytes. |
-| **Pairing** | Token-based ceremony. One device generates a token (encode as QR or share as text); the other calls `joinGroup(token)`. Library manages the Noise handshake. |
-| **Group membership** | Signed, versioned `GroupManifest`. Any member can add or remove devices. Recipients verify the signature — the relay never sees it. |
-| **Encrypted fan-out** | One envelope per recipient. ECDH + ChaCha20-Poly1305. Relay sees `recipient_pub` + ciphertext; sender identity is inside the ciphertext. |
-| **Guaranteed delivery** | Outbox survives crashes and relay disconnects. Blobs queued offline replay automatically on reconnect — `send()` never silently drops. |
-| **Auto-generated names** | Each device gets a deterministic two-word name (`AmberFalcon`, `SwiftHorizon`) derived from its public key. No configuration. |
+- **Device identity** — X25519 + Ed25519 keypair, auto-generated on first launch, persisted to SQLite. You never handle key bytes.
+- **Pairing** — one device generates a token (QR or text); the other calls `joinGroup(token)`. Library manages the Noise handshake underneath.
+- **Group membership** — signed, versioned `GroupManifest`. Any current member can add or remove devices.
+- **Encrypted fan-out** — one envelope per recipient. ECDH + ChaCha20-Poly1305. The relay sees `recipient_pub` + ciphertext; sender identity is inside the ciphertext.
+- **Guaranteed delivery** — outbox survives crashes and relay disconnects. Blobs queued offline replay on reconnect. `send()` never silently drops.
+- **Auto-generated device names** — deterministic two-word name (`AmberFalcon`, `SwiftHorizon`) derived from the device's public key. No configuration needed.
 
-**What you're responsible for:** what the bytes mean, conflict resolution, bootstrapping new members with historical state, and any permission hierarchy above "any current member can do anything."
+**You're responsible for:** what the bytes mean, conflict resolution, and bootstrapping new members with historical state.
 
 ---
 
 ## API surface
 
-Two layers (ADR-0010):
-
-### Session — use this
-
-The opinionated facade. Wires everything together; owns relay connection, reconnect loop, manifest, and message dispatch. Exposed to Swift/Kotlin via UniFFI as `HushFfiSession`.
-
 ```
 create(baseDir, namespace, relayHost, relayPub, callbacks)
-  → always succeeds; relay connects in background
+  → always succeeds; relay connects in the background
 
-pairingToken()            → base64url string encoding your public keys
-                            encode as QR or share as text; hand to the other device
-joinGroup(token)          → joining device: decode initiator's token, push Pair message
-setOnMemberRequest(cb)    → host: fires with (token, name) when a Pair message arrives
-acceptMember(token)       → host: admit the pending device; issues a new GroupManifest
-cancelPairing()           → close the pairing window without admitting anyone
+pairingToken()            → base64url token encoding your public keys
+                            encode as QR or share as text
+joinGroup(token)          → joining device: decode and push Pair message to initiator
+setOnMemberRequest(cb)    → host: fires (token, name) when a joining device is waiting
+acceptMember(token)       → host: admit the device; issues a new GroupManifest
+cancelPairing()           → close the window without admitting anyone
 
-send(blob)                → fan-out to all current group members
+send(blob)                → fan-out encrypted to all current members
 members()                 → [(id, name)] excluding the local device
-localNodeId()             → stable opaque id for this device (base64url, 11 chars)
+localNodeId()             → stable opaque id for this device (11-char base64url)
 localDeviceName()         → auto-generated name for this device
 
-removeMember(memberId)    → soft removal: issues new manifest excluding the device
-destroyGroup()            → full reset: Revoke pushed to all members, local state wiped,
-                            next create() generates a fresh identity
+removeMember(memberId)    → soft removal; issues new manifest excluding the device
+destroyGroup()            → full reset: Revoke to all members, local state wiped,
+                            next create() auto-generates a fresh identity
 ```
 
 `namespace` scopes the SQLite database — one namespace, one group, one session. For multiple independent groups, create one session per namespace.
-
-### Primitives — for advanced use
-
-`DeviceKeypair`, `RelayClient`, `GroupManifest`, `OperationLog`, `Message`, `Envelope` — direct Rust, no lifecycle management. Useful for custom transports, testing harnesses, or integrations that can't use the session facade.
 
 ---
 
 ## Relay
 
-You need a running [hush-relay](../hush-relay) instance and its static public key. Pass the hostname (no port — the session manages ports internally) and the 32-byte public key to `create()`. The relay is zero-knowledge: it routes ciphertext, holds blobs for offline recipients (30-day TTL), and learns nothing about group membership or message content. Self-host or use a shared instance.
+You need a running [hush-relay](../hush-relay) and its static public key. Pass the hostname and the 32-byte public key to `create()`. The relay is zero-knowledge: it routes ciphertext, holds blobs for offline recipients (30-day TTL), and has no concept of group membership.
 
 ---
 
-## Swift / iOS / macOS
-
-Use [hush-sync-swift](../hush-sync-swift). It wraps the compiled xcframework — no Rust toolchain required in your app project.
-
-To rebuild the xcframework from this repo:
+## Building from source
 
 ```sh
+cargo build
+cargo test        # runs fully in-process; no relay or network required
+```
+
+To build the xcframework for Swift:
+
+```sh
+cd ../hush-sync-swift
 ./scripts/build-xcframework.sh
 ```
 
 ---
 
-## Build and test
-
-```sh
-cargo build
-cargo test
-```
-
-The test suite runs fully in-process with in-memory transports — no relay or network required.
-
----
-
 ## Integration guide
 
-[docs/integrating-hush-sync.md](docs/integrating-hush-sync.md) — concepts, edge cases, and hard-won platform notes from the macOS reference integration. Read this before building.
+[docs/integrating-hush-sync.md](docs/integrating-hush-sync.md) — design decisions, edge cases, and platform notes from the reference integration.
 
-Full protocol documentation and architecture → [hush ecosystem docs](../docs)
+Ecosystem overview and full protocol documentation → **[hush-docs](../docs)**
 
 ---
 
