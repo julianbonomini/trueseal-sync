@@ -8,11 +8,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CRATE_NAME: trueseal_sync
+  CARGO_TARGET_DIR: /tmp/trueseal-sync-build
 
 jobs:
   release:
-    name: validate + publish release
-    runs-on: ubuntu-latest
+    name: validate + build + publish
+    runs-on: macos-latest
 
     permissions:
       contents: write
@@ -24,6 +26,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: >-
+            aarch64-apple-darwin
+            x86_64-apple-darwin
+            aarch64-apple-ios
+            aarch64-apple-ios-sim
+            x86_64-apple-ios
 
       - name: Cache cargo registry + build
         uses: actions/cache@v4
@@ -31,7 +39,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
+            /tmp/trueseal-sync-build
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
@@ -48,9 +56,98 @@ jobs:
       - name: cargo test
         run: cargo test --all-features
 
+      # ── xcframework build ───────────────────────────────────────────────────
+
+      - name: Cross-compile for all Apple targets
+        run: |
+          for TARGET in \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin \
+            aarch64-apple-ios \
+            aarch64-apple-ios-sim \
+            x86_64-apple-ios; do
+            echo "▶ cargo build --release --target $TARGET"
+            cargo build --release --target "$TARGET"
+          done
+
+      - name: Lipo universal slices
+        run: |
+          LIB="lib${CRATE_NAME}.a"
+          B="$CARGO_TARGET_DIR"
+          OUT="/tmp/trueseal-xcframework-slices"
+          mkdir -p "$OUT/macos" "$OUT/ios" "$OUT/ios-sim"
+
+          # macOS universal
+          lipo -create \
+            "$B/aarch64-apple-darwin/release/$LIB" \
+            "$B/x86_64-apple-darwin/release/$LIB" \
+            -output "$OUT/macos/$LIB"
+
+          # iOS device (arm64 only)
+          cp "$B/aarch64-apple-ios/release/$LIB" "$OUT/ios/$LIB"
+
+          # iOS Simulator universal
+          lipo -create \
+            "$B/aarch64-apple-ios-sim/release/$LIB" \
+            "$B/x86_64-apple-ios/release/$LIB" \
+            -output "$OUT/ios-sim/$LIB"
+
+      - name: Generate UniFFI Swift bindings
+        run: |
+          BINDGEN_OUT="/tmp/trueseal-xcframework-slices/bindings"
+          mkdir -p "$BINDGEN_OUT"
+          cargo run --release --bin uniffi-bindgen -- generate \
+            --library "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/lib${CRATE_NAME}.a" \
+            --language swift \
+            --out-dir "$BINDGEN_OUT"
+
+      - name: Copy headers to slices
+        run: |
+          BINDGEN_OUT="/tmp/trueseal-xcframework-slices/bindings"
+          for SLICE in macos ios ios-sim; do
+            cp "$BINDGEN_OUT/${CRATE_NAME}FFI.h"         "/tmp/trueseal-xcframework-slices/$SLICE/"
+            cp "$BINDGEN_OUT/${CRATE_NAME}FFI.modulemap" "/tmp/trueseal-xcframework-slices/$SLICE/module.modulemap"
+          done
+
+      - name: Assemble TruesealSyncFFI.xcframework
+        run: |
+          OUT="/tmp/trueseal-xcframework-slices"
+          LIB="lib${CRATE_NAME}.a"
+          XCFW="/tmp/TruesealSyncFFI.xcframework"
+          rm -rf "$XCFW"
+          xcodebuild -create-xcframework \
+            -library "$OUT/macos/$LIB"    -headers "$OUT/macos"    \
+            -library "$OUT/ios/$LIB"      -headers "$OUT/ios"      \
+            -library "$OUT/ios-sim/$LIB"  -headers "$OUT/ios-sim"  \
+            -output "$XCFW"
+
+      - name: Package zip + checksum
+        run: |
+          VERSION="${{ github.ref_name }}"
+          ZIPNAME="trueseal-sync-swift-${VERSION}.zip"
+          XCFW="/tmp/TruesealSyncFFI.xcframework"
+          BINDINGS="/tmp/trueseal-xcframework-slices/bindings/${CRATE_NAME}.swift"
+
+          # Bundle xcframework + Swift bindings together
+          STAGING="/tmp/trueseal-swift-staging"
+          mkdir -p "$STAGING"
+          cp -R "$XCFW" "$STAGING/"
+          cp "$BINDINGS" "$STAGING/${CRATE_NAME}.swift"
+
+          cd /tmp
+          zip -r "$ZIPNAME" "trueseal-swift-staging"
+          shasum -a 256 "$ZIPNAME" > "${ZIPNAME}.sha256"
+
+          echo "ZIP=/tmp/$ZIPNAME" >> "$GITHUB_ENV"
+          echo "SHA256=/tmp/${ZIPNAME}.sha256" >> "$GITHUB_ENV"
+          echo "ZIPNAME=$ZIPNAME" >> "$GITHUB_ENV"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           generate_release_notes: true
+          files: |
+            ${{ env.ZIP }}
+            ${{ env.SHA256 }}
