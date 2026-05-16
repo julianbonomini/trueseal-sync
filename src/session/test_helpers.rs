@@ -3,7 +3,6 @@ use std::sync::{mpsc, Arc, Mutex};
 
 use trueseal_noise::{
     keypair::{generate_keypair, Keypair},
-    session_nk,
     session_xx::accept,
 };
 
@@ -221,12 +220,7 @@ pub(super) fn spawn_single_relay(
             Ok(s) => s,
             Err(_) => return,
         };
-        loop {
-            match sess.receive() {
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
+        while sess.receive().is_ok() {}
     });
 }
 

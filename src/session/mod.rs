@@ -734,7 +734,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             let result =
                 build_push_blob(&msg, recipient_pub, seq, vec![], &signing).and_then(|framed| {
                     (self.push_factory)()
-                        .map_err(|e| crate::relay::RelayError::PushFailed(e))
+                        .map_err(crate::relay::RelayError::PushFailed)
                         .and_then(|transport| push_send(transport, self.relay_pub_bytes, framed))
                 });
             match result {
@@ -766,7 +766,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             .map_err(|e| SessionError::PushFailed(e.to_string()))
             .and_then(|framed| {
                 (self.push_factory)()
-                    .map_err(|e| SessionError::PushFailed(e))
+                    .map_err(SessionError::PushFailed)
                     .and_then(|transport| {
                         push_send(transport, self.relay_pub_bytes, framed)
                             .map(|_| ())

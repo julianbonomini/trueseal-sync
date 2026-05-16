@@ -86,10 +86,7 @@ impl MiniSession {
     // ── A) .expect() — better message, still panics ──────────────────────────
     fn push_a(&self, blob: &[u8]) -> Result<String, SessionError> {
         let guard = self.manifest.lock().expect("manifest mutex: poisoned");
-        let result = match &*guard {
-            None => None,
-            Some(m) => Some(m.members.len()),
-        };
+        let result = (*guard).as_ref().map(|m| m.members.len());
         drop(guard);
         match result {
             None => Err(SessionError::NotInGroup),
@@ -110,10 +107,7 @@ impl MiniSession {
     // ── B) .unwrap_or_else — recover from poison, no API change ──────────────
     fn push_b(&self, blob: &[u8]) -> Result<String, SessionError> {
         let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
-        let result = match &*guard {
-            None => None,
-            Some(m) => Some(m.members.len()),
-        };
+        let result = (*guard).as_ref().map(|m| m.members.len());
         drop(guard);
         match result {
             None => Err(SessionError::NotInGroup),
@@ -132,10 +126,7 @@ impl MiniSession {
             .manifest
             .lock()
             .map_err(|e| SessionError::Internal(format!("manifest lock poisoned: {e}")))?;
-        let result = match &*guard {
-            None => None,
-            Some(m) => Some(m.members.len()),
-        };
+        let result = (*guard).as_ref().map(|m| m.members.len());
         drop(guard);
         match result {
             None => Err(SessionError::NotInGroup),

@@ -6,7 +6,6 @@ use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
 use super::super::TruesealSession;
-use super::make_two_member_manifest;
 
 /// When a Pair message arrives inside an open pairing window,
 /// on_member_request fires with a non-empty token and a name.
@@ -232,7 +231,7 @@ fn pair_outside_window_does_not_fire_callback() {
     // We need a pairing token from A — but A's window is NOT open.
     // Use a fresh device as the "initiator" so B knows where to send.
     let fake_initiator = DeviceKeypair::generate();
-    let fake_token = crate::message::pairing_token(
+    let _fake_token = crate::message::pairing_token(
         &fake_initiator.public_key().0,
         &fake_initiator.signing_public_key().0,
     );

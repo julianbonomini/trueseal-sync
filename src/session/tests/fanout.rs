@@ -143,11 +143,11 @@ fn push_sync_fans_out_to_all_members() {
         .expect("push_sync");
 
     wait_for(
-        || received_b.lock().unwrap().len() >= 1,
+        || !received_b.lock().unwrap().is_empty(),
         Duration::from_secs(5),
     );
     wait_for(
-        || received_c.lock().unwrap().len() >= 1,
+        || !received_c.lock().unwrap().is_empty(),
         Duration::from_secs(5),
     );
 

@@ -8,7 +8,7 @@ use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
 use super::super::{SessionError, TruesealSession};
-use super::{make_one_member_manifest, make_two_member_manifest};
+use super::make_two_member_manifest;
 
 /// remove_member returns MemberNotFound when target signing pub is not in manifest.
 #[test]
@@ -512,7 +512,7 @@ fn removed_member_no_longer_receives_fanout_blobs() {
     let a_sk = SigningKey::from_bytes(&device_a.signing.to_bytes());
     let b_noise = device_b.public_key();
     let b_signing = device_b.signing_public_key();
-    let b_sk = SigningKey::from_bytes(&device_b.signing.to_bytes());
+    let _b_sk = SigningKey::from_bytes(&device_b.signing.to_bytes());
 
     let b_received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let br = b_received.clone();

@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 uniffi::setup_scaffolding!();
 
 pub mod crypto;

@@ -332,7 +332,7 @@ fn push_does_not_expose_stable_noise_key_to_relay() {
     use crate::device::DeviceKeypair;
     use crate::keys::{NoisePublicKey, SigningPublicKey};
     use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
-    use crate::message::Message;
+    
     use crate::operation_log::MemLog;
     use crate::relay::{frame, MsgType};
     use crate::session::test_helpers::*;
@@ -450,7 +450,7 @@ fn push_does_not_expose_stable_noise_key_to_relay() {
     // both accepts succeeded confirms NK was used, and thus the relay never received
     // the stable noise pub key.
     assert!(
-        !keys.iter().any(|k| *k == stable_noise_pub),
+        !keys.contains(&stable_noise_pub),
         "relay must not have seen device's stable noise pub key in any push session \
          (this sentinel check is symbolic; the real guarantee is NK handshake succeeded)"
     );

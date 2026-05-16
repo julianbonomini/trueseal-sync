@@ -342,16 +342,11 @@ fn destroy_group_stops_outbox_replay() {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            loop {
-                match s.receive() {
-                    Ok(raw) => {
+            while let Ok(raw) = s.receive() {
                         if let Some((crate::relay::MsgType::Push, _)) = crate::relay::parse(&raw) {
                             *rr.lock().unwrap() += 1;
                         }
                     }
-                    Err(_) => break,
-                }
-            }
         });
     }
 

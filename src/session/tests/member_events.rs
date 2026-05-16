@@ -9,7 +9,7 @@ use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
 use super::super::TruesealSession;
-use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
+use crate::manifest::{GroupManifest, ManifestMember};
 
 use super::make_two_member_manifest;
 

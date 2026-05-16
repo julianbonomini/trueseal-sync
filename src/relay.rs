@@ -371,8 +371,8 @@ pub fn push_send<T: Read + Write + Send>(
     use trueseal_noise::keypair::generate_keypair;
     let fresh_kp = generate_keypair();
     let session = trueseal_noise::session_nk::dial(transport, fresh_kp, relay_pub)
-        .map_err(|e| RelayError::HandshakeFailed(e))?;
-    session.send(&blob).map_err(|e| RelayError::PushFailed(e))?;
+        .map_err(RelayError::HandshakeFailed)?;
+    session.send(&blob).map_err(RelayError::PushFailed)?;
     // Block until the relay confirms persistence (ADR-0019).
     let raw = session
         .receive()
@@ -468,11 +468,7 @@ mod tests {
         let received_clone = received.clone();
         std::thread::spawn(move || {
             let session = accept(relay_pipe, relay_keypair).unwrap();
-            loop {
-                let raw = match session.receive() {
-                    Ok(r) => r,
-                    Err(_) => break,
-                };
+            while let Ok(raw) = session.receive() {
                 if let Some((MsgType::Push, body)) = parse(&raw) {
                     // Push body layout (ADR-0019): [recipient_pub: 32][envelope_proto: ...]
                     if body.len() >= 32 {
@@ -716,11 +712,7 @@ mod tests {
                 let sess_a = accept(pipe_a_relay, relay_kp_a).unwrap();
                 let sess_b = accept(pipe_b_relay, relay_kp_b).unwrap();
                 // Receive Push from B, route as Deliver to A
-                loop {
-                    let raw = match sess_b.receive() {
-                        Ok(r) => r,
-                        Err(_) => break,
-                    };
+                while let Ok(raw) = sess_b.receive() {
                     if let Some((MsgType::Push, body)) = parse(&raw) {
                         if body.len() >= 32 {
                             // ADR-0020: Deliver body = [blob_id: 8 bytes][envelope_proto]

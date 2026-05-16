@@ -120,7 +120,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             let result = build_push_blob(&msg, recipient_pub, entry.sequence, vec![], &signing)
                 .and_then(|framed| {
                     (push_factory)()
-                        .map_err(|e| crate::relay::RelayError::PushFailed(e))
+                        .map_err(crate::relay::RelayError::PushFailed)
                         .and_then(|transport| push_send(transport, relay_pub_bytes, framed))
                 });
             if result.is_ok() {

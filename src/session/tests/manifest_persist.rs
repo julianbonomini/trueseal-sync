@@ -194,7 +194,7 @@ fn manifest_persists_across_session_restart() {
 #[test]
 fn manifest_restore_via_connect_background() {
     use crate::operation_log::MemLog;
-    use crate::store::PersistentLog;
+    
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
@@ -293,15 +293,15 @@ fn manifest_restore_via_connect_background() {
     .expect("session B2");
 
     // Store the B2 device private bytes to avoid Clone issue.
-    let b_noise_priv = device_b.noise.private();
-    let b_signing_priv_bytes = device_b.signing.to_bytes();
+    let _b_noise_priv = device_b.noise.private();
+    let _b_signing_priv_bytes = device_b.signing.to_bytes();
 
     // Restore B2's manifest from the pairing so it can receive from A2.
     // (B2 didn't persist its manifest in phase 1; reconstruct from A's.)
     // A's manifest contains B — B's manifest also has 2 members.
     {
-        use crate::manifest::{GroupManifest, ManifestMember};
-        use ed25519_dalek::SigningKey;
+        
+        
         let loaded = store_a
             .lock()
             .unwrap()

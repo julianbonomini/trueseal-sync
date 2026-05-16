@@ -678,7 +678,7 @@ fn concurrent_manifest_conflict_last_version_wins() {
         !result.1.timed_out(),
         "C must receive at least one v2 manifest"
     );
-    let fires = *result.0;
+    let _fires = *result.0;
     drop(result);
 
     // Short additional wait to ensure the second manifest (if any) is processed.

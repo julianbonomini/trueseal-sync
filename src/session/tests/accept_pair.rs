@@ -9,7 +9,7 @@ use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
 use super::super::TruesealSession;
-use super::{make_one_member_manifest, make_two_member_manifest};
+use super::make_two_member_manifest;
 
 /// A admits B into an empty group → both have a 2-member manifest.
 #[test]
@@ -92,7 +92,7 @@ fn accept_pair_sends_manifest_to_new_member() {
 
     let b_manifest_received: Arc<Mutex<Option<crate::manifest::GroupManifest>>> =
         Arc::new(Mutex::new(None));
-    let bmr = b_manifest_received.clone();
+    let _bmr = b_manifest_received.clone();
     let _session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
@@ -252,7 +252,7 @@ fn new_member_bootstrap_can_send_to_existing_members() {
     let a_sk = SigningKey::from_bytes(&device_a.signing.to_bytes());
     let b_noise = device_b.public_key();
     let b_signing = device_b.signing_public_key();
-    let b_sk = SigningKey::from_bytes(&device_b.signing.to_bytes());
+    let _b_sk = SigningKey::from_bytes(&device_b.signing.to_bytes());
     let c_noise = device_c.public_key();
     let c_signing = device_c.signing_public_key();
 

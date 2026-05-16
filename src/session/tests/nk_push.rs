@@ -66,11 +66,7 @@ fn on_message_fires_via_xx_receive_after_nk_push() {
         );
         let nk_sess =
             trueseal_noise::session_nk::accept(push_pipe_relay, relay_kp_nk).expect("NK accept");
-        loop {
-            let raw = match nk_sess.receive() {
-                Ok(r) => r,
-                Err(_) => break,
-            };
+        while let Ok(raw) = nk_sess.receive() {
             if let Some((MsgType::Push, body)) = parse(&raw) {
                 if body.len() >= 32 {
                     // ADR-0020: Deliver body = [blob_id: 8 bytes][envelope_proto]
@@ -176,7 +172,7 @@ fn push_send_errors_on_missing_ack() {
     // Stub relay: accepts NK, receives Push, sends wrong response type (not Ack).
     std::thread::spawn(move || {
         let sess = trueseal_noise::session_nk::accept(pipe_r, relay_kp2).expect("NK accept");
-        if let Ok(_) = sess.receive() {
+        if sess.receive().is_ok() {
             // Send Deliver instead of Ack — wrong type.
             let _ = sess.send(&frame(MsgType::Deliver, b"wrong"));
         }
@@ -198,7 +194,7 @@ fn push_send_errors_on_missing_ack() {
 fn push_body_starts_with_recipient_pub() {
     use crate::device::DeviceKeypair;
     use crate::message::Message;
-    use crate::operation_log::MemLog;
+    
     use crate::relay::build_push_blob;
 
     let device = DeviceKeypair::generate();
@@ -238,7 +234,7 @@ fn push_send_accepts_zero_byte_ack() {
     // Stub relay: sends 0-byte Ack (ADR-0019 locked body length).
     std::thread::spawn(move || {
         let sess = trueseal_noise::session_nk::accept(pipe_r, relay_kp2).expect("NK accept");
-        if let Ok(_) = sess.receive() {
+        if sess.receive().is_ok() {
             let _ = sess.send(&frame(MsgType::Ack, &[]));
         }
     });
@@ -255,7 +251,7 @@ fn push_send_accepts_zero_byte_ack() {
 /// run_loop echoes Heartbeat back when the relay sends one on the XX session.
 #[test]
 fn run_loop_echoes_heartbeat_on_receive_session() {
-    use crate::operation_log::MemLog;
+    
     use crate::relay::RelayClient;
     use std::time::Duration;
 
