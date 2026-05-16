@@ -163,7 +163,10 @@ fn undelivered_entries_replayed_after_reconnect() {
     let _r2 = session.push_sync(b"blob2".to_vec());
     let _r3 = session.push_sync(b"blob3".to_vec());
 
-    std::thread::sleep(Duration::from_millis(1500));
+    wait_for(
+        || received_envs.lock().unwrap().len() == 3,
+        Duration::from_secs(10),
+    );
 
     let envs = received_envs.lock().unwrap();
     assert_eq!(envs.len(), 3, "all 3 blobs replayed");
