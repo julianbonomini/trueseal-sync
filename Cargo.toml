@@ -27,7 +27,7 @@ tokio = { version = "1", features = [
   "sync",
   "io-util",
 ] }
-trueseal-noise = { path = "../trueseal-noise/rust" }
+trueseal-noise = { git = "https://github.com/julianbonomini/trueseal-noise", tag = "v0.1.4" }
 uniffi = { version = "0.28", features = ["tokio", "cli"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 
