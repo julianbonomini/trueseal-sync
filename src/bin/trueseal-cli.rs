@@ -132,7 +132,12 @@ fn main() {
         // mode read() returns WouldBlock immediately when no data is present,
         // the lock is released, and send() can proceed.
         move || {
-            let s = TcpStream::connect(&recv_addr).map_err(|e| e.to_string())?;
+            eprintln!("[debug] receive: connecting to {}", recv_addr);
+            let s = TcpStream::connect(&recv_addr).map_err(|e| {
+                eprintln!("[debug] receive: tcp connect failed: {}", e);
+                e.to_string()
+            })?;
+            eprintln!("[debug] receive: tcp connected, starting XX handshake");
             s.set_nonblocking(true).map_err(|e| e.to_string())?;
             Ok(s)
         },
@@ -140,7 +145,12 @@ fn main() {
         // NK sessions are sequential (send then receive), so blocking mode
         // would also work here, but non-blocking is consistent and harmless.
         move || {
-            let s = TcpStream::connect(&push_addr_cb).map_err(|e| e.to_string())?;
+            eprintln!("[debug] push: connecting to {}", push_addr_cb);
+            let s = TcpStream::connect(&push_addr_cb).map_err(|e| {
+                eprintln!("[debug] push: tcp connect failed: {}", e);
+                e.to_string()
+            })?;
+            eprintln!("[debug] push: tcp connected");
             s.set_nonblocking(true).map_err(|e| e.to_string())?;
             Ok(s)
         },
