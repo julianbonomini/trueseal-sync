@@ -332,7 +332,7 @@ fn push_does_not_expose_stable_noise_key_to_relay() {
     use crate::device::DeviceKeypair;
     use crate::keys::{NoisePublicKey, SigningPublicKey};
     use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
-    
+
     use crate::operation_log::MemLog;
     use crate::relay::{frame, MsgType};
     use crate::session::test_helpers::*;

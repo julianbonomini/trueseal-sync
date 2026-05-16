@@ -194,7 +194,7 @@ fn push_send_errors_on_missing_ack() {
 fn push_body_starts_with_recipient_pub() {
     use crate::device::DeviceKeypair;
     use crate::message::Message;
-    
+
     use crate::relay::build_push_blob;
 
     let device = DeviceKeypair::generate();
@@ -251,7 +251,6 @@ fn push_send_accepts_zero_byte_ack() {
 /// run_loop echoes Heartbeat back when the relay sends one on the XX session.
 #[test]
 fn run_loop_echoes_heartbeat_on_receive_session() {
-    
     use crate::relay::RelayClient;
     use std::time::Duration;
 

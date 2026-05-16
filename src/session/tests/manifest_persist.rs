@@ -194,7 +194,7 @@ fn manifest_persists_across_session_restart() {
 #[test]
 fn manifest_restore_via_connect_background() {
     use crate::operation_log::MemLog;
-    
+
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
 
@@ -300,8 +300,6 @@ fn manifest_restore_via_connect_background() {
     // (B2 didn't persist its manifest in phase 1; reconstruct from A's.)
     // A's manifest contains B — B's manifest also has 2 members.
     {
-        
-        
         let loaded = store_a
             .lock()
             .unwrap()
