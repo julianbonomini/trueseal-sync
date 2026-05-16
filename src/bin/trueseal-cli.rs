@@ -78,8 +78,9 @@ fn main() {
 
     // Separate store connection for the on_manifest_changed callback.
     // SQLite WAL mode allows concurrent connections to the same file.
-    let manifest_store: Arc<Mutex<Store>> =
-        Arc::new(Mutex::new(Store::open(&dir, "device").expect("open manifest store")));
+    let manifest_store: Arc<Mutex<Store>> = Arc::new(Mutex::new(
+        Store::open(&dir, "device").expect("open manifest store"),
+    ));
     let manifest_store_cb = manifest_store.clone();
 
     // Persistent op log — separate connection, same db file.

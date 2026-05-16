@@ -8,7 +8,7 @@ use crate::operation_log::MemLog;
 use crate::store::Store;
 
 use super::super::test_helpers::*;
-use super::super::{TruesealSession, SessionError};
+use super::super::{SessionError, TruesealSession};
 use super::make_two_member_manifest;
 
 /// destroy_group() fires on_group_destroyed on the initiating device.
@@ -23,12 +23,16 @@ fn destroy_group_fires_on_group_destroyed_on_initiator() {
         std::thread::spawn(move || {
             let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
             while let Ok(p) = nk_rx.recv() {
-                let kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
-                if sess.receive().is_ok() {
-                    let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
-                }
-            } });
+                let kp2 =
+                    trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
+                        if sess.receive().is_ok() {
+                            let _ =
+                                sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                        }
+                    }
+                });
             }
         });
     }
@@ -133,12 +137,16 @@ fn push_sync_after_destroy_returns_group_destroyed() {
         std::thread::spawn(move || {
             let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
             while let Ok(p) = nk_rx.recv() {
-                let kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
-                if sess.receive().is_ok() {
-                    let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
-                }
-            } });
+                let kp2 =
+                    trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
+                        if sess.receive().is_ok() {
+                            let _ =
+                                sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                        }
+                    }
+                });
             }
         });
     }
@@ -233,12 +241,16 @@ fn on_group_destroyed_callback_wipes_store() {
         std::thread::spawn(move || {
             let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
             while let Ok(p) = nk_rx.recv() {
-                let kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
-                if sess.receive().is_ok() {
-                    let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
-                }
-            } });
+                let kp2 =
+                    trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
+                        if sess.receive().is_ok() {
+                            let _ =
+                                sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                        }
+                    }
+                });
             }
         });
     }
@@ -323,7 +335,8 @@ fn destroy_group_stops_outbox_replay() {
     let rr = relay_received.clone();
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     {
-        let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let relay_kp2 =
+            trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
             let s = match trueseal_noise::session_xx::accept(pipe_relay, relay_kp2) {
                 Ok(s) => s,
@@ -367,10 +380,15 @@ fn destroy_group_stops_outbox_replay() {
         Box::new(MemLog::new()),
         || {},
         |_| {},
-        move || { *dc.lock().unwrap() += 1; },
+        move || {
+            *dc.lock().unwrap() += 1;
+        },
         move || {
             if sc.load(std::sync::atomic::Ordering::Acquire) {
-                pipe_slot2.lock().unwrap().take()
+                pipe_slot2
+                    .lock()
+                    .unwrap()
+                    .take()
                     .ok_or_else(|| "exhausted".to_string())
             } else {
                 Err("not yet".to_string())
@@ -379,7 +397,8 @@ fn destroy_group_stops_outbox_replay() {
         || Err("push factory unused in this test".into()), // destroy_group test never reconnects
         Some(Duration::from_millis(50)),
         None,
-    ).expect("session");
+    )
+    .expect("session");
 
     session.set_manifest(make_two_member_manifest(
         d_noise, d_signing, &d_sk, p_noise, p_signing,
@@ -390,12 +409,17 @@ fn destroy_group_stops_outbox_replay() {
     session.push_sync(b"blob-2".to_vec()).expect("push 2");
     assert_eq!(
         session.op_log.lock().unwrap().undelivered_entries().len(),
-        2, "2 outbox entries"
+        2,
+        "2 outbox entries"
     );
 
     // Destroy BEFORE allowing reconnect.
     session.destroy_group();
-    assert_eq!(*destroyed_count.lock().unwrap(), 1, "on_group_destroyed fired");
+    assert_eq!(
+        *destroyed_count.lock().unwrap(),
+        1,
+        "on_group_destroyed fired"
+    );
     assert!(
         matches!(
             session.push_sync(b"after-destroy".to_vec()),

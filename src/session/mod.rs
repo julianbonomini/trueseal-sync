@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use trueseal_noise::keypair::Keypair as NoiseKeypair;
 use thiserror::Error;
+use trueseal_noise::keypair::Keypair as NoiseKeypair;
 
 use crate::device::DeviceKeypair;
 use crate::envelope::SigningKeypair;
@@ -23,7 +23,6 @@ use crate::member::{member_id, member_name};
 use crate::message::{device_name, Message};
 use crate::operation_log::{MemLog, OperationLog};
 use crate::relay::{build_push_blob, push_send, RelayClient};
-
 
 const DEFAULT_RECONNECT_CAP: Duration = Duration::from_secs(30);
 
@@ -183,14 +182,21 @@ pub(super) fn build_subscribe_handler(
                 let token_bytes: [u8; 16] = rand::random();
                 let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
                 let name = member_name(&SigningPublicKey(*signing_pub));
-                pending_members.lock().unwrap_or_else(|e| e.into_inner()).insert(
-                    token.clone(),
-                    PendingMember {
-                        noise_pub: NoisePublicKey(*noise_pub),
-                        signing_pub: SigningPublicKey(*signing_pub),
-                    },
-                );
-                if let Some(cb) = on_member_request.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                pending_members
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(
+                        token.clone(),
+                        PendingMember {
+                            noise_pub: NoisePublicKey(*noise_pub),
+                            signing_pub: SigningPublicKey(*signing_pub),
+                        },
+                    );
+                if let Some(cb) = on_member_request
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                {
                     cb(token, name);
                 }
             }
@@ -272,12 +278,20 @@ pub(super) fn build_subscribe_handler(
 
                 (on_manifest_changed)(incoming);
 
-                if let Some(cb) = on_member_joined.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                if let Some(cb) = on_member_joined
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                {
                     for (id, name) in joined {
                         cb(id, name);
                     }
                 }
-                if let Some(cb) = on_member_left.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                if let Some(cb) = on_member_left
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                {
                     for (id, name) in left {
                         cb(id, name);
                     }
@@ -297,12 +311,18 @@ pub(super) fn build_subscribe_handler(
 impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Current noise public key for this session.
     pub fn noise_pub(&self) -> NoisePublicKey {
-        self.keys.lock().unwrap_or_else(|e| e.into_inner()).noise_pub
+        self.keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .noise_pub
     }
 
     /// Current signing public key for this session.
     pub fn signing_pub(&self) -> SigningPublicKey {
-        self.keys.lock().unwrap_or_else(|e| e.into_inner()).signing_pub
+        self.keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .signing_pub
     }
 
     /// List of remote group members (excludes the local device).
@@ -311,7 +331,11 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Each entry has a stable `id` and an auto-generated `name` derived from
     /// the member's signing public key — see [`crate::member`].
     pub fn members(&self) -> Vec<Member> {
-        let local_signing = self.keys.lock().unwrap_or_else(|e| e.into_inner()).signing_pub;
+        let local_signing = self
+            .keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .signing_pub;
         let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
         match &*guard {
             None => vec![],
@@ -664,7 +688,11 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             match *guard {
                 None => return Err(SessionError::NotInGroup),
                 Some(ref m) => {
-                    let self_noise = self.keys.lock().unwrap_or_else(|e| e.into_inner()).noise_pub;
+                    let self_noise = self
+                        .keys
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .noise_pub;
                     m.members
                         .iter()
                         .filter(|member| member.noise_pub != self_noise)
@@ -674,12 +702,20 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             }
         };
 
-        if !self.client.lock().unwrap_or_else(|e| e.into_inner()).is_connected() {
+        if !self
+            .client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_connected()
+        {
             // Blob is durably queued in the outbox; delivery is guaranteed on
             // reconnect. Return Ok(()) — the caller should not retry (ADR-0017).
             let seq = self.next_seq();
             for r in &recipients {
-                self.op_log.lock().unwrap_or_else(|e| e.into_inner()).append(&r.0, seq, blob.clone());
+                self.op_log
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .append(&r.0, seq, blob.clone());
             }
             return Ok(());
         }
@@ -691,16 +727,22 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let mut last_err: Option<String> = None;
         for recipient_pub in recipients {
             let oid = recipient_pub.0;
-            self.op_log.lock().unwrap_or_else(|e| e.into_inner()).append(&oid, seq, blob.clone());
-            let result = build_push_blob(&msg, recipient_pub, seq, vec![], &signing)
-                .and_then(|framed| {
+            self.op_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .append(&oid, seq, blob.clone());
+            let result =
+                build_push_blob(&msg, recipient_pub, seq, vec![], &signing).and_then(|framed| {
                     (self.push_factory)()
                         .map_err(|e| crate::relay::RelayError::PushFailed(e))
                         .and_then(|transport| push_send(transport, self.relay_pub_bytes, framed))
                 });
             match result {
                 Ok(_) => {
-                    self.op_log.lock().unwrap_or_else(|e| e.into_inner()).mark_delivered(&oid, seq);
+                    self.op_log
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .mark_delivered(&oid, seq);
                 }
                 Err(e) => {
                     last_err = Some(e.to_string());
@@ -742,12 +784,18 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// `SessionError::GroupDestroyed`. The next `create()` on the same namespace
     /// generates a fresh identity automatically.
     pub fn destroy_group(&self) {
-        let self_noise = self.keys.lock().unwrap_or_else(|e| e.into_inner()).noise_pub;
+        let self_noise = self
+            .keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .noise_pub;
         let peers: Vec<NoisePublicKey> = {
             let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
             match *guard {
                 None => vec![],
-                Some(ref m) => m.members.iter()
+                Some(ref m) => m
+                    .members
+                    .iter()
                     .filter(|mb| mb.noise_pub != self_noise)
                     .map(|mb| mb.noise_pub)
                     .collect(),
@@ -778,7 +826,10 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
 
     pub fn cancel_pairing(&self) {
         *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        self.pending_members.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.pending_members
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
     }
 
     /// Admit a device; requires both noise and signing pub keys.
@@ -861,7 +912,12 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         (self.on_manifest_changed)(&new_manifest);
 
         // Fire onMemberJoined for the newly admitted device.
-        if let Some(cb) = self.on_member_joined.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(cb) = self
+            .on_member_joined
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             cb(
                 crate::member::member_id(&signing_pub),
                 crate::member::member_name(&signing_pub),
@@ -897,20 +953,29 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// the asymmetry is surprising. Fix: move all callbacks to the constructor or
     /// make all of them post-construction setters.
     pub fn set_on_member_request(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
-        *self.on_member_request.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(cb));
+        *self
+            .on_member_request
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(cb));
     }
 
     /// Register the callback fired when a new member appears in an incoming manifest update.
     /// `(id, name)` — same format as [`Self::members`].
     pub fn set_on_member_joined(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
-        *self.on_member_joined.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(cb));
+        *self
+            .on_member_joined
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(cb));
     }
 
     /// Register the callback fired when a member disappears from an incoming manifest update.
     /// Does NOT fire when the local device is the removed one (that's `on_removed_from_group`).
     /// `(id, name)` — same format as [`Self::members`].
     pub fn set_on_member_left(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
-        *self.on_member_left.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(cb));
+        *self
+            .on_member_left
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(cb));
     }
 
     /// Admit a pending member identified by their opaque `token` from `on_member_request`.
@@ -919,7 +984,11 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Returns `false` if the token is unknown or the pairing window has closed.
     /// Clears the pairing window on success (single-use window).
     pub fn accept_member(&self, token: &str) -> bool {
-        let pending = self.pending_members.lock().unwrap_or_else(|e| e.into_inner()).remove(token);
+        let pending = self
+            .pending_members
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(token);
         match pending {
             None => false,
             Some(pm) => self.accept_pair(pm.noise_pub, pm.signing_pub),
@@ -969,7 +1038,11 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             );
 
             // Notify: all remaining members excluding self.
-            let self_noise = self.keys.lock().unwrap_or_else(|e| e.into_inner()).noise_pub;
+            let self_noise = self
+                .keys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .noise_pub;
             let notify: Vec<NoisePublicKey> = new_manifest
                 .members
                 .iter()
@@ -1054,9 +1127,7 @@ impl TruesealSession<TcpStream> {
         let stream =
             TcpStream::connect(addr).map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
         let addr = addr.to_string();
-        let push_factory = move || {
-            TcpStream::connect(&addr).map_err(|e| e.to_string())
-        };
+        let push_factory = move || TcpStream::connect(&addr).map_err(|e| e.to_string());
         Self::connect(stream, relay_pub, keypair, on_message, push_factory)
     }
 }

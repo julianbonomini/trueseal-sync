@@ -59,7 +59,17 @@ fn push_sync_appends_and_marks_delivered() {
     ));
 
     session.push_sync(b"hello".to_vec()).expect("push");
-    wait_for(|| session.op_log.lock().unwrap().undelivered_entries().is_empty(), Duration::from_secs(5));
+    wait_for(
+        || {
+            session
+                .op_log
+                .lock()
+                .unwrap()
+                .undelivered_entries()
+                .is_empty()
+        },
+        Duration::from_secs(5),
+    );
 
     let undelivered = session.op_log.lock().unwrap().undelivered_entries();
     assert!(undelivered.is_empty(), "entry should be delivered");
@@ -350,7 +360,14 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
     // after push_send receives the Ack, which is strictly after the relay
     // increments relay2_received. Waiting on relay count first would race.
     wait_for(
-        || session2.op_log.lock().unwrap().undelivered_entries().is_empty(),
+        || {
+            session2
+                .op_log
+                .lock()
+                .unwrap()
+                .undelivered_entries()
+                .is_empty()
+        },
         Duration::from_secs(5),
     );
     // Verify the relay also received both replayed blobs.
@@ -417,7 +434,11 @@ fn sequence_counter_not_reused_after_restart() {
 
         let entries = session1.op_log.lock().unwrap().undelivered_entries();
         assert_eq!(entries.len(), 3, "3 offline entries");
-        last_seq = entries.iter().map(|e| e.sequence).max().expect("has entries");
+        last_seq = entries
+            .iter()
+            .map(|e| e.sequence)
+            .max()
+            .expect("has entries");
         assert_eq!(last_seq, 2, "max sequence is 2");
         // session1 drops here.
     }
@@ -428,8 +449,8 @@ fn sequence_counter_not_reused_after_restart() {
         let log2 = PersistentLog::new(store2);
         let d_sk2 = SigningKey::from_bytes(&device_signing_priv);
 
-        let device2 = DeviceKeypair::from_bytes(device_noise_priv, device_signing_priv)
-            .expect("reconstruct");
+        let device2 =
+            DeviceKeypair::from_bytes(device_noise_priv, device_signing_priv).expect("reconstruct");
         let d_noise2 = device2.public_key();
         let d_signing2 = device2.signing_public_key();
 
@@ -458,7 +479,11 @@ fn sequence_counter_not_reused_after_restart() {
         let entries = session2.op_log.lock().unwrap().undelivered_entries();
         // 4 entries total: 3 from session1 + 1 from session2.
         assert_eq!(entries.len(), 4, "4 entries total");
-        let new_seq = entries.iter().map(|e| e.sequence).max().expect("has entries");
+        let new_seq = entries
+            .iter()
+            .map(|e| e.sequence)
+            .max()
+            .expect("has entries");
         assert_eq!(
             new_seq,
             last_seq + 1,

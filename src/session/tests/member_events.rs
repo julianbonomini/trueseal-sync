@@ -69,7 +69,10 @@ fn on_member_joined_fires_on_admitting_device() {
     .expect("session B");
 
     _session_b.join_group(&pairing_token).expect("join");
-    wait_for(|| token_slot.lock().unwrap().is_some(), Duration::from_secs(5));
+    wait_for(
+        || token_slot.lock().unwrap().is_some(),
+        Duration::from_secs(5),
+    );
 
     let req_token = token_slot.lock().unwrap().clone().expect("request token");
     session_a.accept_member(&req_token);
@@ -173,7 +176,10 @@ fn on_member_joined_fires_on_existing_members_via_manifest() {
     let msg = Message::GroupManifest { manifest: v2 };
     session_a.push_message(&msg, b_noise).ok();
 
-    wait_for(|| !b_joined.lock().unwrap().is_empty(), Duration::from_secs(5));
+    wait_for(
+        || !b_joined.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+    );
 
     let calls = b_joined.lock().unwrap().clone();
     assert!(calls.contains(&c_id), "B fires onMemberJoined for C");
@@ -282,7 +288,10 @@ fn on_member_left_fires_when_member_removed() {
     let msg = crate::message::Message::GroupManifest { manifest: v2 };
     session_a.push_message(&msg, b_noise).ok();
 
-    wait_for(|| !b_left.lock().unwrap().is_empty(), Duration::from_secs(5));
+    wait_for(
+        || !b_left.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+    );
 
     let calls = b_left.lock().unwrap().clone();
     assert!(calls.contains(&c_id), "B fires onMemberLeft for C");
@@ -353,6 +362,13 @@ fn on_member_left_does_not_fire_for_local_device() {
     // Short fixed wait to ensure on_member_left does NOT fire.
     std::thread::sleep(Duration::from_millis(100));
 
-    assert_eq!(*b_removed.lock().unwrap(), 1, "onRemovedFromGroup fires for B");
-    assert!(b_left.lock().unwrap().is_empty(), "onMemberLeft must NOT fire when local device is removed");
+    assert_eq!(
+        *b_removed.lock().unwrap(),
+        1,
+        "onRemovedFromGroup fires for B"
+    );
+    assert!(
+        b_left.lock().unwrap().is_empty(),
+        "onMemberLeft must NOT fire when local device is removed"
+    );
 }

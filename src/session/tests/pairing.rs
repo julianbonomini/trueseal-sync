@@ -23,16 +23,28 @@ fn pairing_ceremony_creates_manifest_with_new_member() {
     let device_b = DeviceKeypair::generate();
 
     let session_a = Arc::new(
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, move |_, _, _| {}, nk.factory())
-            .expect("session A"),
+        TruesealSession::connect(
+            pipe_a_client,
+            relay_pub,
+            device_a,
+            move |_, _, _| {},
+            nk.factory(),
+        )
+        .expect("session A"),
     );
 
     let _token = session_a.pairing_token();
 
     let device_b_noise_pub = device_b.public_key();
     let device_b_signing_pub = device_b.signing_public_key();
-    let _session_b =
-        TruesealSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
+    let _session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session B");
 
     let admitted = session_a.accept_pair(device_b_noise_pub, device_b_signing_pub);
     assert!(admitted, "accept_pair must return true when window is open");
@@ -60,7 +72,14 @@ fn accept_pair_outside_window_is_noop() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, || Err("push factory unused in pairing test".into())).expect("connect");
+    let session = TruesealSession::connect(
+        pipe_client,
+        relay_pub,
+        device,
+        |_, _, _| {},
+        || Err("push factory unused in pairing test".into()),
+    )
+    .expect("connect");
 
     let dummy = NoisePublicKey(make_relay_kp().public_key);
     let dummy_signing = crate::keys::SigningPublicKey([0u8; 32]);
@@ -85,7 +104,14 @@ fn accept_pair_window_stays_open_until_cancelled() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, || Err("push factory unused in pairing test".into())).expect("connect");
+    let session = TruesealSession::connect(
+        pipe_client,
+        relay_pub,
+        device,
+        |_, _, _| {},
+        || Err("push factory unused in pairing test".into()),
+    )
+    .expect("connect");
 
     let _token = session.pairing_token();
     // Sleep well beyond the old 60-second auto-expiry — window must still be open.
@@ -111,7 +137,14 @@ fn accept_pair_returns_bool_reflecting_window_state() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, || Err("push factory unused in pairing test".into())).expect("connect");
+    let session = TruesealSession::connect(
+        pipe_client,
+        relay_pub,
+        device,
+        |_, _, _| {},
+        || Err("push factory unused in pairing test".into()),
+    )
+    .expect("connect");
 
     let dummy = NoisePublicKey(make_relay_kp().public_key);
     let dummy_signing = crate::keys::SigningPublicKey([0u8; 32]);
@@ -153,7 +186,14 @@ fn no_callback_fired_when_window_closed() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, || Err("push factory unused in pairing test".into())).expect("connect");
+    let session = TruesealSession::connect(
+        pipe_client,
+        relay_pub,
+        device,
+        |_, _, _| {},
+        || Err("push factory unused in pairing test".into()),
+    )
+    .expect("connect");
 
     let fired: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
     let _fc = fired.clone();
@@ -174,13 +214,19 @@ fn cancel_pairing_clears_pending_members() {
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
-    std::thread::spawn(move || { let _ = accept(pipe_relay, relay_kp2); });
+    std::thread::spawn(move || {
+        let _ = accept(pipe_relay, relay_kp2);
+    });
 
     let device = DeviceKeypair::generate();
     let session = TruesealSession::connect(
-        pipe_client, relay_pub, device, |_, _, _| {},
+        pipe_client,
+        relay_pub,
+        device,
+        |_, _, _| {},
         || Err("push factory unused".into()),
-    ).expect("connect");
+    )
+    .expect("connect");
 
     // Open window, inject a fake pending member directly.
     let _token = session.pairing_token();
@@ -192,7 +238,10 @@ fn cancel_pairing_clears_pending_members() {
             signing_pub: crate::keys::SigningPublicKey([2u8; 32]),
         },
     );
-    assert!(!session.pending_members.lock().unwrap().is_empty(), "setup: token must be present");
+    assert!(
+        !session.pending_members.lock().unwrap().is_empty(),
+        "setup: token must be present"
+    );
 
     session.cancel_pairing();
 

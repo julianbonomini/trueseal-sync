@@ -7,7 +7,7 @@ use crate::device::DeviceKeypair;
 use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
-use super::super::{TruesealSession, SessionError};
+use super::super::{SessionError, TruesealSession};
 use super::{make_one_member_manifest, make_two_member_manifest};
 
 /// remove_member returns MemberNotFound when target signing pub is not in manifest.
@@ -27,7 +27,14 @@ fn remove_member_unknown_returns_member_not_found() {
     let noise = device.public_key();
     let sk = SigningKey::from_bytes(&device.signing.to_bytes());
 
-    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, || Err("push factory: errors swallowed".into())).expect("connect");
+    let session = TruesealSession::connect(
+        pipe_client,
+        relay_pub,
+        device,
+        |_, _, _| {},
+        || Err("push factory: errors swallowed".into()),
+    )
+    .expect("connect");
     let dummy_peer = DeviceKeypair::generate();
     let v1 = make_two_member_manifest(
         noise,
@@ -59,7 +66,14 @@ fn remove_member_no_manifest_returns_not_in_group() {
         });
     }
     let device = DeviceKeypair::generate();
-    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, || Err("push factory: errors swallowed".into())).expect("connect");
+    let session = TruesealSession::connect(
+        pipe_client,
+        relay_pub,
+        device,
+        |_, _, _| {},
+        || Err("push factory: errors swallowed".into()),
+    )
+    .expect("connect");
 
     let target = DeviceKeypair::generate().signing_public_key();
     let result = session.remove_member(target);
@@ -116,12 +130,30 @@ fn remove_member_issues_new_manifest_excluding_target() {
         &a_sk,
     );
 
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
-    let session_b =
-        TruesealSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
-    let session_c =
-        TruesealSession::connect(pipe_c_client, relay_pub, device_c, |_, _, _| {}, nk.factory()).expect("session C");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
+    let session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session B");
+    let session_c = TruesealSession::connect(
+        pipe_c_client,
+        relay_pub,
+        device_c,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session C");
 
     session_a.set_manifest(v1.clone());
     session_b.set_manifest(v1.clone());
@@ -130,8 +162,30 @@ fn remove_member_issues_new_manifest_excluding_target() {
     // A removes C.
     session_a.remove_member(c_signing).expect("remove_member");
 
-    wait_for(|| session_b.manifest.lock().unwrap().as_ref().map(|m| m.version) == Some(2), Duration::from_secs(5));
-    wait_for(|| session_c.manifest.lock().unwrap().as_ref().map(|m| m.version) == Some(2), Duration::from_secs(5));
+    wait_for(
+        || {
+            session_b
+                .manifest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.version)
+                == Some(2)
+        },
+        Duration::from_secs(5),
+    );
+    wait_for(
+        || {
+            session_c
+                .manifest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.version)
+                == Some(2)
+        },
+        Duration::from_secs(5),
+    );
 
     // A's manifest: 2 members.
     let a_m = session_a.manifest.lock().unwrap();
@@ -212,17 +266,35 @@ fn removed_member_messages_are_discarded() {
 
     let a_received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
     let ar = a_received.clone();
-    let session_a = TruesealSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _, _seq| {
-        if let crate::message::Message::Sync { body } = msg {
-            ar.lock().unwrap().push(body);
-        }
-    }, nk.factory())
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        move |msg, _, _seq| {
+            if let crate::message::Message::Sync { body } = msg {
+                ar.lock().unwrap().push(body);
+            }
+        },
+        nk.factory(),
+    )
     .expect("session A");
 
-    let session_b =
-        TruesealSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
-    let session_c =
-        TruesealSession::connect(pipe_c_client, relay_pub, device_c, |_, _, _| {}, nk.factory()).expect("session C");
+    let session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session B");
+    let session_c = TruesealSession::connect(
+        pipe_c_client,
+        relay_pub,
+        device_c,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session C");
 
     session_a.set_manifest(v1.clone());
     session_b.set_manifest(v1.clone());
@@ -272,8 +344,14 @@ fn on_removed_from_group_fires_on_remove_member() {
     let removed_count: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let rc = removed_count.clone();
 
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
     let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
@@ -294,7 +372,10 @@ fn on_removed_from_group_fires_on_remove_member() {
     session_b.set_manifest(v1);
 
     session_a.remove_member(b_signing).expect("remove_member");
-    wait_for(|| *removed_count.lock().unwrap() >= 1, Duration::from_secs(5));
+    wait_for(
+        || *removed_count.lock().unwrap() >= 1,
+        Duration::from_secs(5),
+    );
 
     assert_eq!(
         *removed_count.lock().unwrap(),
@@ -352,8 +433,14 @@ fn on_removed_from_group_does_not_fire_for_unaffected_member() {
     let b_removed_count: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let brc = b_removed_count.clone();
 
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
     let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
@@ -368,8 +455,14 @@ fn on_removed_from_group_does_not_fire_for_unaffected_member() {
         nk.factory(),
     )
     .expect("session B");
-    let session_c =
-        TruesealSession::connect(pipe_c_client, relay_pub, device_c, |_, _, _| {}, nk.factory()).expect("session C");
+    let session_c = TruesealSession::connect(
+        pipe_c_client,
+        relay_pub,
+        device_c,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session C");
 
     session_a.set_manifest(v1.clone());
     session_b.set_manifest(v1.clone());
@@ -378,7 +471,18 @@ fn on_removed_from_group_does_not_fire_for_unaffected_member() {
     // A removes C — B should NOT fire on_removed_from_group.
     session_a.remove_member(c_signing).expect("remove_member");
     // Wait for B to receive the updated manifest (confirms delivery completed).
-    wait_for(|| session_b.manifest.lock().unwrap().as_ref().map(|m| m.version) == Some(2), Duration::from_secs(5));
+    wait_for(
+        || {
+            session_b
+                .manifest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.version)
+                == Some(2)
+        },
+        Duration::from_secs(5),
+    );
 
     assert_eq!(
         *b_removed_count.lock().unwrap(),
@@ -414,13 +518,25 @@ fn removed_member_no_longer_receives_fanout_blobs() {
     let br = b_received.clone();
 
     // A connects first (relay accepts pipe_a_relay first).
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("A");
-    let session_b = TruesealSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
-        if let crate::message::Message::Sync { body } = msg {
-            br.lock().unwrap().push(body);
-        }
-    }, nk.factory())
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("A");
+    let session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        move |msg, _, _seq| {
+            if let crate::message::Message::Sync { body } = msg {
+                br.lock().unwrap().push(body);
+            }
+        },
+        nk.factory(),
+    )
     .expect("B");
 
     let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, b_noise, b_signing);
@@ -430,8 +546,19 @@ fn removed_member_no_longer_receives_fanout_blobs() {
     // A removes B.
     session_a.remove_member(b_signing).expect("remove_member");
     // Wait for removal manifest to reach B before asserting.
-    wait_for(|| session_b.manifest.lock().unwrap().as_ref().map(|m| m.members.len()) == Some(1)
-        || session_b.manifest.lock().unwrap().is_none(), Duration::from_secs(5));
+    wait_for(
+        || {
+            session_b
+                .manifest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.members.len())
+                == Some(1)
+                || session_b.manifest.lock().unwrap().is_none()
+        },
+        Duration::from_secs(5),
+    );
 
     // After removal A is the only remaining member — push_sync has no peers to deliver to.
     // Self-only group returns Ok(()) without delivering anything.

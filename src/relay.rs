@@ -4,11 +4,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use thiserror::Error;
 use trueseal_noise::{
     keypair::Keypair as NoiseKeypair,
     session_xx::{dial, Session},
 };
-use thiserror::Error;
 
 use crate::crypto;
 use crate::envelope::Envelope;
@@ -45,8 +45,8 @@ pub enum RelayError {
 #[repr(u8)]
 #[derive(PartialEq)]
 pub(crate) enum MsgType {
-    Push      = 0x01,
-    Deliver   = 0x02,
+    Push = 0x01,
+    Deliver = 0x02,
     Heartbeat = 0x03,
     /// Relay → client. Body: empty (0 bytes).
     /// Semantic: "persisted to InboxStore" — not "received bytes" (ADR-0008).
@@ -54,11 +54,11 @@ pub(crate) enum MsgType {
     /// rejected: relay never uses sequence numbers; dedup impossible on NK sessions;
     /// NK already authenticates the relay so a well-formed Ack is sufficient proof.
     /// trueseal-sync accepts any body length defensively but the relay always sends 0 bytes.
-    Ack       = 0x04,
+    Ack = 0x04,
     /// Relay → client. Body: empty (0 bytes).
     /// Semantic: the relay permanently rejected the blob (e.g. oversized envelope).
     /// The sender must NOT retry — `push_send` returns `RelayError::PushRejected`.
-    Error     = 0x05,
+    Error = 0x05,
     DeliverAck = 0x06,
 }
 
@@ -182,7 +182,10 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
     /// Decryption and type parsing happen inside — callers receive a clean `Message`
     /// and the sender's signing public key (`author_pub` from the Envelope).
     pub fn subscribe(&self, callback: impl Fn(Message, [u8; 32], u64) + Send + 'static) {
-        self.callbacks.lock().unwrap_or_else(|e| e.into_inner()).push(Box::new(callback));
+        self.callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Box::new(callback));
     }
 
     /// Returns true while the background run loop is alive (relay connected).
@@ -206,7 +209,6 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
             _transport: PhantomData,
         }
     }
-
 }
 
 /// Build and frame a Push blob without sending it.
@@ -305,10 +307,13 @@ fn run_loop<T: Read + Write + Send + 'static>(
                         let _ = session.send(&frame(MsgType::DeliverAck, blob_id));
                         let envelope_bytes = &body[8..];
                         if let Ok(env) = Envelope::decode(envelope_bytes) {
-                            if let Ok((author_pub, plaintext)) = crypto::decrypt(my_noise_priv, &env.payload) {
+                            if let Ok((author_pub, plaintext)) =
+                                crypto::decrypt(my_noise_priv, &env.payload)
+                            {
                                 if env.verify_with(author_pub).is_ok() {
                                     if let Ok(msg) = Message::decode(&plaintext) {
-                                        let cbs = callbacks.lock().unwrap_or_else(|e| e.into_inner());
+                                        let cbs =
+                                            callbacks.lock().unwrap_or_else(|e| e.into_inner());
                                         for cb in cbs.iter() {
                                             cb(msg.clone(), author_pub, env.sequence);
                                         }
@@ -367,9 +372,7 @@ pub fn push_send<T: Read + Write + Send>(
     let fresh_kp = generate_keypair();
     let session = trueseal_noise::session_nk::dial(transport, fresh_kp, relay_pub)
         .map_err(|e| RelayError::HandshakeFailed(e))?;
-    session
-        .send(&blob)
-        .map_err(|e| RelayError::PushFailed(e))?;
+    session.send(&blob).map_err(|e| RelayError::PushFailed(e))?;
     // Block until the relay confirms persistence (ADR-0019).
     let raw = session
         .receive()
@@ -390,12 +393,12 @@ mod tests {
     use crate::envelope::SigningKeypair;
     use crate::keys::NoisePublicKey;
     use crate::message::Message;
+    use std::io;
+    use std::sync::{Arc, Mutex};
     use trueseal_noise::{
         keypair::{generate_keypair, Keypair},
         session_xx::accept,
     };
-    use std::io;
-    use std::sync::{Arc, Mutex};
 
     // ── In-memory bidirectional pipe ──────────────────────────────────────────
 
@@ -527,7 +530,9 @@ mod tests {
         // Spin-wait: react to actual delivery rather than a fixed delay.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if !received.lock().unwrap().is_empty() { break; }
+            if !received.lock().unwrap().is_empty() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
@@ -570,7 +575,8 @@ mod tests {
 
         // Stub relay: completes NK handshake, then immediately sends an Error frame.
         std::thread::spawn(move || {
-            let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+            let relay_kp2 =
+                trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
             let session = nk_accept(relay_pipe, relay_kp2).unwrap();
             let _ = session.receive(); // drain the Push
             let _ = session.send(&frame(MsgType::Error, &[]));
@@ -578,14 +584,17 @@ mod tests {
 
         let sender = DeviceKeypair::generate();
         let recipient = DeviceKeypair::generate();
-        let msg = Message::Sync { body: b"test".to_vec() };
+        let msg = Message::Sync {
+            body: b"test".to_vec(),
+        };
         let blob = build_push_blob(
             &msg,
             recipient.public_key(),
             1,
             vec![],
             &sender.signing_keypair(),
-        ).expect("build_push_blob should succeed");
+        )
+        .expect("build_push_blob should succeed");
 
         let result = push_send(client_pipe, relay_pub, blob);
         assert!(
@@ -640,7 +649,11 @@ mod tests {
         {
             let recipient_pub = recipient.public_key();
             let plaintext = msg_to_deliver.encode();
-            let payload = crate::crypto::encrypt(recipient_pub, sender_signing.public_key_bytes(), &plaintext);
+            let payload = crate::crypto::encrypt(
+                recipient_pub,
+                sender_signing.public_key_bytes(),
+                &plaintext,
+            );
             let env = Envelope::build(1, vec![], recipient_pub, &sender_signing, payload);
             let env_bytes = env.encode();
 
@@ -666,7 +679,9 @@ mod tests {
         // Spin-wait for callback.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if !delivered.lock().unwrap().is_empty() { break; }
+            if !delivered.lock().unwrap().is_empty() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
@@ -759,7 +774,9 @@ mod tests {
         // Spin-wait for A's callback to fire.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
-            if !received.lock().unwrap().is_empty() { break; }
+            if !received.lock().unwrap().is_empty() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 

@@ -25,10 +25,22 @@ fn join_group_sends_pair_message_to_initiator() {
     let b_signing_pub = device_b.signing_public_key();
 
     // B connects first — matches relay accept order.
-    let session_b =
-        TruesealSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session B");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
 
     // Capture the opaque token issued when B's Pair arrives.
     let req_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -41,7 +53,10 @@ fn join_group_sends_pair_message_to_initiator() {
     let result = session_b.join_group(&token);
     assert!(result.is_ok(), "join_group failed: {:?}", result);
 
-    wait_for(|| req_token.lock().unwrap().is_some(), Duration::from_secs(5));
+    wait_for(
+        || req_token.lock().unwrap().is_some(),
+        Duration::from_secs(5),
+    );
 
     // A's pairing handler must have fired exactly once.
     let issued = req_token.lock().unwrap().clone();
@@ -60,7 +75,10 @@ fn join_group_sends_pair_message_to_initiator() {
         .iter()
         .find(|mb| mb.noise_pub == b_noise_pub)
         .expect("B must be in manifest");
-    assert_eq!(b_member.signing_pub, b_signing_pub, "B signing_pub must match");
+    assert_eq!(
+        b_member.signing_pub, b_signing_pub,
+        "B signing_pub must match"
+    );
 }
 
 /// join_group with a malformed token returns InvalidToken.
@@ -86,7 +104,9 @@ fn join_group_invalid_token_returns_error() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk2.factory()).expect("connect");
+    let session =
+        TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk2.factory())
+            .expect("connect");
 
     let result = session.join_group("not-a-valid-token!!!!");
     assert!(

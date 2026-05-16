@@ -36,8 +36,14 @@ fn subscribe_handler_survives_poisoned_manifest_mutex() {
     let received: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let rc = received.clone();
 
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
     let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
@@ -74,10 +80,7 @@ fn subscribe_handler_survives_poisoned_manifest_mutex() {
         .push_sync(b"hello after poison".to_vec())
         .expect("push");
 
-    wait_for(
-        || *received.lock().unwrap() >= 1,
-        Duration::from_secs(5),
-    );
+    wait_for(|| *received.lock().unwrap() >= 1, Duration::from_secs(5));
     assert_eq!(
         *received.lock().unwrap(),
         1,
@@ -99,16 +102,22 @@ fn push_sync_survives_poisoned_manifest_mutex() {
 
     let device = DeviceKeypair::generate();
     let session =
-        TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("session");
+        TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory())
+            .expect("session");
 
     let manifest_arc = session.manifest.clone();
     let _ = std::panic::catch_unwind(|| {
         let _guard = manifest_arc.lock().unwrap();
         panic!("intentional poison");
     });
-    assert!(session.manifest.is_poisoned(), "setup: manifest must be poisoned");
+    assert!(
+        session.manifest.is_poisoned(),
+        "setup: manifest must be poisoned"
+    );
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.push_sync(b"hello".to_vec())));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.push_sync(b"hello".to_vec())
+    }));
     assert!(
         result.is_ok(),
         "push_sync must not panic with poisoned manifest"
@@ -126,7 +135,8 @@ fn members_survives_poisoned_manifest_mutex() {
 
     let device = DeviceKeypair::generate();
     let session =
-        TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("session");
+        TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory())
+            .expect("session");
 
     let manifest_arc = session.manifest.clone();
     let _ = std::panic::catch_unwind(|| {
@@ -135,8 +145,15 @@ fn members_survives_poisoned_manifest_mutex() {
     });
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| session.members()));
-    assert!(result.is_ok(), "members() must not panic with poisoned manifest");
-    assert_eq!(result.unwrap(), vec![], "poisoned None manifest → empty list");
+    assert!(
+        result.is_ok(),
+        "members() must not panic with poisoned manifest"
+    );
+    assert_eq!(
+        result.unwrap(),
+        vec![],
+        "poisoned None manifest → empty list"
+    );
 }
 
 // ── #68 ───────────────────────────────────────────────────────────────────────
@@ -162,8 +179,14 @@ fn on_manifest_changed_panic_does_not_poison_manifest_mutex() {
     let b_noise = device_b.public_key();
     let b_signing = device_b.signing_public_key();
 
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
     // B's on_manifest_changed panics — simulates a failing SQLite write.
     let session_b = TruesealSession::connect_full(
         pipe_b_client,
@@ -196,8 +219,16 @@ fn on_manifest_changed_panic_does_not_poison_manifest_mutex() {
         group_id,
         2,
         vec![
-            ManifestMember { noise_pub: a_noise, signing_pub: a_signing, name: "A".into() },
-            ManifestMember { noise_pub: b_noise, signing_pub: b_signing, name: "B".into() },
+            ManifestMember {
+                noise_pub: a_noise,
+                signing_pub: a_signing,
+                name: "A".into(),
+            },
+            ManifestMember {
+                noise_pub: b_noise,
+                signing_pub: b_signing,
+                name: "B".into(),
+            },
         ],
         &a_sk,
     );

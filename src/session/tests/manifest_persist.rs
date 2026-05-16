@@ -86,7 +86,18 @@ fn manifest_persists_across_session_restart() {
     assert!(admitted, "accept_pair must return true when window is open");
 
     // Wait until B has received and persisted the GroupManifest.
-    wait_for(|| store_b.lock().unwrap().load_group_manifest().ok().flatten().is_some(), Duration::from_secs(5));
+    wait_for(
+        || {
+            store_b
+                .lock()
+                .unwrap()
+                .load_group_manifest()
+                .ok()
+                .flatten()
+                .is_some()
+        },
+        Duration::from_secs(5),
+    );
 
     // ── Phase 2: verify stores have the manifest ─────────────────────────────
     let a_saved = store_a
@@ -182,10 +193,10 @@ fn manifest_persists_across_session_restart() {
 /// connects and can immediately push to B.
 #[test]
 fn manifest_restore_via_connect_background() {
-    use std::sync::{Arc, Condvar, Mutex};
-    use std::time::Duration;
     use crate::operation_log::MemLog;
     use crate::store::PersistentLog;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
 
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
@@ -214,26 +225,44 @@ fn manifest_restore_via_connect_background() {
         |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
-        move |m| { let _ = store_a_cb.lock().unwrap().save_group_manifest(m); },
+        move |m| {
+            let _ = store_a_cb.lock().unwrap().save_group_manifest(m);
+        },
         || {},
         nk1.factory(),
     )
     .expect("session A");
 
-    let _session_b1 = TruesealSession::connect(pipe_b1_client, relay_pub,
-        DeviceKeypair::from_bytes(
-            device_b.noise.private(), device_b.signing.to_bytes()
-        ).unwrap(),
+    let _session_b1 = TruesealSession::connect(
+        pipe_b1_client,
+        relay_pub,
+        DeviceKeypair::from_bytes(device_b.noise.private(), device_b.signing.to_bytes()).unwrap(),
         |_, _, _| {},
         nk1.factory(),
-    ).expect("session B1");
+    )
+    .expect("session B1");
 
     let _token = session_a.pairing_token();
     assert!(session_a.accept_pair(b_noise, b_signing), "accept_pair");
-    wait_for(|| store_a.lock().unwrap().load_group_manifest().ok().flatten().is_some(), Duration::from_secs(5));
+    wait_for(
+        || {
+            store_a
+                .lock()
+                .unwrap()
+                .load_group_manifest()
+                .ok()
+                .flatten()
+                .is_some()
+        },
+        Duration::from_secs(5),
+    );
 
-    let a_saved = store_a.lock().unwrap()
-        .load_group_manifest().expect("load").expect("saved");
+    let a_saved = store_a
+        .lock()
+        .unwrap()
+        .load_group_manifest()
+        .expect("load")
+        .expect("saved");
     assert_eq!(a_saved.members.len(), 2, "manifest saved");
     drop(session_a);
     drop(_session_b1);
@@ -251,7 +280,8 @@ fn manifest_restore_via_connect_background() {
     let br = b2_received.clone();
 
     let session_b2 = TruesealSession::connect(
-        pipe_b2_client, relay_pub,
+        pipe_b2_client,
+        relay_pub,
         DeviceKeypair::from_bytes(device_b.noise.private(), device_b.signing.to_bytes()).unwrap(),
         move |_, _, _| {
             let (lock, cvar) = &*br;
@@ -259,7 +289,8 @@ fn manifest_restore_via_connect_background() {
             cvar.notify_all();
         },
         nk2.factory(),
-    ).expect("session B2");
+    )
+    .expect("session B2");
 
     // Store the B2 device private bytes to avoid Clone issue.
     let b_noise_priv = device_b.noise.private();
@@ -269,10 +300,14 @@ fn manifest_restore_via_connect_background() {
     // (B2 didn't persist its manifest in phase 1; reconstruct from A's.)
     // A's manifest contains B — B's manifest also has 2 members.
     {
-        use ed25519_dalek::SigningKey;
         use crate::manifest::{GroupManifest, ManifestMember};
-        let loaded = store_a.lock().unwrap()
-            .load_group_manifest().expect("load").expect("manifest");
+        use ed25519_dalek::SigningKey;
+        let loaded = store_a
+            .lock()
+            .unwrap()
+            .load_group_manifest()
+            .expect("load")
+            .expect("manifest");
         session_b2.set_manifest(loaded);
     }
 
@@ -289,28 +324,44 @@ fn manifest_restore_via_connect_background() {
         |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
-        move |m| { let _ = store_a2_cb.lock().unwrap().save_group_manifest(m); },
+        move |m| {
+            let _ = store_a2_cb.lock().unwrap().save_group_manifest(m);
+        },
         || {},
         move || {
-            pipe_a2_slot2.lock().unwrap().take()
+            pipe_a2_slot2
+                .lock()
+                .unwrap()
+                .take()
                 .ok_or_else(|| "exhausted".to_string())
         },
         nk2.factory(), // NK push factory (ADR-0018)
         Some(Duration::from_millis(50)),
         None,
-    ).expect("session A2");
+    )
+    .expect("session A2");
 
     // Restore manifest from store BEFORE any relay connection — this is the FFI flow.
-    let restored = store_a3.lock().unwrap()
-        .load_group_manifest().expect("load").expect("manifest for A2");
-    assert_eq!(restored.members.len(), 2, "A2 manifest has 2 members before connect");
+    let restored = store_a3
+        .lock()
+        .unwrap()
+        .load_group_manifest()
+        .expect("load")
+        .expect("manifest for A2");
+    assert_eq!(
+        restored.members.len(),
+        2,
+        "A2 manifest has 2 members before connect"
+    );
     session_a2.set_manifest(restored);
 
     // Wait for A2 to reconnect via the factory.
     std::thread::sleep(Duration::from_millis(300));
 
     // A2 pushes to the group — B2 must receive it.
-    session_a2.push_sync(b"restored-push".to_vec()).expect("push_sync");
+    session_a2
+        .push_sync(b"restored-push".to_vec())
+        .expect("push_sync");
 
     let (lock, cvar) = &*b2_received;
     let result = cvar

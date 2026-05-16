@@ -8,7 +8,7 @@ use crate::member::member_id;
 use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
-use super::super::{TruesealSession, SessionError};
+use super::super::{SessionError, TruesealSession};
 use super::make_two_member_manifest;
 
 /// remove_member_by_id with a valid id removes that member.

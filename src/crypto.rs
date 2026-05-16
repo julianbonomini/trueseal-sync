@@ -126,7 +126,8 @@ mod tests {
         let plaintext = b"hello trueseal-sync";
 
         let ciphertext = encrypt(pub_b, author_pub, plaintext);
-        let (got_author, got_plain) = decrypt(priv_b, &ciphertext).expect("decryption should succeed");
+        let (got_author, got_plain) =
+            decrypt(priv_b, &ciphertext).expect("decryption should succeed");
 
         assert_eq!(got_author, author_pub);
         assert_eq!(got_plain, plaintext);
@@ -152,7 +153,8 @@ mod tests {
         let author_pub = [0x02u8; 32];
 
         let ciphertext = encrypt(pub_b, author_pub, b"");
-        let (got_author, recovered) = decrypt(priv_b, &ciphertext).expect("empty plaintext should decrypt");
+        let (got_author, recovered) =
+            decrypt(priv_b, &ciphertext).expect("empty plaintext should decrypt");
 
         assert_eq!(got_author, author_pub);
         assert_eq!(recovered, b"");

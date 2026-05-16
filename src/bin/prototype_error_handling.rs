@@ -97,7 +97,12 @@ impl MiniSession {
                 let mut seq = self.sequence.lock().expect("sequence mutex: poisoned");
                 let s = *seq;
                 *seq += 1;
-                Ok(format!("pushed {} bytes to {} peers, seq={}", blob.len(), peer_count, s))
+                Ok(format!(
+                    "pushed {} bytes to {} peers, seq={}",
+                    blob.len(),
+                    peer_count,
+                    s
+                ))
             }
         }
     }
@@ -141,7 +146,12 @@ impl MiniSession {
                     .map_err(|e| SessionError::Internal(format!("sequence lock poisoned: {e}")))?;
                 let s = *seq;
                 *seq += 1;
-                Ok(format!("pushed {} bytes to {} peers, seq={}", blob.len(), peer_count, s))
+                Ok(format!(
+                    "pushed {} bytes to {} peers, seq={}",
+                    blob.len(),
+                    peer_count,
+                    s
+                ))
             }
         }
     }
@@ -169,7 +179,10 @@ fn render(session: &MiniSession, log: &[String]) {
     // Clear screen
     print!("\x1b[2J\x1b[H");
 
-    println!("{}", bold("━━ trueseal-sync · error handling prototype ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+    println!(
+        "{}",
+        bold("━━ trueseal-sync · error handling prototype ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    );
     println!();
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -249,7 +262,10 @@ fn render(session: &MiniSession, log: &[String]) {
     println!();
 
     // ── Menu ──────────────────────────────────────────────────────────────────
-    println!("{}", bold("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"));
+    println!(
+        "{}",
+        bold("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    );
     println!(
         "  {} set manifest (2 members)   {} push_sync (all 3 approaches)   {} reset",
         bold("[m]"),
@@ -332,7 +348,9 @@ fn main() {
 
             "r" => {
                 session.reset();
-                log.push(dim("reset — manifested cleared, sequence = 0, poison healed via unwrap_or_else"));
+                log.push(dim(
+                    "reset — manifested cleared, sequence = 0, poison healed via unwrap_or_else",
+                ));
             }
 
             "q" => break,

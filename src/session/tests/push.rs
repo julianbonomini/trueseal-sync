@@ -30,23 +30,38 @@ fn two_sessions_can_exchange_sync_message() {
     let b_noise = device_b.public_key();
     let b_signing = device_b.signing_public_key();
 
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
     session_a.set_manifest(make_two_member_manifest(
         a_noise, a_signing, &a_sk, b_noise, b_signing,
     ));
 
     let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx = received.clone();
-    let _session_b = TruesealSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
-        rx.lock().unwrap().push(msg);
-    }, nk.factory())
+    let _session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        move |msg, _, _seq| {
+            rx.lock().unwrap().push(msg);
+        },
+        nk.factory(),
+    )
     .expect("session B");
 
     session_a
         .push_sync(b"hello from A".to_vec())
         .expect("push_sync");
-    wait_for(|| !received.lock().unwrap().is_empty(), Duration::from_secs(5));
+    wait_for(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+    );
 
     let got = received.lock().unwrap();
     assert_eq!(got.len(), 1);
@@ -121,12 +136,17 @@ fn push_sync_increments_sequence() {
         &sk,
     );
 
-    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("connect");
+    let session =
+        TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory())
+            .expect("connect");
     session.set_manifest(manifest);
 
     session.push_sync(b"first".to_vec()).expect("first");
     session.push_sync(b"second".to_vec()).expect("second");
-    wait_for(|| received_envs.lock().unwrap().len() >= 2, Duration::from_secs(5));
+    wait_for(
+        || received_envs.lock().unwrap().len() >= 2,
+        Duration::from_secs(5),
+    );
 
     let envs = received_envs.lock().unwrap();
     assert_eq!(envs.len(), 2);
@@ -152,8 +172,14 @@ fn on_message_receives_sender_signing_pub() {
     let b_noise = device_b.public_key();
     let b_signing = device_b.signing_public_key();
 
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
     session_a.set_manifest(make_two_member_manifest(
         a_noise,
         a_signing_pub,
@@ -176,7 +202,10 @@ fn on_message_receives_sender_signing_pub() {
     .expect("session B");
 
     session_a.push_sync(b"hello".to_vec()).expect("push");
-    wait_for(|| !received.lock().unwrap().is_empty(), Duration::from_secs(5));
+    wait_for(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+    );
 
     let got = received.lock().unwrap();
     assert_eq!(got.len(), 1);
@@ -205,21 +234,29 @@ fn envelope_addressed_to_wrong_key_is_silently_dropped() {
     // Raw relay: accepts sender first (XX), then A (XX).
     // NK pushes from sender are routed to A's XX deliver (deliberate mis-routing to test drop).
     {
-        let relay_kp_s = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-        let relay_kp_a = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let relay_kp_s =
+            trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let relay_kp_a =
+            trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
             let _sess_sender = accept(pipe_sender_relay, relay_kp_s).unwrap();
             let sess_a = std::sync::Arc::new(accept(pipe_a_relay, relay_kp_a).unwrap());
             // Route all NK pushes to A (deliberate mis-routing).
             while let Ok(nk_pipe) = nk_rx.recv() {
-                let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                let kp =
+                    trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
                 let sess_a2 = sess_a.clone();
                 std::thread::spawn(move || {
                     if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
-                                    let _ = sess_a2.send(&crate::relay::frame(MsgType::Deliver, &{ let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); d }));
+                                    let _ =
+                                        sess_a2.send(&crate::relay::frame(MsgType::Deliver, &{
+                                            let mut d = 0u64.to_be_bytes().to_vec();
+                                            d.extend_from_slice(&body[32..]);
+                                            d
+                                        }));
                                 }
                                 let _ = sess.send(&crate::relay::frame(MsgType::Ack, &[]));
                             }
@@ -239,18 +276,34 @@ fn envelope_addressed_to_wrong_key_is_silently_dropped() {
     let rx = received.clone();
 
     // Sender connects first (relay accepts sender first).
-    let session_sender =
-        TruesealSession::connect(pipe_sender_client, relay_pub, device_sender, |_, _, _| {}, nk.factory())
-            .expect("sender");
+    let session_sender = TruesealSession::connect(
+        pipe_sender_client,
+        relay_pub,
+        device_sender,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("sender");
     // A connects second.
-    let _session_a = TruesealSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _, _seq| {
-        rx.lock().unwrap().push(msg);
-    }, nk.factory())
+    let _session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        move |msg, _, _seq| {
+            rx.lock().unwrap().push(msg);
+        },
+        nk.factory(),
+    )
     .expect("session A");
 
     // Sender pushes a Sync message encrypted for B's noise_pub — wrong key for A.
     session_sender
-        .push_message(&Message::Sync { body: b"misdirected".to_vec() }, b_noise)
+        .push_message(
+            &Message::Sync {
+                body: b"misdirected".to_vec(),
+            },
+            b_noise,
+        )
         .expect("push");
 
     std::thread::sleep(Duration::from_millis(200));
@@ -277,13 +330,13 @@ fn push_does_not_expose_stable_noise_key_to_relay() {
     use trueseal_noise::keypair::Keypair;
 
     use crate::device::DeviceKeypair;
+    use crate::keys::{NoisePublicKey, SigningPublicKey};
+    use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
     use crate::message::Message;
     use crate::operation_log::MemLog;
     use crate::relay::{frame, MsgType};
     use crate::session::test_helpers::*;
     use crate::session::TruesealSession;
-    use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
-    use crate::keys::{NoisePublicKey, SigningPublicKey};
 
     let relay_kp = make_relay_kp();
     let relay_pub_key = relay_kp.public_key;
@@ -344,8 +397,16 @@ fn push_does_not_expose_stable_noise_key_to_relay() {
         new_group_id(),
         1,
         vec![
-            ManifestMember { noise_pub: noise, signing_pub: signing, name: "Self".into() },
-            ManifestMember { noise_pub: peer_noise, signing_pub: peer_signing, name: "Peer".into() },
+            ManifestMember {
+                noise_pub: noise,
+                signing_pub: signing,
+                name: "Self".into(),
+            },
+            ManifestMember {
+                noise_pub: peer_noise,
+                signing_pub: peer_signing,
+                name: "Peer".into(),
+            },
         ],
         &sk,
     );
@@ -366,10 +427,17 @@ fn push_does_not_expose_stable_noise_key_to_relay() {
     let _ = session.push_sync(b"second push".to_vec());
 
     // Give the relay spy time to process both NK sessions.
-    wait_for(|| spy_keys.lock().unwrap().len() >= 2, Duration::from_secs(5));
+    wait_for(
+        || spy_keys.lock().unwrap().len() >= 2,
+        Duration::from_secs(5),
+    );
 
     let keys = spy_keys.lock().unwrap();
-    assert_eq!(keys.len(), 2, "relay must observe exactly 2 NK push sessions");
+    assert_eq!(
+        keys.len(),
+        2,
+        "relay must observe exactly 2 NK push sessions"
+    );
 
     // The relay NEVER saw the device's stable noise pub key in any push handshake.
     // (NK = relay authenticates server to client, not the reverse; relay never

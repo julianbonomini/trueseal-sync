@@ -1,5 +1,4 @@
 mod accept_member;
-mod panic_safety;
 mod accept_pair;
 mod connection;
 mod destroy_group;
@@ -13,6 +12,7 @@ mod nk_push;
 mod offline;
 mod outbox;
 mod pairing;
+mod panic_safety;
 mod push;
 mod remove_member;
 mod remove_member_by_id;

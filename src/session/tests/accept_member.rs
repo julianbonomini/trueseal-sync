@@ -62,7 +62,10 @@ fn pair_inside_window_fires_on_member_request() {
     // B sends Pair message to A.
     session_b.join_group(&pairing_token).expect("join");
 
-    wait_for(|| !received.lock().unwrap().is_empty(), Duration::from_secs(5));
+    wait_for(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+    );
 
     let calls = received.lock().unwrap().clone();
     assert_eq!(calls.len(), 1, "on_member_request must fire once");
@@ -119,7 +122,10 @@ fn accept_member_with_valid_token_returns_true() {
     .expect("session B");
 
     session_b.join_group(&pairing_token).expect("join");
-    wait_for(|| token_received.lock().unwrap().is_some(), Duration::from_secs(5));
+    wait_for(
+        || token_received.lock().unwrap().is_some(),
+        Duration::from_secs(5),
+    );
 
     let request_token = token_received
         .lock()
@@ -143,12 +149,16 @@ fn accept_member_with_unknown_token_returns_false() {
             let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
             // drain nk connections
             while let Ok(p) = nk_rx.recv() {
-                let kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
-                if sess.receive().is_ok() {
-                    let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
-                }
-            } });
+                let kp2 =
+                    trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                std::thread::spawn(move || {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
+                        if sess.receive().is_ok() {
+                            let _ =
+                                sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                        }
+                    }
+                });
             }
         });
     }

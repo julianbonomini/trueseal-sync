@@ -173,7 +173,11 @@ pub(super) fn spawn_routing_relay(
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
-                                    let _ = dst2.send(&{ let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); frame(MsgType::Deliver, &d) });
+                                    let _ = dst2.send(&{
+                                        let mut d = 0u64.to_be_bytes().to_vec();
+                                        d.extend_from_slice(&body[32..]);
+                                        frame(MsgType::Deliver, &d)
+                                    });
                                 }
                                 let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }
@@ -189,7 +193,11 @@ pub(super) fn spawn_routing_relay(
 /// Spawns a minimal relay that accepts exactly one client connection and
 /// discards all messages. Used in tests that only need a live session
 /// without any fanout (single-device panic-safety tests, etc.).
-pub(super) fn spawn_single_relay(relay_kp: &Keypair, pipe: MemPipe, nk_rx: mpsc::Receiver<MemPipe>) {
+pub(super) fn spawn_single_relay(
+    relay_kp: &Keypair,
+    pipe: MemPipe,
+    nk_rx: mpsc::Receiver<MemPipe>,
+) {
     let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_priv = relay_kp.private();
     let relay_pub_key = relay_kp.public_key;
@@ -222,7 +230,12 @@ pub(super) fn spawn_single_relay(relay_kp: &Keypair, pipe: MemPipe, nk_rx: mpsc:
     });
 }
 
-pub(super) fn spawn_bidirectional_relay(relay_kp: &Keypair, pipe_a: MemPipe, pipe_b: MemPipe, nk_rx: mpsc::Receiver<MemPipe>) {
+pub(super) fn spawn_bidirectional_relay(
+    relay_kp: &Keypair,
+    pipe_a: MemPipe,
+    pipe_b: MemPipe,
+    nk_rx: mpsc::Receiver<MemPipe>,
+) {
     let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_kp_b = Keypair::new(relay_kp.private(), relay_kp.public_key);
     let relay_priv = relay_kp.private();
@@ -247,9 +260,15 @@ pub(super) fn spawn_bidirectional_relay(relay_kp: &Keypair, pipe_a: MemPipe, pip
                     if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
-                                if body.len() < 32 { return; }
+                                if body.len() < 32 {
+                                    return;
+                                }
                                 let recipient_pub = &body[0..32];
-                                let framed = { let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); frame(MsgType::Deliver, &d) };
+                                let framed = {
+                                    let mut d = 0u64.to_be_bytes().to_vec();
+                                    d.extend_from_slice(&body[32..]);
+                                    frame(MsgType::Deliver, &d)
+                                };
                                 if true {
                                     if recipient_pub == a_noise {
                                         let _ = sa2.send(&framed);
@@ -313,9 +332,15 @@ pub(super) fn spawn_bidirectional_relay_parallel(
                     if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
-                                if body.len() < 32 { return; }
+                                if body.len() < 32 {
+                                    return;
+                                }
                                 let recipient_pub = &body[0..32];
-                                let framed = { let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); frame(MsgType::Deliver, &d) };
+                                let framed = {
+                                    let mut d = 0u64.to_be_bytes().to_vec();
+                                    d.extend_from_slice(&body[32..]);
+                                    frame(MsgType::Deliver, &d)
+                                };
                                 if true {
                                     if recipient_pub == a_noise {
                                         let _ = sa2.send(&framed);
@@ -417,13 +442,23 @@ pub(super) fn spawn_tripartite_relay(
                     if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
-                                if body.len() < 32 { return; }
+                                if body.len() < 32 {
+                                    return;
+                                }
                                 let recipient_pub = &body[0..32];
-                                let framed = { let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); frame(MsgType::Deliver, &d) };
+                                let framed = {
+                                    let mut d = 0u64.to_be_bytes().to_vec();
+                                    d.extend_from_slice(&body[32..]);
+                                    frame(MsgType::Deliver, &d)
+                                };
                                 if true {
-                                    if recipient_pub == a_noise { let _ = ta.send(framed); }
-                                    else if recipient_pub == b_noise { let _ = tb.send(framed); }
-                                    else if recipient_pub == c_noise { let _ = tc.send(framed); }
+                                    if recipient_pub == a_noise {
+                                        let _ = ta.send(framed);
+                                    } else if recipient_pub == b_noise {
+                                        let _ = tb.send(framed);
+                                    } else if recipient_pub == c_noise {
+                                        let _ = tc.send(framed);
+                                    }
                                 }
                                 let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }
@@ -470,7 +505,9 @@ pub(super) fn spawn_quadpartite_relay(
             (sess_d.clone(), rx_d),
         ] {
             std::thread::spawn(move || {
-                for msg in rx { let _ = sess.send(&msg); }
+                for msg in rx {
+                    let _ = sess.send(&msg);
+                }
             });
         }
 
@@ -494,14 +531,25 @@ pub(super) fn spawn_quadpartite_relay(
                     if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
-                                if body.len() < 32 { return; }
+                                if body.len() < 32 {
+                                    return;
+                                }
                                 let recipient_pub = &body[0..32];
-                                let framed = { let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); frame(MsgType::Deliver, &d) };
+                                let framed = {
+                                    let mut d = 0u64.to_be_bytes().to_vec();
+                                    d.extend_from_slice(&body[32..]);
+                                    frame(MsgType::Deliver, &d)
+                                };
                                 if true {
-                                    if recipient_pub == a_noise { let _ = ta.send(framed); }
-                                    else if recipient_pub == b_noise { let _ = tb.send(framed); }
-                                    else if recipient_pub == c_noise { let _ = tc.send(framed); }
-                                    else if recipient_pub == d_noise { let _ = td.send(framed); }
+                                    if recipient_pub == a_noise {
+                                        let _ = ta.send(framed);
+                                    } else if recipient_pub == b_noise {
+                                        let _ = tb.send(framed);
+                                    } else if recipient_pub == c_noise {
+                                        let _ = tc.send(framed);
+                                    } else if recipient_pub == d_noise {
+                                        let _ = td.send(framed);
+                                    }
                                 }
                                 let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }

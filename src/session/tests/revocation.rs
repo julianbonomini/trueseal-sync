@@ -10,7 +10,7 @@ use crate::operation_log::MemLog;
 use crate::relay::{frame, parse, MsgType};
 
 use super::super::test_helpers::*;
-use super::super::{TruesealSession, SessionError};
+use super::super::{SessionError, TruesealSession};
 use super::make_two_member_manifest;
 
 /// Regression: after B reconnects, A's destroy_group must still fire B's on_group_destroyed.
@@ -166,7 +166,10 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
             !result.1.timed_out(),
             "B's on_group_destroyed must fire after post-reconnect destroy"
         );
-        assert_eq!(*result.0, 1, "B's on_group_destroyed must fire exactly once");
+        assert_eq!(
+            *result.0, 1,
+            "B's on_group_destroyed must fire exactly once"
+        );
     }
 
     assert!(
@@ -277,7 +280,11 @@ fn revoke_from_unknown_device_is_ignored() {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
-                                    let _ = sess_a2.send(&frame(MsgType::Deliver, &{ let mut d = 0u64.to_be_bytes().to_vec(); d.extend_from_slice(&body[32..]); d }));
+                                    let _ = sess_a2.send(&frame(MsgType::Deliver, &{
+                                        let mut d = 0u64.to_be_bytes().to_vec();
+                                        d.extend_from_slice(&body[32..]);
+                                        d
+                                    }));
                                 }
                                 let _ = sess.send(&frame(MsgType::Ack, &[]));
                             }
@@ -323,9 +330,14 @@ fn revoke_from_unknown_device_is_ignored() {
         trusted_signing,
     ));
 
-    let session_stranger =
-        TruesealSession::connect(pipe_stranger_client, relay_pub, device_stranger, |_, _, _| {}, nk.factory())
-            .expect("stranger");
+    let session_stranger = TruesealSession::connect(
+        pipe_stranger_client,
+        relay_pub,
+        device_stranger,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("stranger");
     session_stranger
         .push_message(&Message::Revoke, session_a.noise_pub())
         .expect("stranger push");

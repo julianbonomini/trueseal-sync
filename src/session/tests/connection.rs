@@ -16,7 +16,8 @@ fn connection_changed_fires_true_on_initial_connect() {
     // Relay will accept one connection.
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     {
-        let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let relay_kp2 =
+            trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
             let _ = trueseal_noise::session_xx::accept(pipe_relay, relay_kp2);
         });
@@ -70,7 +71,8 @@ fn connection_changed_fires_sequence_on_disconnect_and_reconnect() {
     // First connection: will be closed after session starts.
     let (pipe1_client, pipe1_relay, _close_relay1, close_client1) = mem_pipe_pair_with_close();
     {
-        let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let relay_kp2 =
+            trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
             let _ = trueseal_noise::session_xx::accept(pipe1_relay, relay_kp2);
         });
@@ -79,7 +81,8 @@ fn connection_changed_fires_sequence_on_disconnect_and_reconnect() {
     // Second connection for reconnect.
     let (pipe2_client, pipe2_relay) = mem_pipe_pair();
     {
-        let relay_kp3 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let relay_kp3 =
+            trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
             let _ = trueseal_noise::session_xx::accept(pipe2_relay, relay_kp3);
         });

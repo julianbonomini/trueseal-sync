@@ -12,7 +12,7 @@ use crate::device::DeviceKeypair;
 use crate::keys::NoisePublicKey;
 use crate::member::{member_id, member_name};
 use crate::message::Message;
-use crate::session::{TruesealSession, SessionError as CoreSessionError};
+use crate::session::{SessionError as CoreSessionError, TruesealSession};
 use crate::store::{PersistentLog, Store};
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -240,7 +240,10 @@ impl TruesealFfiSession {
                 on_removed_from_group.on_removed_from_group();
             },
             move |m: &crate::manifest::GroupManifest| {
-                let _ = manifest_store_save.lock().unwrap_or_else(|e| e.into_inner()).save_group_manifest(m);
+                let _ = manifest_store_save
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .save_group_manifest(m);
             },
             move || {
                 let _ = wipe_store.lock().unwrap_or_else(|e| e.into_inner()).wipe();

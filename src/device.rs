@@ -1,7 +1,7 @@
 use ed25519_dalek::SigningKey;
-use trueseal_noise::keypair::{generate_keypair as noise_generate, Keypair as NoiseKeypair};
 use rand::thread_rng;
 use thiserror::Error;
+use trueseal_noise::keypair::{generate_keypair as noise_generate, Keypair as NoiseKeypair};
 
 use crate::envelope::SigningKeypair;
 use crate::keys::{NoisePublicKey, SigningPublicKey};

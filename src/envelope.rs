@@ -109,8 +109,8 @@ impl Envelope {
     /// decrypted payload. Called by recipients after decryption — never by the Relay.
     /// Signing message: sequence || parents || recipient_pub || ciphertext.
     pub fn verify_with(&self, author_pub: [u8; 32]) -> Result<(), EnvelopeError> {
-        let vk = VerifyingKey::from_bytes(&author_pub)
-            .map_err(|_| EnvelopeError::InvalidKeyLength)?;
+        let vk =
+            VerifyingKey::from_bytes(&author_pub).map_err(|_| EnvelopeError::InvalidKeyLength)?;
         let msg = signing_message(
             self.sequence,
             &self.parents,
@@ -285,10 +285,13 @@ mod tests {
         let env = Envelope::build(1, vec![], recv_pub, &author_b, payload);
 
         // Recipient decrypts → extracts author_pub = A
-        let (extracted_author, _msg) = crypto::decrypt(recv_priv, &env.payload)
-            .expect("decryption should succeed");
-        assert_eq!(extracted_author, author_a.public_key_bytes(),
-            "extracted author_pub should be A's key");
+        let (extracted_author, _msg) =
+            crypto::decrypt(recv_priv, &env.payload).expect("decryption should succeed");
+        assert_eq!(
+            extracted_author,
+            author_a.public_key_bytes(),
+            "extracted author_pub should be A's key"
+        );
 
         // Verify using A's key — must FAIL because B signed, not A
         assert!(

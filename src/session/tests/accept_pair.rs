@@ -28,14 +28,26 @@ fn accept_pair_creates_genesis_manifest() {
     let b_signing = device_b.signing_public_key();
 
     // A connects first (relay accepts pipe_a_relay first).
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
     // B connects second, collects inbound GroupManifest.
     let b_manifests: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let bm = b_manifests.clone();
-    let _session_b = TruesealSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
-        bm.lock().unwrap().push(msg);
-    }, nk.factory())
+    let _session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        move |msg, _, _seq| {
+            bm.lock().unwrap().push(msg);
+        },
+        nk.factory(),
+    )
     .expect("session B");
 
     // A opens a pairing window then accepts B.
@@ -69,8 +81,14 @@ fn accept_pair_sends_manifest_to_new_member() {
     let b_noise = device_b.public_key();
     let b_signing = device_b.signing_public_key();
 
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
 
     let b_manifest_received: Arc<Mutex<Option<crate::manifest::GroupManifest>>> =
         Arc::new(Mutex::new(None));
@@ -93,7 +111,10 @@ fn accept_pair_sends_manifest_to_new_member() {
     let _token = session_a.pairing_token();
     session_a.accept_pair(b_noise, b_signing);
 
-    wait_for(|| b_manifest_arc.lock().unwrap().is_some(), Duration::from_secs(5));
+    wait_for(
+        || b_manifest_arc.lock().unwrap().is_some(),
+        Duration::from_secs(5),
+    );
 
     // B should have received and stored the GroupManifest.
     let b_m = b_manifest_arc.lock().unwrap();
@@ -126,7 +147,9 @@ fn accept_pair_without_window_returns_false() {
     });
 
     let device = DeviceKeypair::generate();
-    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("connect");
+    let session =
+        TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory())
+            .expect("connect");
 
     let dummy_noise = crate::keys::NoisePublicKey([0xAA; 32]);
     let dummy_signing = crate::keys::SigningPublicKey([0xBB; 32]);
@@ -165,8 +188,14 @@ fn accept_pair_extends_existing_manifest() {
     let dummy_b_signing = SigningPublicKey([0xCC; 32]);
     let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, dummy_b_noise, dummy_b_signing);
 
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
     session_a.set_manifest(v1);
 
     let c_manifest_arc = {
@@ -188,7 +217,10 @@ fn accept_pair_extends_existing_manifest() {
     let _token = session_a.pairing_token();
     session_a.accept_pair(c_noise, c_signing);
 
-    wait_for(|| c_manifest_arc.lock().unwrap().is_some(), Duration::from_secs(5));
+    wait_for(
+        || c_manifest_arc.lock().unwrap().is_some(),
+        Duration::from_secs(5),
+    );
 
     let a_m = session_a.manifest.lock().unwrap();
     assert_eq!(a_m.as_ref().unwrap().members.len(), 3, "A: 3 members");
@@ -225,35 +257,71 @@ fn new_member_bootstrap_can_send_to_existing_members() {
     let c_signing = device_c.signing_public_key();
 
     // A and B already form a 2-member group.
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
     let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, b_noise, b_signing);
     session_a.set_manifest(v1.clone());
 
     let b_received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
     let br = b_received.clone();
-    let session_b = TruesealSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
-        if let crate::message::Message::Sync { body } = msg {
-            br.lock().unwrap().push(body);
-        }
-    }, nk.factory())
+    let session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        move |msg, _, _seq| {
+            if let crate::message::Message::Sync { body } = msg {
+                br.lock().unwrap().push(body);
+            }
+        },
+        nk.factory(),
+    )
     .expect("session B");
     session_b.set_manifest(v1);
 
     // C connects; no manifest yet.
-    let session_c =
-        TruesealSession::connect(pipe_c_client, relay_pub, device_c, |_, _, _| {}, nk.factory()).expect("session C");
+    let session_c = TruesealSession::connect(
+        pipe_c_client,
+        relay_pub,
+        device_c,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session C");
 
     // A opens pairing window and admits C.
     let _token = session_a.pairing_token();
     session_a.accept_pair(c_noise, c_signing);
 
     // C must receive the bootstrap GroupManifest from A before it can push.
-    wait_for(|| session_c.manifest.lock().unwrap().as_ref().map(|m| m.members.len()) == Some(3), Duration::from_secs(5));
+    wait_for(
+        || {
+            session_c
+                .manifest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.members.len())
+                == Some(3)
+        },
+        Duration::from_secs(5),
+    );
 
     // C should now have a 3-member manifest.
     assert_eq!(
-        session_c.manifest.lock().unwrap().as_ref().unwrap().members.len(),
+        session_c
+            .manifest
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .members
+            .len(),
         3,
         "C must have 3-member manifest after bootstrap"
     );
@@ -263,7 +331,10 @@ fn new_member_bootstrap_can_send_to_existing_members() {
         .push_sync(b"hello from C".to_vec())
         .expect("C push_sync");
 
-    wait_for(|| !b_received.lock().unwrap().is_empty(), Duration::from_secs(5));
+    wait_for(
+        || !b_received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+    );
 
     let got = b_received.lock().unwrap();
     assert_eq!(got.len(), 1, "B must receive C's blob");

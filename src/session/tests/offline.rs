@@ -2,7 +2,7 @@ use crate::device::DeviceKeypair;
 use crate::operation_log::MemLog;
 
 use super::super::test_helpers::*;
-use super::super::{TruesealSession, SessionError};
+use super::super::{SessionError, TruesealSession};
 
 /// create_offline() succeeds with an unreachable relay — returns a session immediately.
 #[test]

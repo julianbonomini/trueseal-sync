@@ -111,15 +111,23 @@ fn on_message_fires_via_xx_receive_after_nk_push() {
         1,
         vec![],
         &device_b.signing_keypair(),
-    ).expect("build_push_blob should succeed");
+    )
+    .expect("build_push_blob should succeed");
 
     // Device B pushes via NK (anonymous, ephemeral)
     push_send(push_pipe_client, relay_pub_key, blob).expect("NK push failed");
 
-    wait_for(|| !received.lock().unwrap().is_empty(), Duration::from_secs(5));
+    wait_for(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+    );
 
     let msgs = received.lock().unwrap();
-    assert_eq!(msgs.len(), 1, "A should receive one message via XX subscribe");
+    assert_eq!(
+        msgs.len(),
+        1,
+        "A should receive one message via XX subscribe"
+    );
     assert_eq!(
         msgs[0],
         Message::Sync {
@@ -151,7 +159,10 @@ fn push_send_returns_ok_when_relay_acks() {
 
     let blob = frame(MsgType::Push, b"test blob");
     let result = push_send(pipe_c, relay_pub, blob);
-    assert!(result.is_ok(), "push_send must return Ok(()) after relay Ack");
+    assert!(
+        result.is_ok(),
+        "push_send must return Ok(()) after relay Ack"
+    );
 }
 
 /// push_send returns Err when the relay sends an unexpected response instead of Ack.
@@ -196,18 +207,24 @@ fn push_body_starts_with_recipient_pub() {
 
     let signing = device.signing_keypair();
     let blob = build_push_blob(
-        &Message::Sync { body: b"hello".to_vec() },
+        &Message::Sync {
+            body: b"hello".to_vec(),
+        },
         recipient_pub,
         0,
         vec![],
         &signing,
-    ).expect("build_push_blob should succeed");
+    )
+    .expect("build_push_blob should succeed");
 
     // blob = [type:u8][len:u32 BE][recipient_pub:32][envelope_proto:...]
     assert!(blob.len() > 5 + 32, "blob too short");
     let body = &blob[5..]; // strip frame header
     let prefix: [u8; 32] = body[0..32].try_into().unwrap();
-    assert_eq!(prefix, recipient_pub.0, "first 32 bytes of body must be recipient_pub");
+    assert_eq!(
+        prefix, recipient_pub.0,
+        "first 32 bytes of body must be recipient_pub"
+    );
 }
 
 /// Ack body must be 0 bytes — relay sends empty Ack, client accepts any body.
@@ -227,8 +244,10 @@ fn push_send_accepts_zero_byte_ack() {
     });
 
     let blob = frame(MsgType::Push, b"test");
-    assert!(push_send(pipe_c, relay_pub, blob).is_ok(),
-        "push_send must accept 0-byte Ack body");
+    assert!(
+        push_send(pipe_c, relay_pub, blob).is_ok(),
+        "push_send must accept 0-byte Ack body"
+    );
 }
 
 // ── Heartbeat + Ack silent drop on XX Receive Session (ADR-0019 / #73) ───────
@@ -236,9 +255,9 @@ fn push_send_accepts_zero_byte_ack() {
 /// run_loop echoes Heartbeat back when the relay sends one on the XX session.
 #[test]
 fn run_loop_echoes_heartbeat_on_receive_session() {
-    use std::time::Duration;
-    use crate::relay::{RelayClient};
     use crate::operation_log::MemLog;
+    use crate::relay::RelayClient;
+    use std::time::Duration;
 
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
@@ -269,15 +288,18 @@ fn run_loop_echoes_heartbeat_on_receive_session() {
     .expect("connect");
 
     wait_for(|| *echo_received.lock().unwrap(), Duration::from_secs(5));
-    assert!(*echo_received.lock().unwrap(), "run_loop must echo Heartbeat back");
+    assert!(
+        *echo_received.lock().unwrap(),
+        "run_loop must echo Heartbeat back"
+    );
 }
 
 /// run_loop silently drops Ack on the XX Receive Session — session continues.
 #[test]
 fn run_loop_silently_drops_ack_on_receive_session() {
-    use std::time::Duration;
-    use crate::relay::RelayClient;
     use crate::message::Message;
+    use crate::relay::RelayClient;
+    use std::time::Duration;
 
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
@@ -298,14 +320,17 @@ fn run_loop_silently_drops_ack_on_receive_session() {
         // Send a spurious Ack — run_loop must not crash or close.
         let _ = sess.send(&frame(MsgType::Ack, &[]));
         // Then deliver a real message — proves session is still alive.
-        let msg = Message::Sync { body: b"still alive".to_vec() };
+        let msg = Message::Sync {
+            body: b"still alive".to_vec(),
+        };
         let blob = crate::relay::build_push_blob(
             &msg,
             device_a_pub,
             1,
             vec![],
             &device_b.signing_keypair(),
-        ).expect("build_push_blob should succeed");
+        )
+        .expect("build_push_blob should succeed");
         // Deliver = [blob_id: 8 bytes][proto only] (ADR-0020)
         let mut deliver_body = 0u64.to_be_bytes().to_vec();
         deliver_body.extend_from_slice(&blob[5 + 32..]);
@@ -318,10 +343,20 @@ fn run_loop_silently_drops_ack_on_receive_session() {
         trueseal_noise::keypair::Keypair::new(device_a_noise_priv, device_a_noise_pub),
     )
     .expect("connect");
-    client.subscribe(move |msg, _, _seq| { rx.lock().unwrap().push(msg); });
+    client.subscribe(move |msg, _, _seq| {
+        rx.lock().unwrap().push(msg);
+    });
 
-    wait_for(|| !received.lock().unwrap().is_empty(), Duration::from_secs(5));
-    assert_eq!(received.lock().unwrap()[0], Message::Sync { body: b"still alive".to_vec() });
+    wait_for(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        received.lock().unwrap()[0],
+        Message::Sync {
+            body: b"still alive".to_vec()
+        }
+    );
 }
 
 // ── DeliverAck + sequence in callback (ADR-0020) ─────────────────────────────
@@ -368,7 +403,10 @@ fn run_loop_sends_deliver_ack_before_decryption() {
     )
     .expect("connect");
 
-    wait_for(|| ack_received.lock().unwrap().is_some(), Duration::from_secs(5));
+    wait_for(
+        || ack_received.lock().unwrap().is_some(),
+        Duration::from_secs(5),
+    );
     assert_eq!(
         *ack_received.lock().unwrap(),
         Some(0xDEAD_BEEF_1234_5678),
@@ -399,10 +437,17 @@ fn subscribe_callback_receives_sequence() {
     std::thread::spawn(move || {
         let sess = trueseal_noise::session_xx::accept(pipe_relay, relay_kp2).expect("XX accept");
 
-        let msg = Message::Sync { body: b"hello".to_vec() };
+        let msg = Message::Sync {
+            body: b"hello".to_vec(),
+        };
         let blob = crate::relay::build_push_blob(
-            &msg, device_a_pub, 42, vec![], &device_b.signing_keypair(),
-        ).expect("build_push_blob");
+            &msg,
+            device_a_pub,
+            42,
+            vec![],
+            &device_b.signing_keypair(),
+        )
+        .expect("build_push_blob");
         // Deliver body: [blob_id: 8 bytes][envelope_proto: blob[5+32..]]
         let blob_id: u64 = 99;
         let mut body = Vec::new();
@@ -424,6 +469,13 @@ fn subscribe_callback_receives_sequence() {
         *seq_clone.lock().unwrap() = Some(seq);
     });
 
-    wait_for(|| seq_received.lock().unwrap().is_some(), Duration::from_secs(5));
-    assert_eq!(*seq_received.lock().unwrap(), Some(42), "callback must receive sequence=42");
+    wait_for(
+        || seq_received.lock().unwrap().is_some(),
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        *seq_received.lock().unwrap(),
+        Some(42),
+        "callback must receive sequence=42"
+    );
 }

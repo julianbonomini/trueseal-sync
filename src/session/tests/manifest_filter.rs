@@ -31,12 +31,23 @@ fn message_from_non_member_is_discarded() {
     let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx = received.clone();
     // Relay accepts src (stranger) first, then dst (a) — connect in same order.
-    let session_stranger =
-        TruesealSession::connect(pipe_stranger_client, relay_pub, device_stranger, |_, _, _| {}, nk.factory())
-            .expect("stranger");
-    let session_a = TruesealSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _, _seq| {
-        rx.lock().unwrap().push(msg);
-    }, nk.factory())
+    let session_stranger = TruesealSession::connect(
+        pipe_stranger_client,
+        relay_pub,
+        device_stranger,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("stranger");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        move |msg, _, _seq| {
+            rx.lock().unwrap().push(msg);
+        },
+        nk.factory(),
+    )
     .expect("session A");
     session_a.set_manifest(make_one_member_manifest(a_noise, a_signing, &a_sk));
 
@@ -77,11 +88,23 @@ fn message_from_member_is_delivered() {
     let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx = received.clone();
     // Relay accepts src (b) first — connect b before a.
-    let session_b =
-        TruesealSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
-    let session_a = TruesealSession::connect(pipe_a_client, relay_pub, device_a, move |msg, _, _seq| {
-        rx.lock().unwrap().push(msg);
-    }, nk.factory())
+    let session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session B");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        move |msg, _, _seq| {
+            rx.lock().unwrap().push(msg);
+        },
+        nk.factory(),
+    )
     .expect("session A");
     session_a.set_manifest(make_two_member_manifest(
         a_noise, a_signing, &a_sk, b_noise, b_signing,
@@ -96,7 +119,10 @@ fn message_from_member_is_delivered() {
         )
         .expect("push");
 
-    wait_for(|| !received.lock().unwrap().is_empty(), Duration::from_secs(5));
+    wait_for(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+    );
     let got = received.lock().unwrap();
     assert_eq!(got.len(), 1, "member message must be delivered");
     assert_eq!(
@@ -147,16 +173,39 @@ fn inbound_group_manifest_replaces_current() {
         ],
         &b_sk,
     );
-    let session_b =
-        TruesealSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session B");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
     session_a.set_manifest(v1);
     session_b
         .push_message(&Message::GroupManifest { manifest: v2 }, a_noise)
         .expect("push manifest");
 
-    wait_for(|| session_a.manifest.lock().unwrap().as_ref().map(|m| m.version) == Some(2), Duration::from_secs(5));
+    wait_for(
+        || {
+            session_a
+                .manifest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.version)
+                == Some(2)
+        },
+        Duration::from_secs(5),
+    );
 
     let stored = session_a.manifest.lock().unwrap();
     assert_eq!(
@@ -215,10 +264,22 @@ fn inbound_stale_manifest_is_ignored() {
         }],
         &b_sk,
     );
-    let session_b =
-        TruesealSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session B");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
     session_a.set_manifest(v3);
     session_b
         .push_message(&Message::GroupManifest { manifest: v1 }, a_noise)
@@ -271,8 +332,14 @@ fn on_removed_from_group_fires_when_excluded_from_manifest() {
         }],
         &b_sk,
     );
-    let session_b =
-        TruesealSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
+    let session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session B");
     let session_a = TruesealSession::connect_full(
         pipe_a_client,
         relay_pub,
@@ -297,7 +364,10 @@ fn on_removed_from_group_fires_when_excluded_from_manifest() {
         )
         .expect("push excluding manifest");
 
-    wait_for(|| *removed_fired.lock().unwrap() >= 1, Duration::from_secs(5));
+    wait_for(
+        || *removed_fired.lock().unwrap() >= 1,
+        Duration::from_secs(5),
+    );
 
     assert_eq!(
         *removed_fired.lock().unwrap(),
@@ -340,8 +410,14 @@ fn tampered_group_manifest_is_rejected() {
     let rf = removed_fired.clone();
     use crate::operation_log::MemLog;
     // B connects first — relay accepts pipe_b_relay first.
-    let session_b =
-        TruesealSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("session B");
+    let session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session B");
     let session_a = TruesealSession::connect_full(
         pipe_a_client,
         relay_pub,
@@ -364,8 +440,16 @@ fn tampered_group_manifest_is_rejected() {
         group_id,
         1,
         vec![
-            ManifestMember { noise_pub: a_noise, signing_pub: a_signing, name: "A".into() },
-            ManifestMember { noise_pub: b_noise, signing_pub: b_signing, name: "B".into() },
+            ManifestMember {
+                noise_pub: a_noise,
+                signing_pub: a_signing,
+                name: "A".into(),
+            },
+            ManifestMember {
+                noise_pub: b_noise,
+                signing_pub: b_signing,
+                name: "B".into(),
+            },
         ],
         &a_sk,
     );
@@ -379,8 +463,16 @@ fn tampered_group_manifest_is_rejected() {
         group_id,
         2,
         vec![
-            ManifestMember { noise_pub: a_noise, signing_pub: a_signing, name: "A".into() },
-            ManifestMember { noise_pub: b_noise, signing_pub: b_signing, name: "B".into() },
+            ManifestMember {
+                noise_pub: a_noise,
+                signing_pub: a_signing,
+                name: "A".into(),
+            },
+            ManifestMember {
+                noise_pub: b_noise,
+                signing_pub: b_signing,
+                name: "B".into(),
+            },
         ],
         &b_sk,
     );
@@ -388,10 +480,7 @@ fn tampered_group_manifest_is_rejected() {
     tampered.signature = [0u8; 64];
 
     session_b
-        .push_message(
-            &Message::GroupManifest { manifest: tampered },
-            a_noise,
-        )
+        .push_message(&Message::GroupManifest { manifest: tampered }, a_noise)
         .expect("push tampered manifest");
 
     std::thread::sleep(Duration::from_millis(200));
@@ -420,10 +509,10 @@ fn tampered_group_manifest_is_rejected() {
 /// No panic or deadlock.
 #[test]
 fn concurrent_manifest_conflict_last_version_wins() {
+    use crate::operation_log::MemLog;
+    use ed25519_dalek::SigningKey;
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::Duration;
-    use ed25519_dalek::SigningKey;
-    use crate::operation_log::MemLog;
 
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
@@ -449,9 +538,21 @@ fn concurrent_manifest_conflict_last_version_wins() {
 
     let group_id = new_group_id();
     let v1_members = vec![
-        ManifestMember { noise_pub: a_noise, signing_pub: a_signing, name: "A".into() },
-        ManifestMember { noise_pub: b_noise, signing_pub: b_signing, name: "B".into() },
-        ManifestMember { noise_pub: c_noise, signing_pub: c_signing, name: "C".into() },
+        ManifestMember {
+            noise_pub: a_noise,
+            signing_pub: a_signing,
+            name: "A".into(),
+        },
+        ManifestMember {
+            noise_pub: b_noise,
+            signing_pub: b_signing,
+            name: "B".into(),
+        },
+        ManifestMember {
+            noise_pub: c_noise,
+            signing_pub: c_signing,
+            name: "C".into(),
+        },
     ];
     let v1_a = GroupManifest::new(group_id, 1, v1_members.clone(), &a_sk);
     let v1_b = GroupManifest::new(group_id, 1, v1_members.clone(), &b_sk);
@@ -461,12 +562,26 @@ fn concurrent_manifest_conflict_last_version_wins() {
     let c_manifest_changed: Arc<(Mutex<u32>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
     let cmc = c_manifest_changed.clone();
 
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("A");
-    let session_b =
-        TruesealSession::connect(pipe_b_client, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("B");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("A");
+    let session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("B");
     let session_c = TruesealSession::connect_full(
-        pipe_c_client, relay_pub, device_c,
+        pipe_c_client,
+        relay_pub,
+        device_c,
         |_, _, _| {},
         Box::new(MemLog::new()),
         || {},
@@ -477,7 +592,8 @@ fn concurrent_manifest_conflict_last_version_wins() {
         },
         || {},
         nk.factory(),
-    ).expect("C");
+    )
+    .expect("C");
 
     session_a.set_manifest(v1_a);
     session_b.set_manifest(v1_b);
@@ -489,24 +605,68 @@ fn concurrent_manifest_conflict_last_version_wins() {
     let device_d = DeviceKeypair::generate();
     let d_noise = device_d.public_key();
     let d_signing = device_d.signing_public_key();
-    let v2_a = GroupManifest::new(group_id, 2, vec![
-        ManifestMember { noise_pub: a_noise, signing_pub: a_signing, name: "A".into() },
-        ManifestMember { noise_pub: b_noise, signing_pub: b_signing, name: "B".into() },
-        ManifestMember { noise_pub: c_noise, signing_pub: c_signing, name: "C".into() },
-        ManifestMember { noise_pub: d_noise, signing_pub: d_signing, name: "D".into() },
-    ], &a_sk);
-    let v2_b = GroupManifest::new(group_id, 2, vec![
-        ManifestMember { noise_pub: a_noise, signing_pub: a_signing, name: "A".into() },
-        ManifestMember { noise_pub: b_noise, signing_pub: b_signing, name: "B".into() },
-        ManifestMember { noise_pub: c_noise, signing_pub: c_signing, name: "C".into() },
-    ], &b_sk);
+    let v2_a = GroupManifest::new(
+        group_id,
+        2,
+        vec![
+            ManifestMember {
+                noise_pub: a_noise,
+                signing_pub: a_signing,
+                name: "A".into(),
+            },
+            ManifestMember {
+                noise_pub: b_noise,
+                signing_pub: b_signing,
+                name: "B".into(),
+            },
+            ManifestMember {
+                noise_pub: c_noise,
+                signing_pub: c_signing,
+                name: "C".into(),
+            },
+            ManifestMember {
+                noise_pub: d_noise,
+                signing_pub: d_signing,
+                name: "D".into(),
+            },
+        ],
+        &a_sk,
+    );
+    let v2_b = GroupManifest::new(
+        group_id,
+        2,
+        vec![
+            ManifestMember {
+                noise_pub: a_noise,
+                signing_pub: a_signing,
+                name: "A".into(),
+            },
+            ManifestMember {
+                noise_pub: b_noise,
+                signing_pub: b_signing,
+                name: "B".into(),
+            },
+            ManifestMember {
+                noise_pub: c_noise,
+                signing_pub: c_signing,
+                name: "C".into(),
+            },
+        ],
+        &b_sk,
+    );
 
     // Push both v2 manifests to C simultaneously.
     session_a
-        .push_message(&crate::message::Message::GroupManifest { manifest: v2_a }, c_noise)
+        .push_message(
+            &crate::message::Message::GroupManifest { manifest: v2_a },
+            c_noise,
+        )
         .expect("A push v2");
     session_b
-        .push_message(&crate::message::Message::GroupManifest { manifest: v2_b }, c_noise)
+        .push_message(
+            &crate::message::Message::GroupManifest { manifest: v2_b },
+            c_noise,
+        )
         .expect("B push v2");
 
     // Wait for C to process at least one manifest update.
@@ -514,7 +674,10 @@ fn concurrent_manifest_conflict_last_version_wins() {
     let result = cvar
         .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |n| *n == 0)
         .unwrap();
-    assert!(!result.1.timed_out(), "C must receive at least one v2 manifest");
+    assert!(
+        !result.1.timed_out(),
+        "C must receive at least one v2 manifest"
+    );
     let fires = *result.0;
     drop(result);
 
@@ -528,5 +691,8 @@ fn concurrent_manifest_conflict_last_version_wins() {
     assert_eq!(m.version, 2, "C's manifest is version 2");
     assert_eq!(m.group_id, group_id, "same group_id");
     // on_manifest_changed fired exactly once (second v2 is same version — rejected as not higher).
-    assert_eq!(final_fires, 1, "on_manifest_changed fires exactly once (same-version duplicate rejected)");
+    assert_eq!(
+        final_fires, 1,
+        "on_manifest_changed fires exactly once (same-version duplicate rejected)"
+    );
 }

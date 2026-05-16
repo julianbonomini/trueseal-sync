@@ -25,16 +25,21 @@ fn push_sync_no_manifest_returns_not_in_group() {
             let _ = accept(pipe_relay, relay_kp2);
             while let Ok(p) = nk_rx.recv() {
                 let kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
-                std::thread::spawn(move || { if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
-                if sess.receive().is_ok() {
-                    let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
-                }
-            } });
+                std::thread::spawn(move || {
+                    if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
+                        if sess.receive().is_ok() {
+                            let _ =
+                                sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                        }
+                    }
+                });
             }
         });
     }
     let device = DeviceKeypair::generate();
-    let session = TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory()).expect("connect");
+    let session =
+        TruesealSession::connect(pipe_client, relay_pub, device, |_, _, _| {}, nk.factory())
+            .expect("connect");
     let result = session.push_sync(b"hello".to_vec());
     assert!(
         matches!(result, Err(SessionError::NotInGroup)),
@@ -73,30 +78,60 @@ fn push_sync_fans_out_to_all_members() {
     use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
     let group_id = new_group_id();
     let members = vec![
-        ManifestMember { noise_pub: a_noise, signing_pub: a_signing, name: "A".into() },
-        ManifestMember { noise_pub: b_noise, signing_pub: b_signing, name: "B".into() },
-        ManifestMember { noise_pub: c_noise, signing_pub: c_signing, name: "C".into() },
+        ManifestMember {
+            noise_pub: a_noise,
+            signing_pub: a_signing,
+            name: "A".into(),
+        },
+        ManifestMember {
+            noise_pub: b_noise,
+            signing_pub: b_signing,
+            name: "B".into(),
+        },
+        ManifestMember {
+            noise_pub: c_noise,
+            signing_pub: c_signing,
+            name: "C".into(),
+        },
     ];
     let manifest_a = GroupManifest::new(group_id, 1, members.clone(), &a_sk);
     let manifest_b = GroupManifest::new(group_id, 1, members.clone(), &b_sk);
     let manifest_c = GroupManifest::new(group_id, 1, members.clone(), &c_sk);
 
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("session A");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("session A");
 
     let received_b: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx_b = received_b.clone();
-    let session_b = TruesealSession::connect(pipe_b_client, relay_pub, device_b, move |msg, _, _seq| {
-        rx_b.lock().unwrap().push(msg);
-    }, nk.factory())
+    let session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        move |msg, _, _seq| {
+            rx_b.lock().unwrap().push(msg);
+        },
+        nk.factory(),
+    )
     .expect("session B");
     session_b.set_manifest(manifest_b);
 
     let received_c: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx_c = received_c.clone();
-    let session_c = TruesealSession::connect(pipe_c_client, relay_pub, device_c, move |msg, _, _seq| {
-        rx_c.lock().unwrap().push(msg);
-    }, nk.factory())
+    let session_c = TruesealSession::connect(
+        pipe_c_client,
+        relay_pub,
+        device_c,
+        move |msg, _, _seq| {
+            rx_c.lock().unwrap().push(msg);
+        },
+        nk.factory(),
+    )
     .expect("session C");
     session_c.set_manifest(manifest_c);
 
@@ -107,16 +142,32 @@ fn push_sync_fans_out_to_all_members() {
         .push_sync(b"broadcast".to_vec())
         .expect("push_sync");
 
-    wait_for(|| received_b.lock().unwrap().len() >= 1, Duration::from_secs(5));
-    wait_for(|| received_c.lock().unwrap().len() >= 1, Duration::from_secs(5));
+    wait_for(
+        || received_b.lock().unwrap().len() >= 1,
+        Duration::from_secs(5),
+    );
+    wait_for(
+        || received_c.lock().unwrap().len() >= 1,
+        Duration::from_secs(5),
+    );
 
     let got_b = received_b.lock().unwrap();
     assert_eq!(got_b.len(), 1, "B should receive 1 message");
-    assert_eq!(got_b[0], Message::Sync { body: b"broadcast".to_vec() });
+    assert_eq!(
+        got_b[0],
+        Message::Sync {
+            body: b"broadcast".to_vec()
+        }
+    );
 
     let got_c = received_c.lock().unwrap();
     assert_eq!(got_c.len(), 1, "C should receive 1 message");
-    assert_eq!(got_c[0], Message::Sync { body: b"broadcast".to_vec() });
+    assert_eq!(
+        got_c[0],
+        Message::Sync {
+            body: b"broadcast".to_vec()
+        }
+    );
 }
 
 /// One sequence number is consumed per push_sync call regardless of member count.
@@ -212,7 +263,14 @@ fn push_sync_fans_out_to_n_recipients() {
     let (pipe_c_client, pipe_c_relay) = mem_pipe_pair();
     let (pipe_d_client, pipe_d_relay) = mem_pipe_pair();
     let (nk_rx, nk) = nk_push_channel();
-    spawn_quadpartite_relay(&relay_kp, pipe_a_relay, pipe_b_relay, pipe_c_relay, pipe_d_relay, nk_rx);
+    spawn_quadpartite_relay(
+        &relay_kp,
+        pipe_a_relay,
+        pipe_b_relay,
+        pipe_c_relay,
+        pipe_d_relay,
+        nk_rx,
+    );
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
@@ -235,10 +293,26 @@ fn push_sync_fans_out_to_n_recipients() {
     use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
     let group_id = new_group_id();
     let members = vec![
-        ManifestMember { noise_pub: a_noise, signing_pub: a_signing, name: "A".into() },
-        ManifestMember { noise_pub: b_noise, signing_pub: b_signing, name: "B".into() },
-        ManifestMember { noise_pub: c_noise, signing_pub: c_signing, name: "C".into() },
-        ManifestMember { noise_pub: d_noise, signing_pub: d_signing, name: "D".into() },
+        ManifestMember {
+            noise_pub: a_noise,
+            signing_pub: a_signing,
+            name: "A".into(),
+        },
+        ManifestMember {
+            noise_pub: b_noise,
+            signing_pub: b_signing,
+            name: "B".into(),
+        },
+        ManifestMember {
+            noise_pub: c_noise,
+            signing_pub: c_signing,
+            name: "C".into(),
+        },
+        ManifestMember {
+            noise_pub: d_noise,
+            signing_pub: d_signing,
+            name: "D".into(),
+        },
     ];
     let manifest_a = GroupManifest::new(group_id, 1, members.clone(), &a_sk);
     let manifest_b = GroupManifest::new(group_id, 1, members.clone(), &b_sk);
@@ -247,7 +321,9 @@ fn push_sync_fans_out_to_n_recipients() {
 
     // Helper: condvar-based collector for received messages.
     type Received = Arc<(Mutex<Vec<Message>>, Condvar)>;
-    fn make_received() -> Received { Arc::new((Mutex::new(Vec::new()), Condvar::new())) }
+    fn make_received() -> Received {
+        Arc::new((Mutex::new(Vec::new()), Condvar::new()))
+    }
     fn make_cb(r: Received) -> impl Fn(Message, [u8; 32], u64) + Send + 'static {
         move |msg, _, _seq| {
             let (lock, cvar) = &*r;
@@ -260,30 +336,68 @@ fn push_sync_fans_out_to_n_recipients() {
     let received_c = make_received();
     let received_d = make_received();
 
-    let session_a =
-        TruesealSession::connect(pipe_a_client, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("A");
-    let session_b = TruesealSession::connect(pipe_b_client, relay_pub, device_b, make_cb(received_b.clone()), nk.factory()).expect("B");
-    let session_c = TruesealSession::connect(pipe_c_client, relay_pub, device_c, make_cb(received_c.clone()), nk.factory()).expect("C");
-    let session_d = TruesealSession::connect(pipe_d_client, relay_pub, device_d, make_cb(received_d.clone()), nk.factory()).expect("D");
+    let session_a = TruesealSession::connect(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("A");
+    let session_b = TruesealSession::connect(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        make_cb(received_b.clone()),
+        nk.factory(),
+    )
+    .expect("B");
+    let session_c = TruesealSession::connect(
+        pipe_c_client,
+        relay_pub,
+        device_c,
+        make_cb(received_c.clone()),
+        nk.factory(),
+    )
+    .expect("C");
+    let session_d = TruesealSession::connect(
+        pipe_d_client,
+        relay_pub,
+        device_d,
+        make_cb(received_d.clone()),
+        nk.factory(),
+    )
+    .expect("D");
 
     session_a.set_manifest(manifest_a);
     session_b.set_manifest(manifest_b);
     session_c.set_manifest(manifest_c);
     session_d.set_manifest(manifest_d);
 
-    session_a.push_sync(b"broadcast4".to_vec()).expect("push_sync");
+    session_a
+        .push_sync(b"broadcast4".to_vec())
+        .expect("push_sync");
 
     // Wait for all three recipients.
     for (label, r) in [("B", &received_b), ("C", &received_c), ("D", &received_d)] {
         let (lock, cvar) = r.as_ref();
         let result = cvar
-            .wait_timeout_while(lock.lock().unwrap(), std::time::Duration::from_secs(5), |v| v.is_empty())
+            .wait_timeout_while(
+                lock.lock().unwrap(),
+                std::time::Duration::from_secs(5),
+                |v| v.is_empty(),
+            )
             .unwrap();
-        assert!(!result.1.timed_out(), "{label} must receive the blob within 5s");
+        assert!(
+            !result.1.timed_out(),
+            "{label} must receive the blob within 5s"
+        );
         assert_eq!(result.0.len(), 1, "{label} must receive exactly 1 message");
         assert_eq!(
             result.0[0],
-            Message::Sync { body: b"broadcast4".to_vec() },
+            Message::Sync {
+                body: b"broadcast4".to_vec()
+            },
             "{label} blob must match"
         );
     }
