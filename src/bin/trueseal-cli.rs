@@ -18,10 +18,48 @@
 //!   destroy            destroy the group (cryptographic revocation)
 //!   quit               exit
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+
+/// SlowStream: wraps a Read+Write to force partial reads.
+/// Caps each read to N bytes and sleeps before each call so segments
+/// arrive separately. Reproduces real-network framing on loopback.
+/// Activated by env var `TRUESEAL_SLOW_READ=<bytes_per_read>`.
+struct SlowStream<T: Read + Write + Send> {
+    inner: T,
+    cap: usize,
+    delay_us: u64,
+    counter: std::cell::Cell<u32>,
+}
+
+impl<T: Read + Write + Send> Read for SlowStream<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        // Every other call, return WouldBlock to force RetryConn path.
+        let c = self.counter.get();
+        self.counter.set(c.wrapping_add(1));
+        if c % 2 == 0 && self.cap != usize::MAX {
+            std::thread::sleep(std::time::Duration::from_micros(self.delay_us));
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "slow_stream forced"));
+        }
+        std::thread::sleep(std::time::Duration::from_micros(self.delay_us));
+        let n = buf.len().min(self.cap);
+        self.inner.read(&mut buf[..n])
+    }
+}
+impl<T: Read + Write + Send> Write for SlowStream<T> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        std::thread::sleep(std::time::Duration::from_micros(self.delay_us));
+        let n = buf.len().min(self.cap);
+        self.inner.write(&buf[..n])
+    }
+    fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
+}
+
+fn slow_cap() -> Option<usize> {
+    std::env::var("TRUESEAL_SLOW_READ").ok().and_then(|v| v.parse().ok())
+}
 
 use trueseal_sync::{
     device::DeviceKeypair,
@@ -93,7 +131,7 @@ fn main() {
     let recv_addr = receive_addr.clone();
     let push_addr_cb = push_addr.clone();
 
-    let session = TruesealSession::<TcpStream>::connect_background(
+    let session = TruesealSession::<SlowStream<TcpStream>>::connect_background(
         relay_pub,
         keypair,
         // on_message — fires for every decrypted Sync blob delivered by the relay.
@@ -140,7 +178,9 @@ fn main() {
             })?;
             eprintln!("[debug] receive: tcp connected, starting XX handshake");
             s.set_nonblocking(true).map_err(|e| e.to_string())?;
-            Ok(s)
+            let cap = slow_cap().unwrap_or(usize::MAX);
+            if cap != usize::MAX { eprintln!("[debug] receive: SLOW_READ cap={}", cap); }
+            Ok(SlowStream { inner: s, cap, delay_us: if cap == usize::MAX { 0 } else { 5000 }, counter: std::cell::Cell::new(0) })
         },
         // push_factory — opens NK push sessions.
         // NK sessions are sequential (send then receive), so blocking mode
@@ -153,7 +193,8 @@ fn main() {
             })?;
             eprintln!("[debug] push: tcp connected");
             s.set_nonblocking(true).map_err(|e| e.to_string())?;
-            Ok(s)
+            let cap = slow_cap().unwrap_or(usize::MAX);
+            Ok(SlowStream { inner: s, cap, delay_us: if cap == usize::MAX { 0 } else { 5000 }, counter: std::cell::Cell::new(0) })
         },
         None, // reconnect_cap: use default (30s)
         // on_connection_changed
