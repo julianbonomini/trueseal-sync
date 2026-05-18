@@ -189,10 +189,28 @@ jobs:
           git config --global url."https://x-access-token:${{ secrets.TRUESEAL_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
       - name: Cross-compile for Android targets
+        env:
+          # 16KB-page-size alignment — required by Android 15+ devices and
+          # Play Store uploads from Nov 2025. Without this, dlopen fails:
+          # "program alignment (8192) cannot be smaller than system page size (16384)".
+          # Scoped per-target so the later host `cargo build` (for uniffi-bindgen)
+          # is not affected.
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384"
+          CARGO_TARGET_X86_64_LINUX_ANDROID_RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384"
         run: |
           for TARGET in aarch64-linux-android x86_64-linux-android; do
             echo "▶ cargo ndk --target $TARGET -- build --release"
             cargo ndk --target "$TARGET" -- build --release
+          done
+
+      - name: Verify 16KB page alignment
+        run: |
+          NDK_LLVM_READELF=$(find "$ANDROID_NDK_LATEST_HOME"/toolchains/llvm/prebuilt/*/bin/llvm-readelf | head -1)
+          for ABI_TRIPLE in aarch64-linux-android x86_64-linux-android; do
+            SO="$CARGO_TARGET_DIR/$ABI_TRIPLE/release/lib${CRATE_NAME}.so"
+            ALIGN=$("$NDK_LLVM_READELF" -lW "$SO" | awk '/LOAD/ {print $NF; exit}')
+            echo "$ABI_TRIPLE LOAD align = $ALIGN"
+            [ "$ALIGN" = "0x4000" ] || { echo "FAIL: expected 0x4000 (16384), got $ALIGN"; exit 1; }
           done
 
       - name: Build host library for UniFFI bindgen
