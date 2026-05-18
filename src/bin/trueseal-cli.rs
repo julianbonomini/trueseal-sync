@@ -41,7 +41,10 @@ impl<T: Read + Write + Send> Read for SlowStream<T> {
         self.counter.set(c.wrapping_add(1));
         if c % 2 == 0 && self.cap != usize::MAX {
             std::thread::sleep(std::time::Duration::from_micros(self.delay_us));
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "slow_stream forced"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "slow_stream forced",
+            ));
         }
         std::thread::sleep(std::time::Duration::from_micros(self.delay_us));
         let n = buf.len().min(self.cap);
@@ -54,11 +57,15 @@ impl<T: Read + Write + Send> Write for SlowStream<T> {
         let n = buf.len().min(self.cap);
         self.inner.write(&buf[..n])
     }
-    fn flush(&mut self) -> io::Result<()> { self.inner.flush() }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn slow_cap() -> Option<usize> {
-    std::env::var("TRUESEAL_SLOW_READ").ok().and_then(|v| v.parse().ok())
+    std::env::var("TRUESEAL_SLOW_READ")
+        .ok()
+        .and_then(|v| v.parse().ok())
 }
 
 use trueseal_sync::{
@@ -179,8 +186,15 @@ fn main() {
             eprintln!("[debug] receive: tcp connected, starting XX handshake");
             s.set_nonblocking(true).map_err(|e| e.to_string())?;
             let cap = slow_cap().unwrap_or(usize::MAX);
-            if cap != usize::MAX { eprintln!("[debug] receive: SLOW_READ cap={}", cap); }
-            Ok(SlowStream { inner: s, cap, delay_us: if cap == usize::MAX { 0 } else { 5000 }, counter: std::cell::Cell::new(0) })
+            if cap != usize::MAX {
+                eprintln!("[debug] receive: SLOW_READ cap={}", cap);
+            }
+            Ok(SlowStream {
+                inner: s,
+                cap,
+                delay_us: if cap == usize::MAX { 0 } else { 5000 },
+                counter: std::cell::Cell::new(0),
+            })
         },
         // push_factory — opens NK push sessions.
         // NK sessions are sequential (send then receive), so blocking mode
@@ -194,7 +208,12 @@ fn main() {
             eprintln!("[debug] push: tcp connected");
             s.set_nonblocking(true).map_err(|e| e.to_string())?;
             let cap = slow_cap().unwrap_or(usize::MAX);
-            Ok(SlowStream { inner: s, cap, delay_us: if cap == usize::MAX { 0 } else { 5000 }, counter: std::cell::Cell::new(0) })
+            Ok(SlowStream {
+                inner: s,
+                cap,
+                delay_us: if cap == usize::MAX { 0 } else { 5000 },
+                counter: std::cell::Cell::new(0),
+            })
         },
         None, // reconnect_cap: use default (30s)
         // on_connection_changed
