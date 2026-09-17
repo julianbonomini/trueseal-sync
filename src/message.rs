@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::manifest::{GroupManifest, ManifestError};
@@ -99,6 +100,19 @@ impl Message {
             other => Err(MessageError::UnknownType(other)),
         }
     }
+}
+
+/// Stable, relay-independent identifier for an application message.
+///
+/// The author signing key and per-author sequence uniquely identify an Envelope.
+/// Callers persist this opaque value with application state to make handling
+/// at-least-once delivery idempotent. The `tsm1_` prefix versions the derivation.
+pub fn message_id(author_signing_pub: &[u8; 32], sequence: u64) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"trueseal-message-id-v1\0");
+    hash.update(author_signing_pub);
+    hash.update(sequence.to_be_bytes());
+    format!("tsm1_{}", base64url_encode(&hash.finalize()))
 }
 
 /// Produce pairing payload bytes for a QR code.
@@ -367,5 +381,19 @@ mod tests {
         // name is deterministic from signing_pub
         assert!(!name.is_empty());
         assert_eq!(name, device_name(&signing_pub));
+    }
+
+    #[test]
+    fn message_id_is_stable_and_opaque() {
+        let id = message_id(&[0x42; 32], 7);
+        assert_eq!(id, "tsm1_P2JlgL-zK1M_f19R3JDQz3Ny459blO_UjFJ_APmTTrY");
+        assert_eq!(id, message_id(&[0x42; 32], 7));
+    }
+
+    #[test]
+    fn message_id_changes_with_author_or_sequence() {
+        let id = message_id(&[0x42; 32], 7);
+        assert_ne!(id, message_id(&[0x43; 32], 7));
+        assert_ne!(id, message_id(&[0x42; 32], 8));
     }
 }

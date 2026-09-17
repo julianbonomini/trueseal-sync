@@ -32,7 +32,7 @@ A blob that fails decryption or verification is discarded silently. Re-delivery 
 
 `blob_id` is read from the Deliver frame, stored on the stack, echoed in DeliverAck, then discarded. It never surfaces to the caller. It is a relay implementation detail — a different relay could assign IDs differently or not at all. Callers must not depend on it.
 
-### Sequence in callback: `(author_pub, sequence)` as the canonical dedup key
+### Message identity: `(author_pub, sequence)` as the canonical dedup key
 
 At-least-once delivery means callers may receive the same Envelope twice (relay re-delivers if it reconnects before receiving DeliverAck). Callers who need exactly-once semantics must deduplicate.
 
@@ -47,7 +47,15 @@ to:
 Fn(Message, [u8; 32], u64)      // message, author_pub, sequence
 ```
 
-`sequence` is threaded all the way through to `TruesealSession::on_message` so Swift and Kotlin callers have access to it. trueseal-sync does not deduplicate — that is the caller's responsibility. The pair `(author_pub, sequence)` is documented as the canonical dedup key.
+`sequence` is threaded through `TruesealSession::on_message` for direct Rust callers. The FFI derives a versioned opaque `message_id` from `(author_pub, sequence)` and passes that ID through every public SDK. This prevents SDKs from depending on relay IDs or reconstructing identity differently. trueseal-sync does not persist received IDs or suppress callbacks — durable deduplication remains the caller's responsibility.
+
+The v1 SDK Message ID is `tsm1_` followed by unpadded base64url of:
+
+```
+SHA-256("trueseal-message-id-v1\\0" || author_pub[32] || sequence_u64_be)
+```
+
+Callers compare it as an opaque string and must not parse or reproduce it.
 
 ### DeliverAck send path
 
@@ -57,7 +65,8 @@ DeliverAck is sent from the `run_loop` dispatch thread via `session.send()` dire
 
 - Relay can delete blobs promptly after a well-behaved client acknowledges them.
 - A crash between receiving the Deliver frame and sending DeliverAck causes re-delivery on reconnect. Callers must be idempotent.
-- `(author_pub, sequence)` is the canonical dedup key — documented in CONTEXT.md and in the `subscribe` API.
+- `(author_pub, sequence)` is the domain dedup key; SDKs expose its opaque Message ID.
+- Exactly-once application processing is not promised. Callers get at-least-once events and make application writes idempotent.
 - `RelayClient::subscribe` and `TruesealSession::on_message` signatures change — breaking. Acceptable: nothing is in production.
 - `blob_id` never leaks past `run_loop`. Relay implementation details stay invisible to callers.
 - A compromised relay learns nothing from DeliverAck timing — ACK carries no decryption signal.

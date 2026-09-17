@@ -69,9 +69,10 @@ pub struct Member {
 
 /// Fired when a `Sync` message is delivered to this device.
 /// `blob` is the raw application payload; `sender_noise_pub` is the sender's 32-byte X25519 key.
+/// `message_id` is stable across re-delivery and opaque to callers.
 #[uniffi::export(callback_interface)]
 pub trait MessageCallback: Send + Sync {
-    fn on_message(&self, blob: Vec<u8>, sender_noise_pub: Vec<u8>);
+    fn on_message(&self, blob: Vec<u8>, sender_noise_pub: Vec<u8>, message_id: String);
 }
 
 /// Fired when this device is excluded from an incoming `GroupManifest` update.
@@ -216,7 +217,7 @@ impl TruesealFfiSession {
         let inner = TruesealSession::connect_background(
             relay_pub_key,
             keypair,
-            move |msg, author_signing_pub, _sequence| {
+            move |msg, author_signing_pub, sequence| {
                 if let Message::Sync { body } = msg {
                     let sender_noise_pub = manifest_slot_cb
                         .lock()
@@ -232,7 +233,8 @@ impl TruesealFfiSession {
                                 .map(|k| k.0.to_vec())
                         })
                         .unwrap_or_default();
-                    on_message.on_message(body, sender_noise_pub);
+                    let message_id = crate::message::message_id(&author_signing_pub, sequence);
+                    on_message.on_message(body, sender_noise_pub, message_id);
                 }
             },
             Box::new(PersistentLog::new(log_store)),
@@ -471,7 +473,7 @@ mod tests {
     fn invalid_namespace_returns_error() {
         struct NoopMsg;
         impl MessageCallback for NoopMsg {
-            fn on_message(&self, _blob: Vec<u8>, _snp: Vec<u8>) {}
+            fn on_message(&self, _blob: Vec<u8>, _snp: Vec<u8>, _message_id: String) {}
         }
         struct NoopRfg;
         impl RemovedFromGroupCallback for NoopRfg {

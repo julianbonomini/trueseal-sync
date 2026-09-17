@@ -39,7 +39,7 @@ impl<T: Read + Write + Send> Read for SlowStream<T> {
         // Every other call, return WouldBlock to force RetryConn path.
         let c = self.counter.get();
         self.counter.set(c.wrapping_add(1));
-        if c % 2 == 0 && self.cap != usize::MAX {
+        if c.is_multiple_of(2) && self.cap != usize::MAX {
             std::thread::sleep(std::time::Duration::from_micros(self.delay_us));
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,

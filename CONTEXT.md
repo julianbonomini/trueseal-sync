@@ -85,8 +85,12 @@ The durable local state owned and managed entirely by the library for a given na
 _Avoid_: local storage, persisted state, database (those are implementation details)
 
 **Sequence**:
-A monotonically increasing integer counter owned by a Device. Increments once per Envelope sent, across all Objects. Used by recipients to detect gaps — a jump from sequence 5 to sequence 7 from the same Device means one Envelope was missed, regardless of which Object it belonged to. Not scoped per Object. Exposed to callers in `on_message` alongside `author_pub` — the pair `(author_pub, sequence)` is the canonical dedup key for callers who need exactly-once semantics.
+A monotonically increasing integer counter owned by a Device. Increments once per Envelope sent, across all Objects. Used by recipients to detect gaps — a jump from sequence 5 to sequence 7 from the same Device means one Envelope was missed, regardless of which Object it belonged to. Not scoped per Object. Direct Rust callers receive it with `author_pub`; public SDKs receive an opaque Message ID derived from that pair.
 _Avoid_: message number, event ID, offset, version (those imply per-object scoping)
+
+**Message ID**:
+A stable opaque identifier for one application `Sync` message. Derived inside trueseal-sync from the author's signing public key and Envelope sequence, with a versioned domain-separated hash. The same Envelope always yields the same ID across relay re-delivery; distinct authors or sequences yield different IDs. SDK callers persist the ID atomically with application state and ignore an ID already processed. The Relay never sees or creates it, and callers must never parse it.
+_Avoid_: relay blob ID, payload hash, database ID, exactly-once token
 
 **Envelope**:
 The metadata wrapper around a Blob that the Relay can read without decrypting content. Contains: a per-device global sequence number, parent hashes (for DAG causality), recipient public key, signature, and an opaque encrypted payload. The author's signing public key (`author_pub`) is prepended to the message bytes inside the encrypted payload — invisible to the Relay. The object ID also lives inside the encrypted payload — the Relay never sees it. The sequence counter belongs to the sending Device, not to any Object — it increments once per Envelope sent, across all Objects.
@@ -97,7 +101,7 @@ A cryptographic hash of a preceding Envelope in the same Object's Operation Log.
 _Avoid_: previous, predecessor, pointer
 
 **Receive Session**:
-A long-lived, authenticated, forward-secret connection between a Device and the Relay, established via a Noise XX handshake using the Device's stable noise keypair. The relay maintains a `noise_pub → active connection` map and delivers inbound Blobs over this channel (push-on-arrival). Each Device holds exactly one Receive Session at a time. Distinct from blob encryption — a Session is a live channel, not a stored payload. On each Deliver frame, trueseal-sync sends a DeliverAck back to the relay immediately on receipt — before decryption — so the relay can delete the stored Blob. If no DeliverAck is sent before disconnect, the relay re-delivers on reconnect (at-least-once guarantee).
+A long-lived, authenticated, forward-secret connection between a Device and the Relay, established via a Noise XX handshake using the Device's stable noise keypair. The relay maintains a `noise_pub → active connection` map and delivers inbound Blobs over this channel (push-on-arrival). Each Device holds exactly one Receive Session at a time. Distinct from blob encryption — a Session is a live channel, not a stored payload. On each Deliver frame, trueseal-sync sends a DeliverAck back to the relay immediately on receipt — before decryption — so the relay can delete the stored Blob. If no DeliverAck is sent before disconnect, the relay re-delivers on reconnect. This is at-least-once transport to the client process, not exactly-once application processing.
 _Avoid_: connection, socket, channel, stream
 
 **Push Session**:

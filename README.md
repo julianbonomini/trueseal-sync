@@ -27,10 +27,10 @@ The SDKs wrap the compiled native library via UniFFI — no Rust toolchain requi
 - **Pairing** — one device generates a token (QR or text); the other calls `joinGroup(token)`. Library manages the Noise handshake underneath.
 - **Group membership** — signed, versioned `GroupManifest`. Any current member can add or remove devices.
 - **Encrypted fan-out** — one envelope per recipient. ECDH + ChaCha20-Poly1305. The relay sees `recipient_pub` + ciphertext; sender identity is inside the ciphertext.
-- **Guaranteed delivery** — outbox survives crashes and relay disconnects. Blobs queued offline replay on reconnect. `send()` never silently drops.
+- **At-least-once transport** — the sender outbox survives crashes and relay disconnects. Recipients get an opaque message ID for durable deduplication.
 - **Auto-generated device names** — deterministic two-word name (`AmberFalcon`, `SwiftHorizon`) derived from the device's public key. No configuration needed.
 
-**You're responsible for:** what the bytes mean, conflict resolution, and bootstrapping new members with historical state.
+**You're responsible for:** what the bytes mean, conflict resolution, persisting received message IDs with application state, and bootstrapping new members with historical state.
 
 ---
 

@@ -25,8 +25,8 @@ It does **not** give you:
 - Message history on the relay (TTL-based delivery only)
 - Multi-group management (one namespace = one group per session)
 - A "leave group" protocol message (see §9)
-- Payload typing, ordering guarantees beyond FIFO per sender, or deduplication
-  (all of these are the caller's responsibility)
+- Payload typing, ordering guarantees beyond FIFO per sender, or storage of
+  processed Message IDs (all of these are the caller's responsibility)
 
 ---
 
@@ -251,11 +251,13 @@ reconnection. There is no per-message delivery confirmation.
 Incoming blobs arrive on the blob stream as events containing:
 - `data`: the raw payload bytes
 - `senderNoisePub`: the sender's X25519 public key (32 bytes)
+- `messageId`: an opaque stable ID for this Envelope across re-delivery
 
-**The blob stream may fire for your own messages** depending on relay
-implementation. Implement deduplication at the app layer (e.g. content hash
-check against local storage) rather than relying on the transport to filter
-self-sent messages.
+Delivery is at least once, so the blob stream can emit the same message again
+after a reconnect. Persist `messageId` in the same transaction as the
+application update. If the ID already exists, ignore the duplicate. Never parse
+the ID or use a payload hash as a substitute: identical payloads can be valid
+distinct messages.
 
 ### Sync semantics: broadcast-each
 
@@ -263,7 +265,7 @@ The recommended pattern for clipboard sync and similar single-value streams:
 
 - On every new item, broadcast it immediately to the group
 - **Do not diff** — broadcast the full item every time
-- **Dedup at the receiver** — if the content already exists in local storage, drop it
+- **Dedup at the receiver** — if the Message ID already exists in local storage, drop it
 - The outbox replay handles out-of-order / late delivery
 
 This is simpler and more robust than delta-sync or last-write-wins schemes for
