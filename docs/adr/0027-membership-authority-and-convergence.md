@@ -62,7 +62,7 @@ The guiding rule from ADR-0026 applies: nothing the app must get right for corre
 
 ## State machine (one Device, one namespace)
 
-`NotJoined → PendingJoin → Member → Leaving → NotJoined`, and `Member → NotJoined` on a deliberate removal. Destroy Group transitions are defined in trueseal-roadmap#10. Within `Member`, the current manifest and the set of Pending Membership Changes evolve as above.
+`NotJoined → PendingJoin → Member → Leaving → NotJoined`, and `Member → NotJoined` on a deliberate removal. Destroy Group transitions are defined in ADR-0029. Within `Member`, the current manifest and the set of Pending Membership Changes evolve as above.
 
 **Crash points:**
 - **Before the issuing transaction commits:** there's no change, and the app sees the call fail or never return.
