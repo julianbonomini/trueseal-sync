@@ -97,15 +97,19 @@ The ordered sequence of Blobs for a given Object, as seen by a Device. Maintaine
 _Avoid_: event log, message queue, stream (acceptable informally, but Operation Log is the canonical term)
 
 **Outbox**:
-The subset of the Operation Log whose entries have not yet been confirmed delivered to the Relay. When the sender is offline, new Blobs are appended to the local Operation Log and marked undelivered. On reconnect, the session replays undelivered entries. Not a separate data structure — a view over the Operation Log.
+The subset of the Operation Log whose entries have not yet been confirmed delivered to the Relay. When the sender is offline, new Blobs are appended to the local Operation Log and marked undelivered. Undelivered entries are retried while connected and replayed on reconnect, in Sequence order per recipient; a later entry never overtakes one still being retried. An entry the library gives up on (permanent refusal, or a `Sync` entry older than 30 days) is removed and reported as a Delivery Issue. Pair and Group Manifest messages use the Outbox too and never expire. Not a separate data structure — a view over the Operation Log.
 _Avoid_: queue, buffer, pending messages
+
+**Delivery Issue**:
+A device-local, typed report that the library could not deliver or handle a message: an incoming Blob it could not read or authorise, a Blob held for a newer End-to-End Version, a handler that kept failing, or an outgoing message it gave up sending. Carries a Message ID where one exists. Never sent to the other Device or the Relay. Observing Delivery Issues is optional; the library already does the right thing.
+_Avoid_: error, failure event, dead letter
 
 **Namespace**:
 A string that scopes a Session's local database to a logical group. Defaults to `"default"`. Allows a single app to host multiple independent Sessions — one per namespace — without any collision. The caller passes a namespace to `create()`; the library derives all storage paths from it. Most callers use the default and never think about it.
 _Avoid_: space, channel, database name, group ID (namespace is the caller-facing term; group ID is internal to the manifest)
 
 **Session State**:
-The durable local state owned and managed entirely by the library for a given namespace. Comprises three things: the device identity (keypair), the current Group Manifest, and the Operation Log (outbox). Stored in an embedded SQLite database. The caller never reads, writes, or migrates this state directly — the library manages it. Survives process restarts, crashes, and OS kills.
+The durable local state owned and managed entirely by the library for a given namespace. Comprises the device identity (keypair), the current Group Manifest, the Operation Log (outbox), and the Message IDs of recently handled messages (kept 60 days, for dedup). Stored in an embedded SQLite database. The caller never reads, writes, or migrates this state directly — the library manages it. Survives process restarts, crashes, and OS kills.
 _Avoid_: local storage, persisted state, database (those are implementation details)
 
 **Sequence**:
@@ -113,7 +117,7 @@ A monotonically increasing integer counter owned by a Device. Increments once pe
 _Avoid_: message number, event ID, offset, version (those imply per-object scoping)
 
 **Message ID**:
-A stable opaque identifier for one application `Sync` message. Derived inside trueseal-sync from the author's signing public key and Envelope sequence, with a versioned domain-separated hash. The same Envelope always yields the same ID across relay re-delivery; distinct authors or sequences yield different IDs. SDK callers persist the ID atomically with application state and ignore an ID already processed. The Relay never sees or creates it, and callers must never parse it.
+A stable opaque identifier for one application `Sync` message. Derived inside trueseal-sync from the author's signing public key and Envelope sequence, with a versioned domain-separated hash. The same Envelope always yields the same ID across relay re-delivery; distinct authors or sequences yield different IDs. The library records the ID of every handled message and drops re-deliveries itself, so a caller sees the same ID twice only if it crashed while handling that message. The Relay never sees or creates it, and callers must never parse it.
 _Avoid_: relay blob ID, payload hash, database ID, exactly-once token
 
 **Envelope**:
@@ -125,7 +129,7 @@ A cryptographic hash of a preceding Envelope in the same Object's Operation Log.
 _Avoid_: previous, predecessor, pointer
 
 **Receive Session**:
-A long-lived, authenticated, forward-secret connection between a Device and the Relay, established via a Noise XX handshake using the Device's stable noise keypair. The relay maintains a `noise_pub → active connection` map and delivers inbound Blobs over this channel (push-on-arrival). Each Device holds exactly one Receive Session at a time. Distinct from blob encryption — a Session is a live channel, not a stored payload. On each Deliver frame, trueseal-sync sends a DeliverAck back to the relay immediately on receipt — before decryption — so the relay can delete the stored Blob. If no DeliverAck is sent before disconnect, the relay re-delivers on reconnect. This is at-least-once transport to the client process, not exactly-once application processing.
+A long-lived, authenticated, forward-secret connection between a Device and the Relay, established via a Noise XX handshake using the Device's stable noise keypair. The relay maintains a `noise_pub → active connection` map and delivers inbound Blobs over this channel (push-on-arrival). Each Device holds exactly one Receive Session at a time. Distinct from blob encryption — a Session is a live channel, not a stored payload. Nothing is pulled until the caller registers a message handler. Blobs are handled one at a time, in arrival order. trueseal-sync sends a DeliverAck — so the relay can delete the stored Blob — only after the caller's handler has finished with it, or after the library has decided the Blob is unusable (and reported a Delivery Issue). If no DeliverAck is sent before disconnect, the relay re-delivers on the next Receive Session. This is at-least-once delivery to the caller's handler, in per-sender order (ADR-0026).
 _Avoid_: connection, socket, channel, stream
 
 **Push Session**:
@@ -149,11 +153,11 @@ The typed unit of communication in trueseal-sync's protocol. Four variants: `Pai
 _Avoid_: packet, event, command, request
 
 **Protocol Size Limit**:
-The largest `Sync` Message body a Device may send: 61,440 bytes (60 KiB) of caller data. Fixed by the protocol so every Message fits in one Noise frame. `send()` rejects a larger body before anything is queued, so it never enters the Outbox (ADR-0025).
+The largest `Sync` Message body a Device may send: 61,440 bytes (60 KiB) of caller data. Fixed by the protocol so every Message fits in one Noise frame. `send()` rejects a larger body before anything is queued, so it never enters the Outbox (ADR-0026).
 _Avoid_: max envelope bytes, frame size, blob size limit
 
 **Relay Size Limit**:
-A lower limit a Relay operator may set for the Blobs their Relay accepts. It can never exceed the Protocol Size Limit. A Blob the Relay rejects for size is a permanent failure and is never retried (ADR-0025).
+A lower limit a Relay operator may set for the Blobs their Relay accepts. It can never exceed the Protocol Size Limit. A Blob the Relay rejects for size is a permanent failure and is never retried (ADR-0026).
 _Avoid_: max envelope bytes, relay max size
 
 **Pairing Payload**:
