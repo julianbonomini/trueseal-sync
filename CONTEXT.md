@@ -148,6 +148,14 @@ _Avoid_: Using "revocation" to mean only Destroy Group — be specific.
 The typed unit of communication in trueseal-sync's protocol. Four variants: `Pair` (a device requesting to join a Sync Group), `Sync` (an opaque application blob — clipboard entry, secret, or any caller-defined data), `Revoke` (a full Sync Group reset / Destroy Group), and `GroupManifest` (a signed membership update pushed to every member on every membership change). The message type is a private convention of trueseal-sync, encoded as a 1-byte tag inside the encrypted payload. The Relay never sees it. Third-party developers may use trueseal-relay directly with their own protocol — trueseal-sync is one opinionated client protocol built on the relay, not the only possible one.
 _Avoid_: packet, event, command, request
 
+**Protocol Size Limit**:
+The largest `Sync` Message body a Device may send: 61,440 bytes (60 KiB) of caller data. Fixed by the protocol so every Message fits in one Noise frame. `send()` rejects a larger body before anything is queued, so it never enters the Outbox (ADR-0025).
+_Avoid_: max envelope bytes, frame size, blob size limit
+
+**Relay Size Limit**:
+A lower limit a Relay operator may set for the Blobs their Relay accepts. It can never exceed the Protocol Size Limit. A Blob the Relay rejects for size is a permanent failure and is never retried (ADR-0025).
+_Avoid_: max envelope bytes, relay max size
+
 **Pairing Payload**:
 The bytes produced by an initiating Device to bootstrap a Pairing ceremony. Contains the initiator's noise public key and signing public key. Intended to be encoded as a QR code by the caller — trueseal-sync produces and parses the raw bytes only, never the QR image itself. A Device that receives a Pairing Payload can push a `Pair` Message back to the initiator via the Relay.
 _Avoid_: invite, token, code (acceptable in UX copy, not in protocol docs)
