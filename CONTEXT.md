@@ -97,11 +97,15 @@ The most members a Sync Group may have: 32. An admission beyond it is refused.
 _Avoid_: group limit, member cap
 
 **Destroy Group**:
-The operation by which any current member triggers a full Sync Group reset. Pushes a `REVOKE` message to all known members, rotates every device's keypair, and wipes all group state. Cryptographic — the old keypairs become dead addresses. Used for security incidents (stolen or compromised device).
+The operation that ends a Sync Group, for a stolen or compromised device. Every Device that receives its Revoke passes it on to the members it knows, wipes all group state, and starts over with a fresh identity; the user then pairs again. Any current or former member may trigger it. Ends the group only for Devices the Revoke reaches, and never erases what a stolen device already holds (ADR-0029).
+
+**Destroying**:
+The persisted state of a Device that has started or received Destroy Group and is waiting for the Relay to accept its Revokes before it wipes. Survives restarts.
+_Avoid_: revoking, tearing down
 _Avoid_: revoke all, nuclear option, hard reset (use Destroy Group as the canonical term)
 
 **Revocation**:
-The general concept of removing cryptographic access to the group. Encompasses both Soft Removal (cooperative, no key rotation) and Destroy Group (cryptographic, full key rotation). In earlier versions of trueseal-sync, revocation meant only Destroy Group — the distinction is now explicit.
+The general concept of removing cryptographic access to the group. Encompasses both Soft Removal (a new manifest excludes one device) and Destroy Group (the whole group ends and every device starts over with a fresh identity). In earlier versions of trueseal-sync, revocation meant only Destroy Group — the distinction is now explicit.
 _Avoid_: Using "revocation" to mean only Destroy Group — be specific.
 
 **Push**:
@@ -165,7 +169,7 @@ The scheme used to encrypt Blob content for a specific recipient Device. Raw X25
 _Avoid_: Noise (Noise is for Sessions, not Blobs), asymmetric encryption (too generic)
 
 **Revocation**:
-The general concept of removing cryptographic access to the group. Encompasses both Soft Removal (cooperative, no key rotation) and Destroy Group (cryptographic, full key rotation). In earlier versions of trueseal-sync, revocation meant only Destroy Group — the distinction is now explicit.
+The general concept of removing cryptographic access to the group. Encompasses both Soft Removal (a new manifest excludes one device) and Destroy Group (the whole group ends and every device starts over with a fresh identity). In earlier versions of trueseal-sync, revocation meant only Destroy Group — the distinction is now explicit.
 _Avoid_: Using "revocation" to mean only Destroy Group — be specific.
 
 **Message**:
@@ -193,7 +197,7 @@ _Avoid_: invite, token, code (acceptable in UX copy, not in protocol docs)
 - A **Push** produces one **Blob** per recipient **Device** in the **Sync Group**
 - A **Blob** is addressed to exactly one **Device** (by public key)
 - The **Relay** routes **Blobs** to **Devices** and holds no **Sync Group** or **Group Manifest** state, though it can infer likely co-membership from fan-out
-- **Soft Removal** updates the **Group Manifest**; **Destroy Group** wipes it entirely and rotates all **Keypairs**
+- **Soft Removal** updates the **Group Manifest**; **Destroy Group** ends the **Sync Group**; every **Device** it reaches wipes and starts over with a fresh identity
 
 ## Example dialogue
 
@@ -207,7 +211,7 @@ _Avoid_: invite, token, code (acceptable in UX copy, not in protocol docs)
 > **Domain expert:** "No. Pair with their device — exchange public keys via QR. That adds them to the Group Manifest. After that, push blobs addressed to their public key. The relay handles it."
 
 > **Dev:** "My phone was stolen. What do I do?"
-> **Domain expert:** "Call destroyGroup() from any other device. Every member rotates their keypair. The stolen phone's old keypair receives nothing going forward."
+> **Domain expert:** "Call destroyGroup() from any other device. Every device it reaches wipes and starts over with a new identity, so nothing is sent to the stolen phone's old address again. Then pair your remaining devices from scratch. It can't erase what the phone already has."
 
 > **Dev:** "I got a new laptop and want to remove the old one."
 > **Domain expert:** "Call removeMember() with the old laptop's noise_pub. A new Group Manifest version is issued excluding it. The old laptop's messages get filtered. No key rotation needed."
