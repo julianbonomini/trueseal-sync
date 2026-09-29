@@ -49,7 +49,7 @@ The set of Devices that have mutually joined a group and share sync data. Member
 _Avoid_: room, channel, namespace, account
 
 **Group Manifest**:
-The authoritative, signed, versioned document that defines the current membership of a Sync Group. Contains a version number, group ID, and the list of `(noise_pub, signing_pub)` pairs for every current member. Signed by the issuing member's Ed25519 signing key. Any current member may issue a new version. Replaces `PairedList` as the source of truth for who to send to and whose messages to accept.
+The authoritative, signed, versioned document that defines the current membership of a Sync Group. Contains a version number, group ID, and the list of `(noise_pub, signing_pub)` pairs for every current member. Signed by the issuing member's Ed25519 signing key. Names the manifest it was built on (its parent), so a deliberate later change can be told apart from a concurrent one. Any current member may issue a new version, and every current member is fully trusted for membership. Holds at most 32 members (the Maximum Group Size). Replaces `PairedList` as the source of truth for who to send to and whose messages to accept.
 _Avoid_: member list, roster, address book, peer list
 
 **Group ID**:
@@ -57,7 +57,7 @@ A stable random identifier generated at group creation. Never changes, even as t
 _Avoid_: group key, group address, channel ID
 
 **Manifest Version**:
-A monotonically increasing integer scoped to a Group ID. Increments on every membership change. Last-version-wins when two members simultaneously issue conflicting updates. Not scoped per device.
+A monotonically increasing integer scoped to a Group ID. Increments on every membership change. When two members issue the same version concurrently, every Device picks the same winner, and the issuer whose change lost re-applies it automatically (see Pending Membership Change). Not scoped per device.
 _Avoid_: epoch, generation, revision
 
 **Protocol Version**:
@@ -73,8 +73,20 @@ The Protocol Version of Device-to-Device content: the Envelope, its signature, a
 _Avoid_: envelope version, message version, sync version
 
 **Soft Removal**:
-The operation by which any current member removes another member from the Sync Group by issuing a new Group Manifest that excludes them. No keypairs are rotated. Remaining members filter the removed device's future messages. Cooperative — not cryptographically enforced. Used for routine group maintenance (new phone, departing team member).
+The operation by which any current member removes another member from the Sync Group by issuing a new Group Manifest that excludes them. No keypairs are rotated. Remaining members filter the removed device's future messages. The removed device wipes its group state and starts over with a fresh identity. Cooperative — not cryptographically enforced. Used for routine group maintenance (new phone, departing team member).
 _Avoid_: kick, ban, unlink, unpair (unpair implies the removed device's cooperation)
+
+**Leave**:
+Soft Removal of the local Device by itself. The Device stays in a Leaving state until the Relay has accepted the manifest that excludes it, then wipes its group state and starts over with a fresh identity. Survives restarts.
+_Avoid_: unpair, sign out, disconnect
+
+**Pending Membership Change**:
+A membership change (an admission, a removal or a Leave) that its issuer keeps until the group's manifest reflects it or a deliberate later change supersedes it. If a concurrent manifest overwrites the change, the issuer re-applies it on top. This is how concurrent membership changes converge without the app redoing anything.
+_Avoid_: membership intent, membership op
+
+**Maximum Group Size**:
+The most members a Sync Group may have: 32. An admission beyond it is refused.
+_Avoid_: group limit, member cap
 
 **Destroy Group**:
 The operation by which any current member triggers a full Sync Group reset. Pushes a `REVOKE` message to all known members, rotates every device's keypair, and wipes all group state. Cryptographic — the old keypairs become dead addresses. Used for security incidents (stolen or compromised device).
