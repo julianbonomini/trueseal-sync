@@ -13,7 +13,7 @@ A long-term X25519 identity for a Device. Generated once per device, persisted l
 _Avoid_: credentials, identity key, key pair (two words)
 
 **Relay**:
-The infrastructure component that stores and forwards Blobs between Devices. Always in the path for remote sync. Zero-knowledge — it never decrypts content, never learns Sync Group membership, and cannot identify who sent any Blob. Push Sessions use ephemeral, unlinkable keypairs (ADR-0018), so the relay cannot associate a push with any Device. The relay learns exactly two things: which noise public keys are actively connected (to deliver Blobs on arrival), and `recipient_pub` per Envelope (required for routing). Holds Blobs addressed to offline recipients until they reconnect (30-day TTL), then deletes on delivery. Does not hold anything on behalf of offline senders — that is the sender's local responsibility.
+The infrastructure component that stores and forwards Blobs between Devices. Always in the path for remote sync. It never decrypts content and cannot identify who sent any Blob. It can infer which Devices likely share a Sync Group, because one send fans out to all members together (ADR-0024). Push Sessions use ephemeral, unlinkable keypairs (ADR-0018), so the relay cannot associate a push with any Device. Beyond that, the relay sees which noise public keys are actively connected, `recipient_pub` per Envelope (required for routing), and Blob sizes and timing. Holds Blobs addressed to offline recipients until they reconnect (30-day TTL), then deletes on delivery. Does not hold anything on behalf of offline senders — that is the sender's local responsibility.
 _Avoid_: server, TURN server, signaling server, hub
 
 **Blob**:
@@ -160,7 +160,7 @@ _Avoid_: invite, token, code (acceptable in UX copy, not in protocol docs)
 - A **Pairing** ceremony between two **Devices** uses a **Pairing Token** and bootstraps key exchange; joining the group is formalised by a **Group Manifest** update
 - A **Push** produces one **Blob** per recipient **Device** in the **Sync Group**
 - A **Blob** is addressed to exactly one **Device** (by public key)
-- The **Relay** routes **Blobs** to **Devices** but has no concept of **Sync Groups** or **Group Manifests**
+- The **Relay** routes **Blobs** to **Devices** and holds no **Sync Group** or **Group Manifest** state, though it can infer likely co-membership from fan-out
 - **Soft Removal** updates the **Group Manifest**; **Destroy Group** wipes it entirely and rotates all **Keypairs**
 
 ## Example dialogue
