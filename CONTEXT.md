@@ -48,6 +48,18 @@ _Avoid_: group key, group address, channel ID
 A monotonically increasing integer scoped to a Group ID. Increments on every membership change. Last-version-wins when two members simultaneously issue conflicting updates. Not scoped per device.
 _Avoid_: epoch, generation, revision
 
+**Protocol Version**:
+The general concept of which wire format a component speaks. Split into two independent numbers: Transport Version and End-to-End Version. Unrelated to Manifest Version (which counts membership changes) and to package versions (which never imply wire compatibility).
+_Avoid_: version (unqualified), epoch, protocol revision
+
+**Transport Version**:
+The Protocol Version of the Device-to-Relay connection: the Noise handshake and the relay frames. The only Protocol Version the Relay checks. A Relay refuses a Device speaking a Transport Version it does not support, and says which versions it does support.
+_Avoid_: relay version, wire version
+
+**End-to-End Version**:
+The Protocol Version of Device-to-Device content: the Envelope, its signature, and addressed encryption. Bound into what is signed and encrypted, so it cannot be altered in transit. The Relay never sees or checks it. A Device reading a Blob in an End-to-End Version it does not support never treats it as readable data.
+_Avoid_: envelope version, message version, sync version
+
 **Soft Removal**:
 The operation by which any current member removes another member from the Sync Group by issuing a new Group Manifest that excludes them. No keypairs are rotated. Remaining members filter the removed device's future messages. Cooperative — not cryptographically enforced. Used for routine group maintenance (new phone, departing team member).
 _Avoid_: kick, ban, unlink, unpair (unpair implies the removed device's cooperation)
