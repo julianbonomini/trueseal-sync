@@ -5,6 +5,7 @@ mod destroy_group;
 mod fanout;
 mod join_group;
 mod manifest_filter;
+mod manifest_hijack;
 mod manifest_persist;
 mod member_events;
 mod members;
