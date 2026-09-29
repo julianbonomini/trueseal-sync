@@ -80,6 +80,14 @@ _Avoid_: relay version, wire version
 The Protocol Version of Device-to-Device content: the Envelope, its signature, and addressed encryption. Bound into what is signed and encrypted, so it cannot be altered in transit. The Relay never sees or checks it. A Device reading a Blob in an End-to-End Version it does not support never treats it as readable data.
 _Avoid_: envelope version, message version, sync version
 
+**TrueSeal Release**:
+The one version number shared by trueseal-sync and the Swift, Kotlin and TS SDKs, which always release together. The same TrueSeal Release means the same core build and API shape on every platform. Implies nothing about wire compatibility; see Compatibility Table.
+_Avoid_: SDK version (when it means one platform only), core version
+
+**Compatibility Table**:
+The published mapping from TrueSeal Release, relay and noise versions to the Transport Version and End-to-End Version each speaks. The only authority on which package versions can work together.
+_Avoid_: support matrix, version matrix
+
 **Soft Removal**:
 The operation by which any current member removes another member from the Sync Group by issuing a new Group Manifest that excludes them. No keypairs are rotated. Remaining members filter the removed device's future messages. The removed device wipes its group state and starts over with a fresh identity. Cooperative — not cryptographically enforced. Used for routine group maintenance (new phone, departing team member).
 _Avoid_: kick, ban, unlink, unpair (unpair implies the removed device's cooperation)
