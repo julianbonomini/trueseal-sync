@@ -141,19 +141,23 @@ A string that scopes a Session's local database to a logical group. Defaults to 
 _Avoid_: space, channel, database name, group ID (namespace is the caller-facing term; group ID is internal to the manifest)
 
 **Session State**:
-The durable local state owned and managed entirely by the library for a given namespace. Comprises the device identity (keypair), the current Group Manifest, the Operation Log (outbox), and the Message IDs of recently handled messages (kept 60 days, for dedup). Stored in an embedded SQLite database. The caller never reads, writes, or migrates this state directly — the library manages it. Survives process restarts, crashes, and OS kills.
+The durable local state owned and managed entirely by the library for a given namespace. Comprises the device identity (keypair), the current Group Manifest, the Operation Log (outbox), and the Message IDs of recently handled messages (kept for the Replay Window, for dedup). Stored in an embedded SQLite database. The caller never reads, writes, or migrates this state directly — the library manages it. Survives process restarts, crashes, and OS kills.
 _Avoid_: local storage, persisted state, database (those are implementation details)
 
 **Sequence**:
-A monotonically increasing integer counter owned by a Device. Increments once per Envelope sent, across all Objects. Used by recipients to detect gaps — a jump from sequence 5 to sequence 7 from the same Device means one Envelope was missed, regardless of which Object it belonged to. Not scoped per Object. Direct Rust callers receive it with `author_pub`; public SDKs receive an opaque Message ID derived from that pair.
+A monotonically increasing integer counter owned by a Device. Increments once per Envelope sent, across all Objects. Sealed inside the Envelope, so only recipients see it (ADR-0031). Used by recipients to detect gaps — a jump from sequence 5 to sequence 7 from the same Device means one Envelope was missed, regardless of which Object it belonged to. Not scoped per Object. Direct Rust callers receive it with `author_pub`; public SDKs receive an opaque Message ID derived from that pair.
 _Avoid_: message number, event ID, offset, version (those imply per-object scoping)
 
+**Replay Window**:
+60 days. A Device rejects a message whose signed sender timestamp is older than this, and keeps each handled Message ID until the window has passed for both the handling time and the sender timestamp. So no message reaches the handler twice, even when a malicious Relay re-delivers it (ADR-0031).
+_Avoid_: dedup TTL, message expiry (Blob TTL on the Relay is a separate, shorter limit)
+
 **Message ID**:
-A stable opaque identifier for one application `Sync` message. Derived inside trueseal-sync from the author's signing public key and Envelope sequence, with a versioned domain-separated hash. The same Envelope always yields the same ID across relay re-delivery; distinct authors or sequences yield different IDs. The library records the ID of every handled message and drops re-deliveries itself, so a caller sees the same ID twice only if it crashed while handling that message. The Relay never sees or creates it, and callers must never parse it.
+A stable opaque identifier for one application `Sync` message. Derived inside trueseal-sync from the author's signing public key and Envelope sequence, with a versioned domain-separated hash. The same Envelope always yields the same ID across relay re-delivery; distinct authors or sequences yield different IDs. The library records the ID of every handled message and drops re-deliveries itself, so a caller sees the same ID twice only if it crashed while handling that message. The Relay never sees or creates it, and callers must never parse it. A message older than the Replay Window is rejected, so a replay can never outlive its dedup record.
 _Avoid_: relay blob ID, payload hash, database ID, exactly-once token
 
 **Envelope**:
-The metadata wrapper around a Blob that the Relay can read without decrypting content. Contains: a per-device global sequence number, parent hashes (for DAG causality), recipient public key, signature, and an opaque encrypted payload. The author's signing public key (`author_pub`) is prepended to the message bytes inside the encrypted payload — invisible to the Relay. The object ID also lives inside the encrypted payload — the Relay never sees it. The sequence counter belongs to the sending Device, not to any Object — it increments once per Envelope sent, across all Objects.
+The wrapper around a Blob. The Relay can read only its End-to-End Version, the recipient public key and the sealed payload. Everything else is inside the Addressed Encryption, where the Relay can't see it: the author's signing public key (`author_pub`), the Sequence, the parent hashes, the sender timestamp, the object ID and the signature. Two Envelopes from the same Device share no Relay-readable value apart from the version, and the recipient key when both go to the same Device (ADR-0031).
 _Avoid_: header, wrapper, frame, message
 
 **Parent Hash**:
@@ -165,7 +169,7 @@ A long-lived, authenticated, forward-secret connection between a Device and the 
 _Avoid_: connection, socket, channel, stream
 
 **Push Session**:
-A short-lived, anonymous connection from a Device to the Relay used solely to send Blobs. Established via a Noise NK handshake with a fresh ephemeral X25519 keypair generated per push — the relay authenticates to the Device (Device verifies `relay_pub`) but learns no stable client identity. Closed immediately after the push completes. The relay cannot link a Push Session to any Device or Receive Session (ADR-0018).
+A short-lived, anonymous connection from a Device to the Relay used solely to send Blobs. Established via a Noise NK handshake with a fresh ephemeral X25519 keypair generated per push — the relay authenticates to the Device (Device verifies `relay_pub`) but learns no stable client identity. Closed immediately after the push completes. The handshake proves nothing about the sender. The Relay can still often link a Push Session to a Device's Receive Session by IP address or timing, because TrueSeal doesn't hide network-level identity (ADR-0018, ADR-0031).
 _Avoid_: connection, send session, upload session
 
 **Session**:
@@ -173,7 +177,7 @@ Umbrella term for a Device's active relay connections: one Receive Session (long
 _Avoid_: connection, socket, channel, stream
 
 **Addressed Encryption**:
-The scheme used to encrypt Blob content for a specific recipient Device. Raw X25519 key agreement + ChaCha20-Poly1305 using the recipient's static public key. At-rest encryption — independent of any live Session. The plaintext encrypted is `author_pub (32 bytes) || message_tag (1 byte) || message_body` — the sender's identity is bound inside the ciphertext and is invisible to the Relay. A Blob encrypted this way can be stored on the Relay and decrypted later by the recipient without an active Session.
+The scheme used to encrypt Blob content for a specific recipient Device. A fresh ephemeral X25519 key agreed with the recipient's static public key, then HKDF and ChaCha20-Poly1305. The End-to-End Version, ephemeral key and recipient key are bound into the key derivation and the associated data. Independent of any live Session. The sealed plaintext carries the author's identity, Sequence, parent hashes, sender timestamp, message and signature, none of which the Relay can see (ADR-0031). It has no end-to-end forward secrecy: anyone holding the recipient's private key can decrypt every Blob ever addressed to it. A Blob encrypted this way can be stored on the Relay and decrypted later by the recipient without an active Session.
 _Avoid_: Noise (Noise is for Sessions, not Blobs), asymmetric encryption (too generic)
 
 **Revocation**:
