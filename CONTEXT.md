@@ -40,9 +40,17 @@ _Avoid_: pairing session, pairing mode
 The joining Device's durable record that it asked to join via a specific Pairing Token and is waiting to be admitted. Survives restarts, has no timeout, and ends when a valid Group Manifest arrives or the caller cancels. A Device with neither a Group Manifest nor a Pending Join accepts no manifest.
 _Avoid_: join request (that is the admitter's view), invitation
 
-**Member Request Token**:
-An opaque string the library gives the caller in `onMemberRequest` when a joining device sends a `Pair` message. The caller passes it back to `acceptMember()` to admit the device. Never interpreted by the caller — it is a handle to a pending join request held internally by the library.
-_Avoid_: key, public key, noise_pub, signing_pub
+**Join Request**:
+The admitter's view of a `Pair` that proved it knows the Pairing Secret. The library delivers it to the caller as a `joinRequest` event carrying an opaque ID and the joiner's member name. The caller passes it back to `accept()` to admit the device. A request that is never accepted disappears when the Pairing Window closes, because there is no reject (ADR-0023).
+_Avoid_: member request token, pairing request, invitation
+
+**Group Status**:
+Where the local Device stands in its namespace's Sync Group: `notJoined`, `pendingJoin`, `member` or `leaving`. Changes are reported as `statusChanged` with a reason (`created`, `joined`, `left`, `removed` or `destroyed`). After removal, leave or Destroy Group the Device is back at `notJoined` with a fresh identity, and the same SDK object can pair again (ADR-0028).
+_Avoid_: join state, connection state (that is the relay link)
+
+**Relay Address**:
+The single string that names a Relay: `trueseal://<relay public key hex>@host[:receivePort][?push=pushPort]`. The ports default to 7700 and 7701. SDKs also accept a typed form with the same fields. The key comes first because it is what authenticates the Relay (ADR-0028).
+_Avoid_: relay URL, relay host (a host alone is not enough)
 
 **Sync Group**:
 The set of Devices that have mutually joined a group and share sync data. Membership is defined by the current Group Manifest — not by pairwise pairing alone. A client-side concept only — the relay has no knowledge of group membership.
@@ -117,7 +125,7 @@ A device-local, typed report that the library could not deliver or handle a mess
 _Avoid_: error, failure event, dead letter
 
 **Namespace**:
-A string that scopes a Session's local database to a logical group. Defaults to `"default"`. Allows a single app to host multiple independent Sessions — one per namespace — without any collision. The caller passes a namespace to `create()`; the library derives all storage paths from it. Most callers use the default and never think about it.
+A string that scopes a Session's local database to a logical group. Defaults to `"default"`. Allows a single app to host multiple independent Sessions — one per namespace — without any collision. The caller passes a namespace to `open()`; the library derives all storage paths from it. Most callers use the default and never think about it.
 _Avoid_: space, channel, database name, group ID (namespace is the caller-facing term; group ID is internal to the manifest)
 
 **Session State**:
@@ -217,12 +225,12 @@ _Avoid_: invite, token, code (acceptable in UX copy, not in protocol docs)
 - All session state persistence (identity, manifest, outbox) via embedded SQLite
 - Auto-generating device identity on first launch
 - Auto-generating member display names from public keys
-- Notifying the caller of membership events (`onMemberRequest`, `onMemberJoined`, `onMemberLeft`, `onRemovedFromGroup`, `onGroupDestroyed`)
+- Notifying the caller of group events (`statusChanged`, `membersChanged`, `joinRequest`, `connectionChanged`, `admissionDropped`) and Delivery Issues (ADR-0028)
 
 **trueseal-sync is NOT responsible for:**
 - What the bytes in a blob mean — that is the caller's data model
 - Conflict resolution — the caller decides what to do when two devices diverge
-- Bootstrapping a new device with historical state — the caller decides what to send after `onMemberJoined` fires
+- Bootstrapping a new device with historical state — the caller decides what to send after `membersChanged` shows a new member
 - Point-to-point messaging between specific devices — this is a sync primitive, not a chat primitive. `send()` always fans out to the entire Sync Group
 - Permission hierarchies (only admins can remove members) — implement above this primitive
 - Cryptographically enforced single-member removal without key rotation — that is a v2 concern (see ADR-0015)
@@ -245,4 +253,4 @@ trueseal-sync exposes two layers:
 
 **Session** (`TruesealSession`) — opinionated facade. Wires the primitives. Owns relay connection, reconnection, group manifest, message dispatch, soft removal, and destroy group. Caller owns keypair storage, op log, manifest storage, and relay address. UniFFI exposes only the session to Swift and Kotlin.
 
-On Destroy Group, the session fires `onGroupDestroyed` and wipes the local database for that namespace. The next `create()` call auto-generates a fresh identity — the caller never handles keypair bytes directly (ADR-0016).
+The public SDKs (Swift, Kotlin, TS) expose one API shape over the session, the `TrueSeal` object (ADR-0028). On removal, leave or Destroy Group, the library wipes the local database for that namespace, generates a fresh identity, and reports `statusChanged(notJoined, reason)`. The same object stays usable, and the caller never handles keypair bytes directly (ADR-0016).
