@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted
+Accepted. DeliverAck timing and caller-owned dedup are superseded by [ADR-0026](0026-delivery-contract.md); the Message ID derivation still stands.
 
 ## Context
 
