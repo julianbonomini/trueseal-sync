@@ -1,6 +1,6 @@
 # Session State is versioned and migrates forward; a Store Reset needs explicit approval
 
-Status: accepted (decided 2026-09-30 in [trueseal-roadmap#20](https://github.com/julianbonomini/trueseal-roadmap/issues/20); not yet implemented). This refines the outbox rule of ADR-0022 and adds one status reason and one error case to ADR-0028. The relay's store follows the same policy in trueseal-relay ADR-0013.
+Status: accepted (decided 2026-09-30 in [trueseal-roadmap#20](https://github.com/julianbonomini/trueseal-roadmap/issues/20); not yet implemented). This refines the outbox rule of ADR-0022 and adds one status reason and one error case to ADR-0028. The relay's store follows the same policy in trueseal-relay ADR-0013. Amended by ADR-0034.
 
 The store has no schema version and no migrations today. The preview ADRs already add a lot of durable state: Pending Join, Leaving, Destroying, the dedup table, held manifests and Pending Membership Changes. So 0.6.0 starts a new store format no matter what. This ADR decides what happens between preview releases.
 
@@ -20,7 +20,7 @@ A wipe is costly. Losing Session State also loses the Device identity, so every 
 ADR-0022 says that outbox entries sealed under an old End-to-End Version can't be re-sealed, because the outbox keeps no plaintext. That is true only of app `Sync` bodies. Pair, Group Manifest and Revoke entries are built by the library from Session State. Purging them would stall state machines. A Pending Join whose Pair was purged would wait forever, and a Leaving or Destroying device would wait for relay acceptance that never comes.
 
 - In the migration transaction, the library **rebuilds and re-seals** every Pair, Group Manifest and Revoke entry under the new End-to-End Version. Their Sequence ordering stays unchanged.
-- Only `Sync` entries are removed. Their Message IDs are **persisted** as a pending `UndeliverableAfterUpgrade{messageIds}` Delivery Issue in the same transaction.
+- (Superseded by ADR-0034: `Sync` entries are re-sealed too, and nothing is removed.) Only `Sync` entries are removed. Their Message IDs are **persisted** as a pending `UndeliverableAfterUpgrade{messageIds}` Delivery Issue in the same transaction.
 - The store opens before any handler exists, so the pending issue is delivered once, when a delivery-issue handler is first registered, and then deleted. Firing it at startup would make the ADR-0026 promise ("you learn about every message the library gave up on") impossible to observe.
 - Peers still on the old release keep the re-sealed newer-version Blobs unacked on the Relay (up to the ADR-0022 cap) until they upgrade.
 

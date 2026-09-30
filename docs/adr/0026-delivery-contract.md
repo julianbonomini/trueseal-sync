@@ -1,6 +1,6 @@
 # Delivery contract: ack after handling, library dedup, per-sender order
 
-Status: accepted (decided 2026-09-29 in [trueseal-roadmap#7](https://github.com/julianbonomini/trueseal-roadmap/issues/7); not yet implemented). This supersedes the DeliverAck timing and caller-owned dedup of ADR-0020. The Message ID derivation in ADR-0020 stands.
+Status: accepted (decided 2026-09-29 in [trueseal-roadmap#7](https://github.com/julianbonomini/trueseal-roadmap/issues/7); not yet implemented). This supersedes the DeliverAck timing and caller-owned dedup of ADR-0020. The Message ID derivation in ADR-0020 stands. Amended by ADR-0034.
 
 A Device acks a Blob to the Relay only after the app's message handler has finished with it, or after the library has decided the Blob is unusable. The library runs handlers one at a time and drops duplicates itself, using a table of handled Message IDs. Senders retry while connected, never let a later message overtake one still being retried, and learn about every message they give up on. Pair and every Group Manifest use the same durable outbox as `Sync`.
 

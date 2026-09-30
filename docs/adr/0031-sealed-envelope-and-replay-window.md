@@ -1,6 +1,6 @@
 # Sealed Envelope: sender metadata and a Replay Window inside the ciphertext
 
-Status: accepted (decided 2026-09-29 in [trueseal-roadmap#16](https://github.com/julianbonomini/trueseal-roadmap/issues/16); not yet implemented). It uses the clean wire break from ADR-0022 and tightens the dedup rule from ADR-0026.
+Status: accepted (decided 2026-09-29 in [trueseal-roadmap#16](https://github.com/julianbonomini/trueseal-roadmap/issues/16); not yet implemented). It uses the clean wire break from ADR-0022 and tightens the dedup rule from ADR-0026. Amended by ADR-0034.
 
 The Relay-readable part of an Envelope shrinks to what routing and version rejection need: the End-to-End Version, the recipient public key, and the sealed payload. The sequence, parent hashes, sender timestamp and signature all move inside the Addressed Encryption. A receiver rejects any message whose signed sender timestamp is older than the **Replay Window** (60 days). It also keeps each handled Message ID until that message's own window has ended. Together these make the claim "a message is never delivered to your handler twice, even from a malicious Relay" true and testable.
 
@@ -45,6 +45,7 @@ The sealed plaintext is `author_pub`, sequence, parent hashes, sender timestamp 
 - **Future timestamps are accepted.** They are not rejected, so a sender whose clock runs fast still gets through.
 - **How long a Message ID is kept.** It is kept until 60 days after the *later* of the handling time and the sender timestamp. A future-dated message can therefore never outlive its dedup record and be replayed.
 - **Why 60 days is enough.** The window is twice the 30-day Relay TTL and the 30-day Outbox expiry. Clock skew would have to reach weeks before an honest message is lost.
+- **When the timestamp is taken (ADR-0034).** A `Sync` message is stamped once at `send()`, and every re-seal keeps that timestamp. Control messages are stamped at each seal, and replaying them must be harmless. The Relay TTL is capped at 30 days.
 
 State: this adds no new Device state beyond the per-Message-ID expiry above. Crash behaviour is ADR-0026's:
 - The Message ID is recorded and the ack sent only after the handler finishes, or after the rejection is recorded.

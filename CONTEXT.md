@@ -129,11 +129,11 @@ The ordered sequence of Blobs for a given Object, as seen by a Device. Maintaine
 _Avoid_: event log, message queue, stream (acceptable informally, but Operation Log is the canonical term)
 
 **Outbox**:
-The subset of the Operation Log whose entries have not yet been confirmed delivered to the Relay. When the sender is offline, new Blobs are appended to the local Operation Log and marked undelivered. Undelivered entries are retried while connected and replayed on reconnect, in Sequence order per recipient; a later entry never overtakes one still being retried. An entry the library gives up on (permanent refusal, or a `Sync` entry older than 30 days) is removed and reported as a Delivery Issue. Pair and Group Manifest messages use the Outbox too and never expire. Not a separate data structure — a view over the Operation Log.
+The subset of the Operation Log whose entries have not yet been confirmed delivered to the Relay. When the sender is offline, new Blobs are appended to the local Operation Log and marked undelivered. Undelivered entries are retried while connected and replayed on reconnect, in Sequence order per recipient; a later entry never overtakes one still being retried. An entry the library gives up on (permanent refusal, or a `Sync` entry older than 30 days) is removed and reported as a Delivery Issue. Pair and Group Manifest messages use the Outbox too and never expire. An End-to-End Version upgrade re-seals every entry, so nothing queued is lost (ADR-0034). Not a separate data structure — a view over the Operation Log.
 _Avoid_: queue, buffer, pending messages
 
 **Delivery Issue**:
-A device-local, typed report that the library could not deliver or handle a message: an incoming Blob it could not read or authorise, a Blob held for a newer End-to-End Version, a handler that kept failing, or an outgoing message it gave up sending. Carries a Message ID where one exists. Never sent to the other Device or the Relay. Observing Delivery Issues is optional; the library already does the right thing.
+A device-local, typed report that the library could not deliver or handle a message: an incoming Blob it could not read or authorise, a Blob held for a newer End-to-End Version, a handler that kept failing, or an outgoing message it gave up sending. A rejected incoming Blob is reported as `unreadable` with a reason: `malformed`, `senderOutdated`, `expired` or `droppedWhileHeld` (ADR-0034). Carries a Message ID where one exists. Never sent to the other Device or the Relay. Observing Delivery Issues is optional; the library already does the right thing.
 _Avoid_: error, failure event, dead letter
 
 **Namespace**:
@@ -165,8 +165,12 @@ A monotonically increasing integer counter owned by a Device. Increments once pe
 _Avoid_: message number, event ID, offset, version (those imply per-object scoping)
 
 **Replay Window**:
-60 days. A Device rejects a message whose signed sender timestamp is older than this, and keeps each handled Message ID until the window has passed for both the handling time and the sender timestamp. So no message reaches the handler twice, even when a malicious Relay re-delivers it (ADR-0031).
+60 days. A Device rejects a message whose signed sender timestamp is older than this, and keeps each handled Message ID until the window has passed for both the handling time and the sender timestamp. So no message reaches the handler twice, even when a malicious Relay re-delivers it (ADR-0031). This rests on the Sender Timestamp staying fixed across re-seals (ADR-0034).
 _Avoid_: dedup TTL, message expiry (Blob TTL on the Relay is a separate, shorter limit)
+
+**Sender Timestamp**:
+The time a message was created, sealed inside its Envelope and signed. An app `Sync` message is stamped once when it is sent, and keeps that time through every retry, replay and upgrade re-seal. A control message (Pair, Group Manifest, Leave, Revoke) is stamped each time it is sealed. The Replay Window is measured from it (ADR-0034).
+_Avoid_: send time (ambiguous across retries), receive time, relay timestamp
 
 **Message ID**:
 A stable opaque identifier for one application `Sync` message. Derived inside trueseal-sync from the author's signing public key and Envelope sequence, with a versioned domain-separated hash. The same Envelope always yields the same ID across relay re-delivery; distinct authors or sequences yield different IDs. The library records the ID of every handled message and drops re-deliveries itself, so a caller sees the same ID twice only if it crashed while handling that message. The Relay never sees or creates it, and callers must never parse it. A message older than the Replay Window is rejected, so a replay can never outlive its dedup record.
