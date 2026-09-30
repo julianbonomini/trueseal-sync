@@ -144,6 +144,14 @@ _Avoid_: space, channel, database name, group ID (namespace is the caller-facing
 The durable local state owned and managed entirely by the library for a given namespace. Comprises the device identity (keypair), the current Group Manifest, the Operation Log (outbox), and the Message IDs of recently handled messages (kept for the Replay Window, for dedup). Stored in an embedded SQLite database. The caller never reads, writes, or migrates this state directly — the library manages it. Survives process restarts, crashes, and OS kills.
 _Avoid_: local storage, persisted state, database (those are implementation details)
 
+**Store Version**:
+The format version of Session State, recorded in the store itself. Each TrueSeal Release migrates any older preview Store Version forward, and refuses to open a store written by a newer release (ADR-0032).
+_Avoid_: schema version, DB version
+
+**Store Reset**:
+A TrueSeal Release, declared in its release notes, that cannot migrate older Session State. Opening an older store wipes the namespace, generates a fresh identity and reports `statusChanged(notJoined, storeReset)`, so every group whose devices upgrade must pair again. Requires the product owner's approval (ADR-0032).
+_Avoid_: wipe (when it means this upgrade case), migration failure
+
 **Sequence**:
 A monotonically increasing integer counter owned by a Device. Increments once per Envelope sent, across all Objects. Sealed inside the Envelope, so only recipients see it (ADR-0031). Used by recipients to detect gaps — a jump from sequence 5 to sequence 7 from the same Device means one Envelope was missed, regardless of which Object it belonged to. Not scoped per Object. Direct Rust callers receive it with `author_pub`; public SDKs receive an opaque Message ID derived from that pair.
 _Avoid_: message number, event ID, offset, version (those imply per-object scoping)
