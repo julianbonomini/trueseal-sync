@@ -144,6 +144,14 @@ _Avoid_: space, channel, database name, group ID (namespace is the caller-facing
 The durable local state owned and managed entirely by the library for a given namespace. Comprises the device identity (keypair), the current Group Manifest, the Operation Log (outbox), and the Message IDs of recently handled messages (kept for the Replay Window, for dedup). Stored in an embedded SQLite database. The caller never reads, writes, or migrates this state directly — the library manages it. Survives process restarts, crashes, and OS kills.
 _Avoid_: local storage, persisted state, database (those are implementation details)
 
+**Developer Preview**:
+The 0.x life of TrueSeal, in which any release may break the API, the wire format or stored data without notice. It has no end date and ends only when the 1.0 criteria in ADR-0033 are met.
+_Avoid_: beta, alpha, early access
+
+**Upgrade Notes**:
+The required "Breaking" section of a release that breaks the API, the wire format or stored data, with the steps to upgrade. It is the only warning a Developer Preview release gives.
+_Avoid_: migration guide, breaking-change notice
+
 **Store Version**:
 The format version of Session State, recorded in the store itself. Each TrueSeal Release migrates any older preview Store Version forward, and refuses to open a store written by a newer release (ADR-0032).
 _Avoid_: schema version, DB version
