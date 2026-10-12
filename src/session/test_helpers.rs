@@ -54,13 +54,22 @@ pub(super) fn nk_push_channel() -> (mpsc::Receiver<MemPipe>, NkSender) {
 pub(super) struct MemPipe {
     pub read_buf: Arc<Mutex<Vec<u8>>>,
     pub write_buf: Arc<Mutex<Vec<u8>>>,
+    /// Set by the peer when IT drops — this end then reads EOF.
     pub closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when this end drops — the peer then reads EOF. `None` for pipes
+    /// from `mem_pipe_pair_with_close`, whose close is driven only by the
+    /// explicit close handles.
+    peer_closed: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl Drop for MemPipe {
     fn drop(&mut self) {
-        self.closed
-            .store(true, std::sync::atomic::Ordering::Release);
+        // Signal EOF to the PEER: set the flag the other end observes, like
+        // closing a real socket does. (This previously set the flag this pipe
+        // observes about itself, so a dropped end never EOFed its peer.)
+        if let Some(peer_closed) = &self.peer_closed {
+            peer_closed.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -100,11 +109,13 @@ pub(super) fn mem_pipe_pair() -> (MemPipe, MemPipe) {
             read_buf: ba.clone(),
             write_buf: ab.clone(),
             closed: b_closed.clone(),
+            peer_closed: Some(a_closed.clone()),
         },
         MemPipe {
             read_buf: ab.clone(),
             write_buf: ba.clone(),
             closed: a_closed.clone(),
+            peer_closed: Some(b_closed),
         },
     )
 }
@@ -126,15 +137,52 @@ pub(super) fn mem_pipe_pair_with_close() -> (
             read_buf: ba.clone(),
             write_buf: ab.clone(),
             closed: b_closed.clone(),
+            peer_closed: None, // close is driven only by the returned handles
         },
         MemPipe {
             read_buf: ab.clone(),
             write_buf: ba.clone(),
             closed: a_closed.clone(),
+            peer_closed: None,
         },
         a_closed,
         b_closed,
     )
+}
+
+// ── Pipe close semantics ─────────────────────────────────────────────────
+
+/// A dropped pipe end EOFs its peer, like a real socket close: the peer
+/// drains buffered data first, then reads EOF. Pre-fix `Drop` flipped the
+/// flag the dropped pipe observes about itself, so the peer never saw EOF.
+#[test]
+fn dropped_pipe_end_eofs_its_peer() {
+    use std::io::{Read, Write};
+    let (mut a, mut b) = mem_pipe_pair();
+    a.write_all(b"hello").unwrap();
+    drop(a);
+
+    let mut buf = [0u8; 5];
+    b.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"hello", "buffered data drains before EOF");
+    let mut byte = [0u8; 1];
+    assert_eq!(b.read(&mut byte).unwrap(), 0, "peer must see EOF after drop");
+    assert_eq!(b.read(&mut byte).unwrap(), 0, "EOF persists");
+}
+
+/// The same in the other direction (B drops, A reads EOF).
+#[test]
+fn dropped_pipe_end_eofs_its_peer_reverse() {
+    use std::io::{Read, Write};
+    let (mut a, mut b) = mem_pipe_pair();
+    b.write_all(b"world").unwrap();
+    drop(b);
+
+    let mut buf = [0u8; 5];
+    a.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"world");
+    let mut byte = [0u8; 1];
+    assert_eq!(a.read(&mut byte).unwrap(), 0, "peer must see EOF after drop");
 }
 
 // ── Routing relay helper ──────────────────────────────────────────────────────

@@ -379,7 +379,14 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         };
         drop(ks);
         self.push_message(&msg, NoisePublicKey(initiator_noise))
-            .map_err(|e| SessionError::PushFailed(e.to_string()))
+            .map_err(|e| match e {
+                // Preserve the typed refusal (ADR-0022) instead of erasing it
+                // into a string, mirroring push_message.
+                SessionError::RelayVersionUnsupported { min, max } => {
+                    SessionError::RelayVersionUnsupported { min, max }
+                }
+                other => SessionError::PushFailed(other.to_string()),
+            })
     }
 
     // ── Constructors ──────────────────────────────────────────────────────────
