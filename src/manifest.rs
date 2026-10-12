@@ -407,6 +407,73 @@ mod tests {
         ));
     }
 
+    // ── SYNC-10 (#102): checked version arithmetic + bounded jumps ──────────
+    // Red before the fix: none of these rejections exist, so a hostile or
+    // corrupt manifest at u64::MAX (or any huge jump) is accepted and freezes
+    // membership for good. The bound literal here is 1024; the fix commit
+    // switches these tests to the MAX_MANIFEST_VERSION_JUMP constant and
+    // exact error variants.
+
+    #[test]
+    fn u64_max_update_rejected() {
+        let key = make_signing_key();
+        let member = make_member(&key);
+        let group_id = new_group_id();
+
+        let v1 = GroupManifest::new(group_id, 1, vec![member.clone()], &key);
+        let hostile = GroupManifest::new(group_id, u64::MAX, vec![member], &key);
+
+        assert!(
+            hostile.verify(Some(&v1)).is_err(),
+            "a manifest at u64::MAX can never be incremented; accepting it freezes membership"
+        );
+    }
+
+    #[test]
+    fn u64_max_genesis_rejected() {
+        let key = make_signing_key();
+        let member = make_member(&key);
+
+        let hostile = GroupManifest::new(new_group_id(), u64::MAX, vec![member], &key);
+
+        assert!(
+            hostile.verify(None).is_err(),
+            "a genesis at u64::MAX freezes the group from the start"
+        );
+    }
+
+    #[test]
+    fn version_jump_over_bound_rejected() {
+        let key = make_signing_key();
+        let member = make_member(&key);
+        let group_id = new_group_id();
+
+        let v1 = GroupManifest::new(group_id, 1, vec![member.clone()], &key);
+        // One past the sanity bound of 1024 (ADR-0027).
+        let far = GroupManifest::new(group_id, 1 + 1024 + 1, vec![member], &key);
+
+        assert!(
+            far.verify(Some(&v1)).is_err(),
+            "a version jump beyond the sanity bound must be rejected"
+        );
+    }
+
+    #[test]
+    fn version_jump_at_bound_accepted() {
+        let key = make_signing_key();
+        let member = make_member(&key);
+        let group_id = new_group_id();
+
+        let v1 = GroupManifest::new(group_id, 1, vec![member.clone()], &key);
+        // Exactly at the bound — accepted before and after the fix.
+        let at_bound = GroupManifest::new(group_id, 1 + 1024, vec![member], &key);
+
+        assert!(
+            at_bound.verify(Some(&v1)).is_ok(),
+            "a version jump exactly at the bound is accepted"
+        );
+    }
+
     #[test]
     fn contains_signing_pub_works() {
         let key = make_signing_key();

@@ -21,6 +21,7 @@ mod remove_member;
 mod remove_member_by_id;
 mod revocation;
 mod size_limit;
+mod version_arithmetic;
 
 use ed25519_dalek::SigningKey;
 
