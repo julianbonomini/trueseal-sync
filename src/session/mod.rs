@@ -186,6 +186,17 @@ pub(super) fn build_subscribe_handler(
             signing_pub,
         } = &msg
         {
+            // SYNC-4 (#96): the Pair body's signing_pub must equal the key
+            // that actually signed this Envelope. Without the binding, a
+            // requester can get a signing key it does not control admitted,
+            // or pair a victim's signing key with its own routing address
+            // (manifest-trust hijack, repro variant 5). Drop silently before
+            // any Join Request is raised; the blob is still acked as handled.
+            // This check stays once SYNC-3 adds the Pairing Secret proof —
+            // both are required (ADR-0023 Consequences).
+            if *signing_pub != author_signing_pub {
+                return;
+            }
             let window_open = pairing
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
