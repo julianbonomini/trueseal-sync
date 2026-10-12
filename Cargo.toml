@@ -27,7 +27,9 @@ tokio = { version = "1", features = [
   "sync",
   "io-util",
 ] }
-trueseal-noise = { git = "https://github.com/julianbonomini/trueseal-noise", tag = "v0.1.4" }
+# Pinned to the NOISE-1 merge commit (caller-supplied prologue in XX and NK, noise#25/#33).
+# Exact rev per ADR-0030 / gate G8 — no floating tags for cross-repo inputs.
+trueseal-noise = { git = "https://github.com/julianbonomini/trueseal-noise", rev = "6cea366a741e618709503f0a41c4f58d5973c381" }
 uniffi = { version = "0.28", features = ["tokio", "cli"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 

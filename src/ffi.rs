@@ -35,6 +35,10 @@ pub enum SessionError {
     MemberNotFound,
     #[error("group has been destroyed")]
     GroupDestroyed,
+    /// The relay refused our Transport Version and reported the range it
+    /// supports (ADR-0022). Outbox entries stay queued.
+    #[error("relay supports Transport Version {min}..={max}")]
+    RelayVersionUnsupported { min: u32, max: u32 },
 }
 
 impl From<CoreSessionError> for SessionError {
@@ -50,7 +54,33 @@ impl From<CoreSessionError> for SessionError {
             CoreSessionError::InvalidToken => SessionError::InvalidToken,
             CoreSessionError::MemberNotFound => SessionError::MemberNotFound,
             CoreSessionError::GroupDestroyed => SessionError::GroupDestroyed,
+            CoreSessionError::RelayVersionUnsupported { min, max } => {
+                SessionError::RelayVersionUnsupported { min, max }
+            }
         }
+    }
+}
+
+// ── Version info ──────────────────────────────────────────────────────────────
+
+/// Version triple reported by every TrueSeal SDK (ADR-0022, ADR-0030 §Reporting).
+/// `transport_version` and `end_to_end_version` come from the core constants —
+/// the single source of truth. `sdk_version` is this crate's package version.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TruesealInfo {
+    pub sdk_version: String,
+    pub transport_version: u32,
+    pub end_to_end_version: u32,
+}
+
+/// The version triple for this build. Package versions imply nothing about
+/// wire compatibility — the two protocol versions are the authority.
+#[uniffi::export]
+pub fn trueseal_info() -> TruesealInfo {
+    TruesealInfo {
+        sdk_version: env!("CARGO_PKG_VERSION").to_string(),
+        transport_version: crate::version::TRANSPORT_VERSION,
+        end_to_end_version: crate::version::END_TO_END_VERSION,
     }
 }
 
@@ -517,6 +547,18 @@ mod tests {
             kp2.public_key(),
             "different namespaces must generate independent identities"
         );
+    }
+
+    /// trueseal_info() reports the core version constants — the single source
+    /// of truth — plus the crate version (ADR-0022 Reporting).
+    #[test]
+    fn trueseal_info_reports_the_protocol_versions() {
+        let info = trueseal_info();
+        assert_eq!(info.transport_version, crate::TRANSPORT_VERSION);
+        assert_eq!(info.end_to_end_version, crate::END_TO_END_VERSION);
+        assert_eq!(info.transport_version, 1);
+        assert_eq!(info.end_to_end_version, 1);
+        assert!(!info.sdk_version.is_empty());
     }
 
     /// Same namespace returns the same identity on second open.

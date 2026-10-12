@@ -1,8 +1,9 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::version::testutil::xx_accept_after_prefix;
 use ed25519_dalek::SigningKey;
-use trueseal_noise::{keypair::Keypair, session_xx::accept};
+use trueseal_noise::keypair::Keypair;
 
 use crate::device::DeviceKeypair;
 use crate::message::Message;
@@ -22,11 +23,11 @@ fn push_sync_no_manifest_returns_not_in_group() {
     {
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = accept(pipe_relay, relay_kp2);
+            let _ = xx_accept_after_prefix(pipe_relay, relay_kp2);
             while let Ok(p) = nk_rx.recv() {
                 let kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(p, kp2) {
                         if sess.receive().is_ok() {
                             let _ =
                                 sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
@@ -182,7 +183,7 @@ fn push_sync_consumes_one_sequence_per_call() {
     {
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let s = accept(pipe_relay, relay_kp2).unwrap();
+            let s = xx_accept_after_prefix(pipe_relay, relay_kp2).unwrap();
             // drain nk connections (pushes go offline in this test but drain for safety)
             let _ = nk_rx;
             loop {

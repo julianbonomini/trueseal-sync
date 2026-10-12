@@ -1,10 +1,9 @@
 use std::io;
 use std::sync::{mpsc, Arc, Mutex};
 
-use trueseal_noise::{
-    keypair::{generate_keypair, Keypair},
-    session_xx::accept,
-};
+use trueseal_noise::keypair::{generate_keypair, Keypair};
+
+use crate::version::testutil::xx_accept_after_prefix;
 
 use crate::keys::NoisePublicKey;
 use crate::relay::{frame, parse, MsgType};
@@ -154,8 +153,8 @@ pub(super) fn spawn_routing_relay(
     let relay_priv = relay_kp.private();
     let relay_pub_key = relay_kp.public_key;
     std::thread::spawn(move || {
-        let sess_a = accept(pipe_a, relay_kp_a).unwrap();
-        let sess_b = accept(pipe_b, relay_kp_b).unwrap();
+        let sess_a = xx_accept_after_prefix(pipe_a, relay_kp_a).unwrap();
+        let sess_b = xx_accept_after_prefix(pipe_b, relay_kp_b).unwrap();
         let (_src, dst) = if a_is_src {
             (Arc::new(sess_a), Arc::new(sess_b))
         } else {
@@ -168,7 +167,8 @@ pub(super) fn spawn_routing_relay(
                 let kp = Keypair::new(relay_priv, relay_pub_key);
                 let dst2 = dst_nk.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp)
+                    {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
@@ -207,7 +207,7 @@ pub(super) fn spawn_single_relay(
         while let Ok(nk_pipe) = nk_rx.recv() {
             let kp = Keypair::new(relay_priv, relay_pub_key);
             std::thread::spawn(move || {
-                if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
+                if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp) {
                     if sess.receive().is_ok() {
                         let _ = sess.send(&frame(MsgType::Ack, &[]));
                     }
@@ -216,7 +216,7 @@ pub(super) fn spawn_single_relay(
         }
     });
     std::thread::spawn(move || {
-        let sess = match accept(pipe, kp) {
+        let sess = match xx_accept_after_prefix(pipe, kp) {
             Ok(s) => s,
             Err(_) => return,
         };
@@ -235,8 +235,8 @@ pub(super) fn spawn_bidirectional_relay(
     let relay_priv = relay_kp.private();
     let relay_pub_key = relay_kp.public_key;
     std::thread::spawn(move || {
-        let sess_a = accept(pipe_a, relay_kp_a).unwrap();
-        let sess_b = accept(pipe_b, relay_kp_b).unwrap();
+        let sess_a = xx_accept_after_prefix(pipe_a, relay_kp_a).unwrap();
+        let sess_b = xx_accept_after_prefix(pipe_b, relay_kp_b).unwrap();
         // Build routing table: noise_pub → deliver channel
         let a_noise = sess_a.remote_public_key();
         let b_noise = sess_b.remote_public_key();
@@ -251,7 +251,8 @@ pub(super) fn spawn_bidirectional_relay(
                 let sa2 = sa_nk.clone();
                 let sb2 = sb_nk.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp)
+                    {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() < 32 {
@@ -299,11 +300,11 @@ pub(super) fn spawn_bidirectional_relay_parallel(
     let (tx_b, rx_b) = std_mpsc::channel();
 
     std::thread::spawn(move || {
-        let sess = accept(pipe_a, relay_kp_a).unwrap();
+        let sess = xx_accept_after_prefix(pipe_a, relay_kp_a).unwrap();
         tx_a.send(sess).unwrap();
     });
     std::thread::spawn(move || {
-        let sess = accept(pipe_b, relay_kp_b).unwrap();
+        let sess = xx_accept_after_prefix(pipe_b, relay_kp_b).unwrap();
         tx_b.send(sess).unwrap();
     });
 
@@ -323,7 +324,8 @@ pub(super) fn spawn_bidirectional_relay_parallel(
                 let sa2 = sa_nk.clone();
                 let sb2 = sb_nk.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp)
+                    {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() < 32 {
@@ -390,9 +392,9 @@ pub(super) fn spawn_tripartite_relay(
     let relay_priv = relay_kp.private();
     let relay_pub_key = relay_kp.public_key;
     std::thread::spawn(move || {
-        let sess_a = Arc::new(accept(pipe_a, relay_kp_a).unwrap());
-        let sess_b = Arc::new(accept(pipe_b, relay_kp_b).unwrap());
-        let sess_c = Arc::new(accept(pipe_c, relay_kp_c).unwrap());
+        let sess_a = Arc::new(xx_accept_after_prefix(pipe_a, relay_kp_a).unwrap());
+        let sess_b = Arc::new(xx_accept_after_prefix(pipe_b, relay_kp_b).unwrap());
+        let sess_c = Arc::new(xx_accept_after_prefix(pipe_c, relay_kp_c).unwrap());
 
         // Three channels — one per session destination.
         let (tx_a, rx_a) = mpsc::channel::<Vec<u8>>();
@@ -433,7 +435,8 @@ pub(super) fn spawn_tripartite_relay(
                 let tb = txb2.clone();
                 let tc = txc2.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp)
+                    {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() < 32 {
@@ -481,10 +484,10 @@ pub(super) fn spawn_quadpartite_relay(
     let relay_priv = relay_kp.private();
     let relay_pub_key = relay_kp.public_key;
     std::thread::spawn(move || {
-        let sess_a = Arc::new(accept(pipe_a, relay_kp_a).unwrap());
-        let sess_b = Arc::new(accept(pipe_b, relay_kp_b).unwrap());
-        let sess_c = Arc::new(accept(pipe_c, relay_kp_c).unwrap());
-        let sess_d = Arc::new(accept(pipe_d, relay_kp_d).unwrap());
+        let sess_a = Arc::new(xx_accept_after_prefix(pipe_a, relay_kp_a).unwrap());
+        let sess_b = Arc::new(xx_accept_after_prefix(pipe_b, relay_kp_b).unwrap());
+        let sess_c = Arc::new(xx_accept_after_prefix(pipe_c, relay_kp_c).unwrap());
+        let sess_d = Arc::new(xx_accept_after_prefix(pipe_d, relay_kp_d).unwrap());
 
         let (tx_a, rx_a) = mpsc::channel::<Vec<u8>>();
         let (tx_b, rx_b) = mpsc::channel::<Vec<u8>>();
@@ -522,7 +525,8 @@ pub(super) fn spawn_quadpartite_relay(
                 let tc = txc2.clone();
                 let td = txd2.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp)
+                    {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() < 32 {

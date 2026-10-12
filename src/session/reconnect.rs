@@ -82,6 +82,17 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
         let noise_kp = NoiseKeypair::new(noise_priv, noise_pub_key);
         let new_client = match RelayClient::connect(transport, relay_pub, noise_kp) {
             Ok(c) => c,
+            Err(crate::relay::RelayError::RelayVersionUnsupported { min, max }) => {
+                // The relay refuses our Transport Version (ADR-0022). Keep
+                // retrying — the relay may be upgraded — and leave every
+                // outbox entry queued.
+                log::warn!(
+                    "relay supports Transport Version {min}..={max}, \
+                     this build speaks {}; outbox stays queued",
+                    crate::version::TRANSPORT_VERSION
+                );
+                continue;
+            }
             Err(_) => continue,
         };
 

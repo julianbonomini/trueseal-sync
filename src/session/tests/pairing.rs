@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use trueseal_noise::{keypair::Keypair, session_xx::accept};
+use crate::version::testutil::xx_accept_after_prefix;
+use trueseal_noise::keypair::Keypair;
 
 use crate::device::DeviceKeypair;
 use crate::keys::NoisePublicKey;
@@ -68,7 +69,7 @@ fn accept_pair_outside_window_is_noop() {
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
     std::thread::spawn(move || {
-        let _ = accept(pipe_relay, relay_kp2);
+        let _ = xx_accept_after_prefix(pipe_relay, relay_kp2);
     });
 
     let device = DeviceKeypair::generate();
@@ -100,7 +101,7 @@ fn accept_pair_window_stays_open_until_cancelled() {
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
     std::thread::spawn(move || {
-        let _ = accept(pipe_relay, relay_kp2);
+        let _ = xx_accept_after_prefix(pipe_relay, relay_kp2);
     });
 
     let device = DeviceKeypair::generate();
@@ -133,7 +134,7 @@ fn accept_pair_returns_bool_reflecting_window_state() {
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
     std::thread::spawn(move || {
-        let _ = accept(pipe_relay, relay_kp2);
+        let _ = xx_accept_after_prefix(pipe_relay, relay_kp2);
     });
 
     let device = DeviceKeypair::generate();
@@ -182,7 +183,7 @@ fn no_callback_fired_when_window_closed() {
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
     std::thread::spawn(move || {
-        let _ = accept(pipe_relay, relay_kp2);
+        let _ = xx_accept_after_prefix(pipe_relay, relay_kp2);
     });
 
     let device = DeviceKeypair::generate();
@@ -215,7 +216,7 @@ fn cancel_pairing_clears_pending_members() {
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
     std::thread::spawn(move || {
-        let _ = accept(pipe_relay, relay_kp2);
+        let _ = xx_accept_after_prefix(pipe_relay, relay_kp2);
     });
 
     let device = DeviceKeypair::generate();

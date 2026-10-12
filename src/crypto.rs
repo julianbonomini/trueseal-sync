@@ -8,6 +8,7 @@ use thiserror::Error;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::keys::NoisePublicKey;
+use crate::version;
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -37,20 +38,29 @@ fn encrypt_raw(recipient_pub: NoisePublicKey, plaintext: &[u8]) -> Vec<u8> {
     // DH: eph_priv * recipient_pub
     let shared = eph_secret.diffie_hellman(&PublicKey::from(recipient_pub.0));
 
-    // Derive symmetric key via HKDF-SHA256
+    // Derive symmetric key via HKDF-SHA256. The info string carries the
+    // End-to-End Version (ADR-0022), so a blob sealed under one version can
+    // never be opened under another.
     let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
     let mut key = [0u8; 32];
-    hk.expand(b"trueseal-sync addressed encryption v0", &mut key)
+    hk.expand(&version::addressed_encryption_hkdf_info(), &mut key)
         .expect("HKDF expand failed");
 
     // Encrypt with ChaCha20-Poly1305. Zero nonce is safe here because the
     // symmetric key is derived from an ephemeral DH — it is single-use by
     // construction. Reusing the nonce would only be a problem if the key
     // were reused, which it never is.
+    // The End-to-End Version is also bound as AEAD associated data.
     let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("valid key length");
     let nonce = Nonce::default();
     let ct = cipher
-        .encrypt(&nonce, plaintext)
+        .encrypt(
+            &nonce,
+            chacha20poly1305::aead::Payload {
+                msg: plaintext,
+                aad: &version::addressed_encryption_aad(),
+            },
+        )
         .expect("encryption failed");
 
     // Output: ephemeral_pub || nonce || ciphertext+tag
@@ -92,17 +102,23 @@ fn decrypt_raw(my_priv: [u8; 32], ciphertext: &[u8]) -> Result<Vec<u8>, CryptoEr
     let secret = StaticSecret::from(my_priv);
     let shared = secret.diffie_hellman(&PublicKey::from(eph_pub_bytes));
 
-    // Derive same symmetric key
+    // Derive same symmetric key (version-bound HKDF info, ADR-0022).
     let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
     let mut key = [0u8; 32];
-    hk.expand(b"trueseal-sync addressed encryption v0", &mut key)
+    hk.expand(&version::addressed_encryption_hkdf_info(), &mut key)
         .expect("HKDF expand failed");
 
-    // Decrypt
+    // Decrypt (version-bound AAD, ADR-0022).
     let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("valid key length");
     let nonce = Nonce::from(nonce_bytes);
     cipher
-        .decrypt(&nonce, ct)
+        .decrypt(
+            &nonce,
+            chacha20poly1305::aead::Payload {
+                msg: ct,
+                aad: &version::addressed_encryption_aad(),
+            },
+        )
         .map_err(|_| CryptoError::DecryptionFailed)
 }
 

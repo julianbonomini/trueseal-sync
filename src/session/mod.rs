@@ -55,6 +55,21 @@ pub enum SessionError {
     MemberNotFound,
     #[error("group has been destroyed")]
     GroupDestroyed,
+    /// The relay refused our Transport Version (ADR-0022). Outbox entries
+    /// stay queued; the relay (or this client) must be upgraded.
+    #[error("relay supports Transport Version {min}..={max}")]
+    RelayVersionUnsupported { min: u32, max: u32 },
+}
+
+impl From<crate::relay::RelayError> for SessionError {
+    fn from(e: crate::relay::RelayError) -> Self {
+        match e {
+            crate::relay::RelayError::RelayVersionUnsupported { min, max } => {
+                SessionError::RelayVersionUnsupported { min, max }
+            }
+            other => SessionError::ConnectionFailed(other.to_string()),
+        }
+    }
 }
 
 // ── Internal types ────────────────────────────────────────────────────────────
@@ -454,8 +469,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let on_mj_cb_ret = on_mj_cb.clone();
         let on_ml_cb_ret = on_ml_cb.clone();
 
-        let client = RelayClient::connect(transport, relay_pub, noise_kp)
-            .map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
+        let client = RelayClient::connect(transport, relay_pub, noise_kp)?;
 
         client.subscribe(build_subscribe_handler(
             keys_cb,

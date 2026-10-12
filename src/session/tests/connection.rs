@@ -19,7 +19,7 @@ fn connection_changed_fires_true_on_initial_connect() {
         let relay_kp2 =
             trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = trueseal_noise::session_xx::accept(pipe_relay, relay_kp2);
+            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2);
         });
     }
 
@@ -74,7 +74,7 @@ fn connection_changed_fires_sequence_on_disconnect_and_reconnect() {
         let relay_kp2 =
             trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = trueseal_noise::session_xx::accept(pipe1_relay, relay_kp2);
+            let _ = crate::version::testutil::xx_accept_after_prefix(pipe1_relay, relay_kp2);
         });
     }
 
@@ -84,7 +84,7 @@ fn connection_changed_fires_sequence_on_disconnect_and_reconnect() {
         let relay_kp3 =
             trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = trueseal_noise::session_xx::accept(pipe2_relay, relay_kp3);
+            let _ = crate::version::testutil::xx_accept_after_prefix(pipe2_relay, relay_kp3);
         });
     }
 

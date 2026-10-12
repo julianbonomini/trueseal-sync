@@ -50,9 +50,11 @@ pub enum ManifestError {
 // ── Signing message ───────────────────────────────────────────────────────────
 
 /// Canonical bytes that are signed/verified for a manifest.
-/// group_id(32) || version(8 LE) || members_encoded
+/// domain || group_id(32) || version(8 LE) || members_encoded
+/// The domain separator carries the End-to-End Version (ADR-0022).
 fn signing_message(group_id: &[u8; 32], version: u64, members: &[ManifestMember]) -> Vec<u8> {
-    let mut msg = Vec::new();
+    // `crate::` — the `version` parameter shadows the module name here.
+    let mut msg = crate::version::manifest_signing_domain();
     msg.extend_from_slice(group_id);
     msg.extend_from_slice(&version.to_le_bytes());
     for m in members {
