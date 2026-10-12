@@ -4,7 +4,27 @@ use thiserror::Error;
 
 use crate::device::DeviceKeypair;
 use crate::manifest::GroupManifest;
-use crate::operation_log::{LogEntry, OperationLog};
+use crate::operation_log::{now_secs, LogEntry, OperationLog, OutboxKind, DEDUP_RETENTION_SECS};
+
+/// Outbox `kind` column values. `Sync` is 0 so rows written by builds from
+/// before the column existed (all application `Sync` bodies) migrate to the
+/// right kind via the column default.
+const KIND_SYNC: i64 = 0;
+const KIND_CONTROL: i64 = 1;
+
+fn kind_to_db(kind: OutboxKind) -> i64 {
+    match kind {
+        OutboxKind::Sync => KIND_SYNC,
+        OutboxKind::Control => KIND_CONTROL,
+    }
+}
+
+fn kind_from_db(v: i64) -> OutboxKind {
+    match v {
+        KIND_CONTROL => OutboxKind::Control,
+        _ => OutboxKind::Sync,
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -50,10 +70,48 @@ impl Store {
                  sequence   INTEGER NOT NULL,
                  blob       BLOB    NOT NULL,
                  delivered  INTEGER NOT NULL DEFAULT 0,
+                 kind       INTEGER NOT NULL DEFAULT 0,
+                 created_at INTEGER NOT NULL DEFAULT 0,
                  UNIQUE(object_id, sequence) ON CONFLICT IGNORE
+             );
+             -- Handled Message IDs kept for the dedup retention window
+             -- (ADR-0026). The library drops re-deliveries itself.
+             CREATE TABLE IF NOT EXISTS handled_messages (
+                 message_id TEXT PRIMARY KEY,
+                 handled_at INTEGER NOT NULL
+             );
+             -- Singleton metadata. `seq_high_water`: the highest sequence
+             -- ever consumed — survives deletion of delivered outbox rows,
+             -- so a restart never re-uses a sequence number (ADR-0026).
+             CREATE TABLE IF NOT EXISTS meta (
+                 key   TEXT PRIMARY KEY,
+                 value INTEGER NOT NULL
              );
              COMMIT;",
         )?;
+
+        // Dev-preview schema drift, handled without migration machinery
+        // (Store Versions and chained migrations are SYNC-13 scope): stores
+        // written by builds from before SYNC-5 have an outbox table without
+        // `kind`/`created_at`. Add the columns; rows they contain are all
+        // application `Sync` bodies, and their real queue time is unknown,
+        // so they get a fresh 30-day lease stamped at this open rather than
+        // an instant expiry.
+        let has_kind: bool = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('outbox') WHERE name = 'kind'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !has_kind {
+            conn.execute_batch(
+                "ALTER TABLE outbox ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE outbox ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;",
+            )?;
+            conn.execute(
+                "UPDATE outbox SET created_at = ?1 WHERE created_at = 0",
+                rusqlite::params![now_secs() as i64],
+            )?;
+        }
 
         Ok(Self { conn })
     }
@@ -61,12 +119,17 @@ impl Store {
     /// Wipe all data from all tables.
     ///
     /// Leaves the schema intact. Used by destroyGroup() and tests.
+    /// Clears the dedup table and sequence high-water mark too: after a
+    /// Destroy Group every device starts over with a fresh identity, so no
+    /// Message ID or sequence from the old group may carry over.
     pub fn wipe(&self) -> Result<(), StoreError> {
         self.conn.execute_batch(
             "BEGIN;
              DELETE FROM identity;
              DELETE FROM manifest;
              DELETE FROM outbox;
+             DELETE FROM handled_messages;
+             DELETE FROM meta;
              COMMIT;",
         )?;
         Ok(())
@@ -216,14 +279,23 @@ impl PersistentLog {
 }
 
 impl OperationLog for PersistentLog {
-    fn append(&mut self, object_id: &[u8; 32], sequence: u64, blob: Vec<u8>) {
+    fn append_entry(&mut self, entry: LogEntry) {
         // UNIQUE(object_id, sequence) ON CONFLICT IGNORE — duplicate is a no-op.
         if let Err(e) = self.store.conn.execute(
-            "INSERT INTO outbox (object_id, sequence, blob, delivered)
-             VALUES (?1, ?2, ?3, 0)",
-            rusqlite::params![object_id.as_slice(), sequence as i64, blob.as_slice()],
+            "INSERT INTO outbox (object_id, sequence, blob, delivered, kind, created_at)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+            rusqlite::params![
+                entry.object_id.as_slice(),
+                entry.sequence as i64,
+                entry.blob.as_slice(),
+                kind_to_db(entry.kind),
+                entry.created_at as i64,
+            ],
         ) {
-            warn!("[trueseal-sync] outbox append failed (seq={sequence}): {e}");
+            warn!(
+                "[trueseal-sync] outbox append failed (seq={}): {e}",
+                entry.sequence
+            );
         }
     }
 
@@ -251,7 +323,7 @@ impl OperationLog for PersistentLog {
             .store
             .conn
             .prepare(
-                "SELECT object_id, sequence, blob FROM outbox
+                "SELECT object_id, sequence, blob, kind, created_at FROM outbox
                  WHERE delivered = 0 ORDER BY sequence ASC",
             )
             .expect("prepare undelivered");
@@ -260,15 +332,19 @@ impl OperationLog for PersistentLog {
                 let oid: Vec<u8> = row.get(0)?;
                 let seq: i64 = row.get(1)?;
                 let blob: Vec<u8> = row.get(2)?;
-                Ok((oid, seq as u64, blob))
+                let kind: i64 = row.get(3)?;
+                let created_at: i64 = row.get(4)?;
+                Ok((oid, seq as u64, blob, kind, created_at as u64))
             })
             .expect("query undelivered");
         rows.filter_map(|r| r.ok())
-            .filter_map(|(oid, sequence, blob)| {
+            .filter_map(|(oid, sequence, blob, kind, created_at)| {
                 let object_id: [u8; 32] = oid.try_into().ok()?;
                 Some(LogEntry {
                     object_id,
                     sequence,
+                    kind: kind_from_db(kind),
+                    created_at,
                     blob,
                 })
             })
@@ -280,7 +356,7 @@ impl OperationLog for PersistentLog {
             .store
             .conn
             .prepare(
-                "SELECT sequence, blob FROM outbox
+                "SELECT sequence, blob, kind, created_at FROM outbox
                  WHERE object_id = ?1 AND sequence >= ?2
                  ORDER BY sequence ASC",
             )
@@ -290,20 +366,25 @@ impl OperationLog for PersistentLog {
             .query_map(rusqlite::params![oid_slice, sequence as i64], |row| {
                 let seq: i64 = row.get(0)?;
                 let blob: Vec<u8> = row.get(1)?;
-                Ok((seq as u64, blob))
+                let kind: i64 = row.get(2)?;
+                let created_at: i64 = row.get(3)?;
+                Ok((seq as u64, blob, kind, created_at as u64))
             })
             .expect("query entries_from");
         rows.filter_map(|r| r.ok())
-            .map(|(seq, blob)| LogEntry {
+            .map(|(seq, blob, kind, created_at)| LogEntry {
                 object_id: *object_id,
                 sequence: seq,
+                kind: kind_from_db(kind),
+                created_at,
                 blob,
             })
             .collect()
     }
 
     fn max_sequence(&self) -> Option<u64> {
-        self.store
+        let entries_max: Option<u64> = self
+            .store
             .conn
             .query_row("SELECT MAX(sequence) FROM outbox", [], |row| {
                 let v: Option<i64> = row.get(0)?;
@@ -311,7 +392,57 @@ impl OperationLog for PersistentLog {
             })
             .ok()
             .flatten()
-            .map(|v| v as u64)
+            .map(|v| v as u64);
+        let high_water: Option<u64> = self
+            .store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'seq_high_water'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .map(|v| v as u64);
+        entries_max.into_iter().chain(high_water).max()
+    }
+
+    fn record_sequence(&mut self, sequence: u64) {
+        // Monotonic: the high-water mark never regresses.
+        if let Err(e) = self.store.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('seq_high_water', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = MAX(value, excluded.value)",
+            rusqlite::params![sequence as i64],
+        ) {
+            warn!("[trueseal-sync] record_sequence failed (seq={sequence}): {e}");
+        }
+    }
+
+    fn is_handled(&self, message_id: &str) -> bool {
+        self.store
+            .conn
+            .query_row(
+                "SELECT 1 FROM handled_messages WHERE message_id = ?1",
+                rusqlite::params![message_id],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
+    fn record_handled(&mut self, message_id: &str, now: u64) {
+        if let Err(e) = self.store.conn.execute(
+            "INSERT INTO handled_messages (message_id, handled_at) VALUES (?1, ?2)
+             ON CONFLICT(message_id) DO UPDATE SET handled_at = excluded.handled_at",
+            rusqlite::params![message_id, now as i64],
+        ) {
+            warn!("[trueseal-sync] record_handled failed: {e}");
+        }
+        let cutoff = now.saturating_sub(DEDUP_RETENTION_SECS);
+        if let Err(e) = self.store.conn.execute(
+            "DELETE FROM handled_messages WHERE handled_at < ?1",
+            rusqlite::params![cutoff as i64],
+        ) {
+            warn!("[trueseal-sync] dedup prune failed: {e}");
+        }
     }
 }
 
@@ -626,6 +757,131 @@ mod tests {
         let dir = tmp_dir();
         let s = Store::open(dir.path(), "ns").expect("open");
         assert!(s.load_group_manifest().expect("load").is_none());
+    }
+
+    /// The sequence high-water mark survives deletion of delivered rows and
+    /// a store reopen — a restarted device must never re-use a sequence
+    /// number (ADR-0026): the recipient's dedup table would drop the new
+    /// message as a duplicate of the old one.
+    #[test]
+    fn persistent_log_high_water_survives_deletion_and_reopen() {
+        let dir = tmp_dir();
+        {
+            let s = Store::open(dir.path(), "ns").expect("open");
+            let mut log = PersistentLog::new(s);
+            log.append(&oid(1), 0, b"a".to_vec());
+            log.record_sequence(0);
+            log.remove(&oid(1), 0); // delivered rows are deleted
+            assert_eq!(log.max_sequence(), Some(0));
+        }
+        let s2 = Store::open(dir.path(), "ns").expect("reopen");
+        let log2 = PersistentLog::new(s2);
+        assert_eq!(log2.max_sequence(), Some(0), "high-water mark persists");
+        assert!(log2.undelivered_entries().is_empty());
+    }
+
+    /// Kind and created_at round-trip through SQLite; a Sync entry staged
+    /// with an old timestamp comes back old (the 30-day expiry input).
+    #[test]
+    fn persistent_log_kind_and_created_at_round_trip() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.append_control(&oid(1), 0, b"\x04manifest".to_vec());
+        log.append_entry(LogEntry {
+            object_id: oid(1),
+            sequence: 1,
+            kind: OutboxKind::Sync,
+            created_at: 1_000_000,
+            blob: b"old".to_vec(),
+        });
+        let entries = log.undelivered_entries();
+        assert_eq!(entries[0].kind, OutboxKind::Control);
+        assert!(entries[0].created_at > 1_000_000);
+        assert_eq!(entries[1].kind, OutboxKind::Sync);
+        assert_eq!(entries[1].created_at, 1_000_000);
+    }
+
+    /// Handled Message IDs persist across a reopen and prune past the
+    /// 60-day retention window (ADR-0026).
+    #[test]
+    fn handled_messages_persist_and_prune() {
+        let dir = tmp_dir();
+        {
+            let s = Store::open(dir.path(), "ns").expect("open");
+            let mut log = PersistentLog::new(s);
+            log.record_handled("tsm1_a", 1_000_000);
+            assert!(log.is_handled("tsm1_a"));
+            assert!(!log.is_handled("tsm1_b"));
+        }
+        let s2 = Store::open(dir.path(), "ns").expect("reopen");
+        let mut log2 = PersistentLog::new(s2);
+        assert!(log2.is_handled("tsm1_a"), "dedup records survive restart");
+        // Recording past the retention window prunes the old record.
+        log2.record_handled("tsm1_b", 1_000_000 + DEDUP_RETENTION_SECS + 1);
+        assert!(log2.is_handled("tsm1_b"));
+        assert!(!log2.is_handled("tsm1_a"));
+    }
+
+    /// A store written before SYNC-5 (outbox without kind/created_at, no
+    /// handled_messages/meta tables) opens cleanly: the columns are added,
+    /// legacy rows become Sync entries with a fresh lease, and the dedup and
+    /// meta tables exist. Store Versions and chained migrations are SYNC-13
+    /// scope; this is the dev-preview drift bridge.
+    #[test]
+    fn legacy_outbox_schema_is_upgraded_on_open() {
+        let dir = tmp_dir();
+        let path = dir.path().join("trueseal_ns.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("create legacy db");
+            conn.execute_batch(
+                "CREATE TABLE outbox (
+                     object_id  BLOB    NOT NULL,
+                     sequence   INTEGER NOT NULL,
+                     blob       BLOB    NOT NULL,
+                     delivered  INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE(object_id, sequence) ON CONFLICT IGNORE
+                 );
+                 INSERT INTO outbox (object_id, sequence, blob, delivered)
+                 VALUES (X'0101010101010101010101010101010101010101010101010101010101010101', 0, X'AABB', 0);",
+            )
+            .expect("legacy schema");
+        }
+        let before = now_secs();
+        let s = Store::open(dir.path(), "ns").expect("open upgrades schema");
+        let log = PersistentLog::new(s);
+        let entries = log.undelivered_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].kind, OutboxKind::Sync, "legacy rows are Sync");
+        assert_eq!(entries[0].blob, vec![0xAA, 0xBB]);
+        assert!(
+            entries[0].created_at >= before,
+            "legacy rows get a fresh lease, not an instant expiry"
+        );
+        // Dedup and meta tables exist and work.
+        let mut log = log;
+        log.record_handled("tsm1_x", now_secs());
+        assert!(log.is_handled("tsm1_x"));
+        log.record_sequence(5);
+        assert_eq!(log.max_sequence(), Some(5));
+    }
+
+    /// wipe() clears the dedup table and high-water mark too — after Destroy
+    /// Group the device starts over with a fresh identity (ADR-0029).
+    #[test]
+    fn wipe_clears_dedup_and_high_water() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.record_handled("tsm1_a", now_secs());
+        log.record_sequence(9);
+        drop(log);
+        let s2 = Store::open(dir.path(), "ns").expect("open2");
+        s2.wipe().expect("wipe");
+        let s3 = Store::open(dir.path(), "ns").expect("open3");
+        let log3 = PersistentLog::new(s3);
+        assert!(!log3.is_handled("tsm1_a"));
+        assert_eq!(log3.max_sequence(), None);
     }
 
     /// max_sequence returns None on an empty log, the highest sequence otherwise.

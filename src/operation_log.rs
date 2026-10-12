@@ -1,11 +1,45 @@
 use std::collections::BTreeMap;
 
+/// How long a handled Message ID is kept for dedup: 60 days (ADR-0026).
+/// A message can wait up to 30 days in the sender's outbox and then up to
+/// 30 days on the Relay, so a copy always arrives within 60 days of
+/// `send()`. (ADR-0034 §2 refines this to "the later of handling time and
+/// the Sender Timestamp" — the sealed Sender Timestamp lands with SYNC-12;
+/// until then the retention runs from the handling time.)
+pub const DEDUP_RETENTION_SECS: u64 = 60 * 24 * 60 * 60;
+
+/// Current time in whole Unix seconds. Outbox timestamps are coarse — the
+/// 30-day expiry and 60-day dedup retention never need sub-second precision.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// What an outbox entry carries (ADR-0026).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutboxKind {
+    /// An application `Sync` body (raw bytes, no type tag). Expires 30 days
+    /// after `send()` — the Relay TTL cap is 30 days, so an older entry
+    /// could never be delivered inside the Replay Window.
+    Sync,
+    /// A control-plane message (Pair, Group Manifest, Revoke): the blob is
+    /// the full `Message::encode()`. Never expires — a Leave or Destroy
+    /// Group queued offline for months must still reach every peer
+    /// (ADR-0034 §2).
+    Control,
+}
+
 /// A named entry returned from the operation log.
 /// Replaces positional tuple returns in the trait — callers use field names instead
 /// of destructuring by position, which is both more readable and refactor-safe.
 pub struct LogEntry {
     pub object_id: [u8; 32],
     pub sequence: u64,
+    pub kind: OutboxKind,
+    /// Unix seconds when the entry was queued (`send()` time for `Sync`).
+    pub created_at: u64,
     pub blob: Vec<u8>,
 }
 
@@ -29,7 +63,30 @@ pub struct LogEntry {
 /// - v0 uses an in-memory backend (`MemLog`).
 ///   A `SqliteLog` (persisted) is the obvious next backend.
 pub trait OperationLog: Send {
-    fn append(&mut self, object_id: &[u8; 32], sequence: u64, blob: Vec<u8>);
+    /// Append a fully-described entry. Implementations must stay idempotent
+    /// for the same (object_id, sequence) pair: first-write wins.
+    fn append_entry(&mut self, entry: LogEntry);
+    /// Queue an application `Sync` body, stamped now.
+    fn append(&mut self, object_id: &[u8; 32], sequence: u64, blob: Vec<u8>) {
+        self.append_entry(LogEntry {
+            object_id: *object_id,
+            sequence,
+            kind: OutboxKind::Sync,
+            created_at: now_secs(),
+            blob,
+        });
+    }
+    /// Queue a control-plane message (its full `Message::encode()`),
+    /// stamped now. Control entries never expire (ADR-0026).
+    fn append_control(&mut self, object_id: &[u8; 32], sequence: u64, encoded_message: Vec<u8>) {
+        self.append_entry(LogEntry {
+            object_id: *object_id,
+            sequence,
+            kind: OutboxKind::Control,
+            created_at: now_secs(),
+            blob: encoded_message,
+        });
+    }
     fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64);
     /// Permanently delete one entry. Used to drop entries that can never be
     /// delivered (e.g. over the Protocol Size Limit, ADR-0025) — unlike
@@ -38,14 +95,31 @@ pub trait OperationLog: Send {
     /// Returns undelivered entries sorted by global sequence ascending.
     fn undelivered_entries(&self) -> Vec<LogEntry>;
     fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<LogEntry>;
-    /// Returns the highest sequence number ever stored across all objects,
-    /// or `None` if the log is empty. Used to restore the sequence counter
-    /// after a process restart so it never re-uses a sequence number.
+    /// Returns the highest sequence number ever consumed across all
+    /// objects, or `None` if the log is empty. Used to restore the sequence
+    /// counter after a process restart so it never re-uses a sequence
+    /// number. Delivered rows are deleted once the Relay accepts them
+    /// (ADR-0026), so implementations fold in the high-water mark recorded
+    /// by [`OperationLog::record_sequence`], not just surviving rows.
     fn max_sequence(&self) -> Option<u64>;
+    /// Record that `sequence` has been consumed. The high-water mark
+    /// survives deletion of the entry that used it, so a restart never
+    /// re-uses a sequence number after delivered rows are deleted (ADR-0026):
+    /// a re-used sequence would collide in the recipient's dedup table and
+    /// the new message would be silently dropped as a duplicate.
+    fn record_sequence(&mut self, sequence: u64);
+    /// Dedup table (ADR-0026 recipient step 3): has this Message ID already
+    /// been handled?
+    fn is_handled(&self, message_id: &str) -> bool;
+    /// Record a handled Message ID, stamped `now` (Unix seconds), and prune
+    /// records older than [`DEDUP_RETENTION_SECS`] relative to `now`.
+    fn record_handled(&mut self, message_id: &str, now: u64);
 }
 
 /// A single entry in the log.
 struct Entry {
+    kind: OutboxKind,
+    created_at: u64,
     blob: Vec<u8>,
     delivered: bool,
 }
@@ -54,12 +128,18 @@ struct Entry {
 /// Key: object_id bytes. Value: BTreeMap<sequence, Entry>.
 pub struct MemLog {
     inner: BTreeMap<[u8; 32], BTreeMap<u64, Entry>>,
+    /// Highest sequence ever consumed — survives deletion of delivered rows.
+    high_water: Option<u64>,
+    /// Handled Message IDs → handling time (Unix seconds). The dedup table.
+    handled: BTreeMap<String, u64>,
 }
 
 impl MemLog {
     pub fn new() -> Self {
         Self {
             inner: BTreeMap::new(),
+            high_water: None,
+            handled: BTreeMap::new(),
         }
     }
 }
@@ -71,13 +151,15 @@ impl Default for MemLog {
 }
 
 impl OperationLog for MemLog {
-    fn append(&mut self, object_id: &[u8; 32], sequence: u64, blob: Vec<u8>) {
+    fn append_entry(&mut self, entry: LogEntry) {
         self.inner
-            .entry(*object_id)
+            .entry(entry.object_id)
             .or_default()
-            .entry(sequence)
+            .entry(entry.sequence)
             .or_insert(Entry {
-                blob,
+                kind: entry.kind,
+                created_at: entry.created_at,
+                blob: entry.blob,
                 delivered: false,
             });
     }
@@ -111,6 +193,8 @@ impl OperationLog for MemLog {
                     .map(move |(seq, entry)| LogEntry {
                         object_id: *object_id,
                         sequence: *seq,
+                        kind: entry.kind,
+                        created_at: entry.created_at,
                         blob: entry.blob.clone(),
                     })
             })
@@ -127,6 +211,8 @@ impl OperationLog for MemLog {
                 .map(|(seq, entry)| LogEntry {
                     object_id: *object_id,
                     sequence: *seq,
+                    kind: entry.kind,
+                    created_at: entry.created_at,
                     blob: entry.blob.clone(),
                 })
                 .collect(),
@@ -138,6 +224,23 @@ impl OperationLog for MemLog {
             .values()
             .flat_map(|map| map.keys().copied())
             .max()
+            .into_iter()
+            .chain(self.high_water)
+            .max()
+    }
+
+    fn record_sequence(&mut self, sequence: u64) {
+        self.high_water = Some(self.high_water.map_or(sequence, |hw| hw.max(sequence)));
+    }
+
+    fn is_handled(&self, message_id: &str) -> bool {
+        self.handled.contains_key(message_id)
+    }
+
+    fn record_handled(&mut self, message_id: &str, now: u64) {
+        self.handled.insert(message_id.to_string(), now);
+        let cutoff = now.saturating_sub(DEDUP_RETENTION_SECS);
+        self.handled.retain(|_, handled_at| *handled_at >= cutoff);
     }
 }
 
@@ -302,6 +405,78 @@ mod tests {
         let mut log = MemLog::new();
         log.mark_delivered(&oid(99), 42);
         assert!(log.undelivered_entries().is_empty());
+    }
+
+    /// The high-water mark survives deletion of the row that consumed the
+    /// sequence — a restart must never re-use a sequence number after
+    /// delivered rows are deleted (ADR-0026); a re-used sequence would
+    /// collide in the recipient's dedup table and be dropped as a duplicate.
+    #[test]
+    fn max_sequence_survives_deletion_of_delivered_rows() {
+        let mut log = MemLog::new();
+        log.append(&oid(1), 0, b"a".to_vec());
+        log.record_sequence(0);
+        log.remove(&oid(1), 0); // delivered rows are deleted, not kept
+        assert_eq!(log.max_sequence(), Some(0));
+        assert!(log.undelivered_entries().is_empty());
+    }
+
+    /// record_sequence only ever moves the high-water mark up.
+    #[test]
+    fn record_sequence_never_regresses() {
+        let mut log = MemLog::new();
+        log.record_sequence(7);
+        log.record_sequence(3);
+        assert_eq!(log.max_sequence(), Some(7));
+    }
+
+    /// Control entries keep their kind and timestamp; Sync bodies appended
+    /// through the shorthand are Sync kind stamped ~now.
+    #[test]
+    fn append_control_marks_kind_and_timestamp() {
+        let mut log = MemLog::new();
+        let before = now_secs();
+        log.append_control(&oid(1), 0, b"\x04manifest".to_vec());
+        log.append(&oid(1), 1, b"raw body".to_vec());
+        let entries = log.entries_from(&oid(1), 0);
+        assert_eq!(entries[0].kind, OutboxKind::Control);
+        assert_eq!(entries[0].blob, b"\x04manifest");
+        assert!(entries[0].created_at >= before);
+        assert_eq!(entries[1].kind, OutboxKind::Sync);
+    }
+
+    /// A constructed entry with an explicit timestamp round-trips — this is
+    /// how tests stage old entries for the 30-day expiry rule.
+    #[test]
+    fn append_entry_preserves_explicit_created_at() {
+        let mut log = MemLog::new();
+        log.append_entry(LogEntry {
+            object_id: oid(1),
+            sequence: 0,
+            kind: OutboxKind::Sync,
+            created_at: 1_000_000,
+            blob: b"old".to_vec(),
+        });
+        let entries = log.undelivered_entries();
+        assert_eq!(entries[0].created_at, 1_000_000);
+    }
+
+    /// Dedup: a recorded Message ID is handled; records older than the
+    /// 60-day retention are pruned on the next record.
+    #[test]
+    fn handled_ids_are_recorded_and_pruned() {
+        let mut log = MemLog::new();
+        assert!(!log.is_handled("tsm1_x"));
+        // An old record at t=1000.
+        log.record_handled("tsm1_old", 1_000);
+        assert!(log.is_handled("tsm1_old"));
+        // Recording at t=1000+60d+1 prunes the old one.
+        log.record_handled("tsm1_new", 1_000 + DEDUP_RETENTION_SECS + 1);
+        assert!(log.is_handled("tsm1_new"));
+        assert!(
+            !log.is_handled("tsm1_old"),
+            "records older than the retention window are pruned"
+        );
     }
 
     /// max_sequence returns None on empty log, max across all objects otherwise.
