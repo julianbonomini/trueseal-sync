@@ -166,7 +166,11 @@ fn dropped_pipe_end_eofs_its_peer() {
     b.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"hello", "buffered data drains before EOF");
     let mut byte = [0u8; 1];
-    assert_eq!(b.read(&mut byte).unwrap(), 0, "peer must see EOF after drop");
+    assert_eq!(
+        b.read(&mut byte).unwrap(),
+        0,
+        "peer must see EOF after drop"
+    );
     assert_eq!(b.read(&mut byte).unwrap(), 0, "EOF persists");
 }
 
@@ -182,7 +186,11 @@ fn dropped_pipe_end_eofs_its_peer_reverse() {
     a.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"world");
     let mut byte = [0u8; 1];
-    assert_eq!(a.read(&mut byte).unwrap(), 0, "peer must see EOF after drop");
+    assert_eq!(
+        a.read(&mut byte).unwrap(),
+        0,
+        "peer must see EOF after drop"
+    );
 }
 
 // ── Routing relay helper ──────────────────────────────────────────────────────

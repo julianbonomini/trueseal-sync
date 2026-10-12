@@ -22,7 +22,8 @@ fn connection_changed_fires_true_on_initial_connect() {
             // Hold the session open like a real relay; dropping it right after
             // the handshake would EOF the client immediately (Drop on MemPipe
             // signals the peer).
-            if let Ok(sess) = crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2)
+            if let Ok(sess) =
+                crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2)
             {
                 while sess.receive().is_ok() {}
             }
