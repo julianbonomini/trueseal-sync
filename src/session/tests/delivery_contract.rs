@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use crate::device::DeviceKeypair;
 use crate::delivery_issue::DeliveryIssue;
+use crate::device::DeviceKeypair;
 use crate::envelope::{Envelope, SigningKeypair};
 use crate::keys::{NoisePublicKey, SigningPublicKey};
 use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
@@ -29,10 +29,7 @@ struct ScriptedRelay {
 }
 
 impl ScriptedRelay {
-    fn spawn(
-        pipe: MemPipe,
-        relay_kp: &trueseal_noise::keypair::Keypair,
-    ) -> Self {
+    fn spawn(pipe: MemPipe, relay_kp: &trueseal_noise::keypair::Keypair) -> Self {
         let client_frames = Arc::new(Mutex::new(Vec::<(u8, Vec<u8>)>::new()));
         let (deliver_tx, deliver_rx) = mpsc::channel::<(u64, Vec<u8>)>();
         let frames_clone = client_frames.clone();
@@ -75,8 +72,7 @@ impl ScriptedRelay {
         seq: u64,
     ) {
         let plaintext = msg.encode();
-        let payload =
-            crate::crypto::encrypt(recipient, sender.public_key_bytes(), &plaintext);
+        let payload = crate::crypto::encrypt(recipient, sender.public_key_bytes(), &plaintext);
         let env = Envelope::build(seq, vec![], recipient, sender, payload);
         self.deliver_raw(blob_id, env.encode());
     }
@@ -243,6 +239,9 @@ fn handler_failing_five_times_gives_up_and_blob_is_acked() {
         5,
         "exactly 5 handler attempts (ADR-0026)"
     );
+    // The issue fires inside the dispatch callback and the DeliverAck is
+    // sent the moment it returns — wait for it rather than racing it.
+    wait_for(|| relay.deliver_acks() == vec![9], Duration::from_secs(3));
     assert_eq!(
         relay.deliver_acks(),
         vec![9],
@@ -301,7 +300,10 @@ fn handler_succeeding_on_retry_is_not_reported_and_deduped() {
 
     // The Message ID is now recorded: a re-delivery is silent.
     relay.deliver(2, &msg, device_pub, &sender, 7);
-    wait_for(|| relay.deliver_acks() == vec![1, 2], Duration::from_secs(3));
+    wait_for(
+        || relay.deliver_acks() == vec![1, 2],
+        Duration::from_secs(3),
+    );
     assert_eq!(
         attempts.load(Ordering::SeqCst),
         3,
@@ -333,11 +335,8 @@ fn dedup_record_survives_restart_and_prevents_rehandling() {
         let handled: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
         let handled_cb = handled.clone();
         let store = Store::open(dir.path(), "ns").expect("store");
-        let device1 = DeviceKeypair::from_bytes(
-            device.noise.private(),
-            device.signing.to_bytes(),
-        )
-        .expect("keypair bytes");
+        let device1 = DeviceKeypair::from_bytes(device.noise.private(), device.signing.to_bytes())
+            .expect("keypair bytes");
         let _session = TruesealSession::<MemPipe>::connect_full(
             pipe_client,
             relay_pub(&relay_kp),
@@ -440,9 +439,7 @@ fn stale_manifest_replay_is_silent() {
     session.subscribe_delivery_issues(move |i| issues_cb.lock().unwrap().push(i));
     let joined: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(vec![]));
     let joined_cb = joined.clone();
-    session.set_on_member_joined(move |id, name| {
-        joined_cb.lock().unwrap().push((id, name))
-    });
+    session.set_on_member_joined(move |id, name| joined_cb.lock().unwrap().push((id, name)));
 
     // Replays: the CURRENT manifest again, and an OLDER one.
     for (blob_id, m) in [(1u64, v2), (2, v1)] {
@@ -600,11 +597,12 @@ fn member_request_arriving_before_registration_flushes_on_registration() {
 
     let events: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(vec![]));
     let events_cb = events.clone();
-    session.set_on_member_request(move |token, name| {
-        events_cb.lock().unwrap().push((token, name))
-    });
+    session.set_on_member_request(move |token, name| events_cb.lock().unwrap().push((token, name)));
 
-    wait_for(|| !events.lock().unwrap().is_empty(), Duration::from_secs(3));
+    wait_for(
+        || !events.lock().unwrap().is_empty(),
+        Duration::from_secs(3),
+    );
     let (token, _name) = events.lock().unwrap()[0].clone();
     assert!(
         session.accept_member(&token),

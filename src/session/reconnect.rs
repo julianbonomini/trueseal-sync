@@ -4,15 +4,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ed25519_dalek::SigningKey;
 use trueseal_noise::keypair::Keypair as NoiseKeypair;
 
-use crate::envelope::SigningKeypair;
 use crate::keys::NoisePublicKey;
 use crate::manifest::GroupManifest;
 use crate::message::Message;
 use crate::operation_log::OperationLog;
-use crate::relay::{build_push_blob, push_send, RelayClient};
+use crate::relay::RelayClient;
 
 use super::{EventSink, IssueSink, KeyState, PendingMember};
 
@@ -36,7 +34,6 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     on_member_left: Arc<Mutex<EventSink>>,
     issue_sink: Arc<Mutex<IssueSink>>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
-    push_factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
     on_connection_changed: Arc<dyn Fn(bool) + Send + Sync + 'static>,
 ) {
@@ -75,9 +72,9 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             Err(_) => continue,
         };
 
-        let (noise_priv, noise_pub_key, signing_priv) = {
+        let (noise_priv, noise_pub_key) = {
             let ks = keys.lock().unwrap_or_else(|e| e.into_inner());
-            (ks.noise_priv, ks.noise_pub_key, ks.signing_priv)
+            (ks.noise_priv, ks.noise_pub_key)
         };
 
         let noise_kp = NoiseKeypair::new(noise_priv, noise_pub_key);
@@ -134,29 +131,8 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
         *client.lock().unwrap_or_else(|e| e.into_inner()) = new_client;
         backoff = Duration::from_secs(1);
 
-        // Replay undelivered outbox in ascending sequence order.
-        let signing = SigningKeypair::from_signing_key(SigningKey::from_bytes(&signing_priv));
-        let relay_pub_bytes = relay_pub.0;
-        let entries = op_log
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .undelivered_entries();
-        for entry in entries {
-            let oid = entry.object_id;
-            let recipient_pub = NoisePublicKey(oid);
-            let msg = crate::message::Message::Sync { body: entry.blob };
-            let result = build_push_blob(&msg, recipient_pub, entry.sequence, vec![], &signing)
-                .and_then(|framed| {
-                    (push_factory)()
-                        .map_err(crate::relay::RelayError::PushFailed)
-                        .and_then(|transport| push_send(transport, relay_pub_bytes, framed))
-                });
-            if result.is_ok() {
-                op_log
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .mark_delivered(&oid, entry.sequence);
-            }
-        }
+        // SYNC-5: no outbox replay here. The sender pump owns the whole
+        // outbox state machine (ADR-0026) — it notices the reconnection,
+        // clears its per-recipient backoffs and retries immediately.
     }
 }

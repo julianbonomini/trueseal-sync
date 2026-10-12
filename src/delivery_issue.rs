@@ -70,8 +70,5 @@ pub enum DeliveryIssue {
     /// The app's message handler failed on all 5 attempts (ADR-0026
     /// recipient step 4). The Blob was then acked and dropped — it will not
     /// be delivered again. Carries the Message ID and the last error.
-    HandlerGaveUp {
-        message_id: String,
-        error: String,
-    },
+    HandlerGaveUp { message_id: String, error: String },
 }

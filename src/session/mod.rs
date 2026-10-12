@@ -1,4 +1,5 @@
 mod reconnect;
+mod sender;
 #[cfg(test)]
 mod test_helpers;
 #[cfg(test)]
@@ -20,14 +21,13 @@ use trueseal_noise::keypair::Keypair as NoiseKeypair;
 
 use crate::delivery_issue::{DeliveryIssue, SendFailedReason, UnreadableReason};
 use crate::device::DeviceKeypair;
-use crate::envelope::SigningKeypair;
 use crate::keys::{NoisePublicKey, SigningPublicKey};
 use crate::limits::PROTOCOL_SIZE_LIMIT;
 use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
 use crate::member::{member_id, member_name};
 use crate::message::{device_name, message_id, Message};
 use crate::operation_log::{now_secs, MemLog, OperationLog};
-use crate::relay::{build_push_blob, push_send, RelayClient};
+use crate::relay::RelayClient;
 
 const DEFAULT_RECONNECT_CAP: Duration = Duration::from_secs(30);
 
@@ -308,10 +308,6 @@ fn drop_oversize_outbox_entries(
 /// Transport-generic so tests can inject in-memory pipes.
 pub struct TruesealSession<T: Read + Write + Send + 'static> {
     client: Arc<Mutex<RelayClient<T>>>,
-    /// Raw relay public key used as the NK push target (ADR-0018).
-    relay_pub_bytes: [u8; 32],
-    /// Factory that opens a fresh transport to the relay for each NK push.
-    push_factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync + 'static>,
     keys: Arc<Mutex<KeyState>>,
     sequence: Arc<Mutex<u64>>,
     pairing: Arc<Mutex<Option<PairingWindow>>>,
@@ -345,12 +341,13 @@ pub struct TruesealSession<T: Read + Write + Send + 'static> {
     /// Size Limit; a caller may lower it (e.g. to match a stricter relay),
     /// never raise it above the protocol ceiling (ADR-0025).
     max_payload_bytes: AtomicUsize,
-    /// Delivery Issues raised by the session itself — currently
-    /// `sendFailed(tooLarge)` for outbox entries dropped on load
-    /// (ADR-0025). Buffered until the first subscriber registers, so the
-    /// load-time reports are never lost. Receive-path issues are raised on
-    /// the RelayClient (SYNC-1); SYNC-15 unifies the surface on the FFI.
+    /// Delivery Issues raised by the session AND forwarded from the
+    /// receive path (SYNC-5: one stream, ADR-0026). Buffered until the
+    /// first subscriber registers, so construction-time reports are never
+    /// lost. SYNC-15 owns the public FFI surface for it.
     issue_sink: Arc<Mutex<IssueSink>>,
+    /// Wakes the sender pump when a new entry is queued (ADR-0026).
+    kick: Arc<sender::Kick>,
 }
 
 /// Builds the full manifest-aware subscribe handler.
@@ -495,9 +492,7 @@ pub(super) fn build_subscribe_handler(
                         );
                     }
                     Some(issue) => {
-                        warn!(
-                            "[trueseal-sync] rejected GroupManifest v{rejected_version}: {err}"
-                        );
+                        warn!("[trueseal-sync] rejected GroupManifest v{rejected_version}: {err}");
                         issue_sink
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -812,6 +807,25 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             handler,
             Some(Box::new(issue_forwarder)),
         )?;
+        let client = Arc::new(Mutex::new(client));
+        let push_factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync + 'static> =
+            Arc::new(push_factory);
+
+        // SYNC-5 (ADR-0026): the sender pump owns the outbox state machine —
+        // retries while connected, head-of-line per recipient, typed
+        // permanent/temporary classes, expiry, delivered-row deletion.
+        let kick = Arc::new(sender::Kick::new());
+        sender::spawn_sender(
+            client.clone(),
+            op_log.clone(),
+            keys.clone(),
+            relay_pub.0,
+            push_factory.clone(),
+            issue_sink.clone(),
+            destroyed.clone(),
+            kick.clone(),
+            sender::SenderConfig::default(),
+        );
 
         // SYNC-8 (#100): drop oversize entries persisted by pre-fix builds —
         // they can never be delivered and would replay forever (ADR-0025).
@@ -831,9 +845,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             .unwrap_or(0);
 
         Ok(Self {
-            client: Arc::new(Mutex::new(client)),
-            relay_pub_bytes: relay_pub.0,
-            push_factory: Arc::new(push_factory),
+            client,
             keys,
             sequence: Arc::new(Mutex::new(initial_seq)),
             pairing,
@@ -849,6 +861,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             on_member_left: on_ml_cb_ret,
             max_payload_bytes: AtomicUsize::new(PROTOCOL_SIZE_LIMIT),
             issue_sink,
+            kick,
         })
     }
 
@@ -892,7 +905,6 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let on_mj_arc = session.on_member_joined.clone();
         let on_ml_arc = session.on_member_left.clone();
         let issue_sink_arc = session.issue_sink.clone();
-        let push_factory_arc = session.push_factory.clone();
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
         let on_cc: Arc<dyn Fn(bool) + Send + Sync + 'static> = on_connection_changed
             .map(|f| -> Arc<dyn Fn(bool) + Send + Sync + 'static> { Arc::new(f) })
@@ -916,7 +928,6 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 on_ml_arc,
                 issue_sink_arc,
                 transport_factory,
-                push_factory_arc,
                 cap,
                 on_cc,
             );
@@ -974,7 +985,6 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let transport_factory = Arc::new(transport_factory);
         let push_factory_arc: Arc<dyn Fn() -> Result<T, String> + Send + Sync + 'static> =
             Arc::new(push_factory);
-        let push_factory_for_reconnect = push_factory_arc.clone();
 
         // Stub client: permanently disconnected — the reconnect loop will replace it.
         let client: Arc<Mutex<RelayClient<T>>> = Arc::new(Mutex::new(RelayClient::disconnected()));
@@ -998,10 +1008,24 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             .map(|s| s + 1)
             .unwrap_or(0);
 
+        // SYNC-5 (ADR-0026): the sender pump owns the outbox state machine.
+        // It starts against the disconnected stub client and delivers as
+        // soon as the reconnect loop brings the session up.
+        let kick = Arc::new(sender::Kick::new());
+        sender::spawn_sender(
+            client.clone(),
+            op_log_arc.clone(),
+            keys.clone(),
+            relay_pub.0,
+            push_factory_arc.clone(),
+            issue_sink.clone(),
+            destroyed.clone(),
+            kick.clone(),
+            sender::SenderConfig::default(),
+        );
+
         let session = Self {
             client: client.clone(),
-            relay_pub_bytes: relay_pub.0,
-            push_factory: push_factory_arc,
             keys: keys.clone(),
             sequence: Arc::new(Mutex::new(initial_seq)),
             pairing: pairing.clone(),
@@ -1017,6 +1041,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             on_member_left: on_member_left.clone(),
             max_payload_bytes: AtomicUsize::new(PROTOCOL_SIZE_LIMIT),
             issue_sink: issue_sink.clone(),
+            kick,
         };
 
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
@@ -1042,7 +1067,6 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 on_member_left,
                 issue_sink,
                 transport_factory,
-                push_factory_for_reconnect,
                 cap,
                 on_cc,
             );
@@ -1055,6 +1079,14 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// One sequence number is consumed per call regardless of member count.
     /// Returns `SessionError::NotInGroup` if no manifest is set.
     /// Returns `SessionError::GroupDestroyed` if the group has been destroyed.
+    ///
+    /// ADR-0026: `send()` writes the entry to the outbox before returning.
+    /// Delivery is the sender pump's job from here: it retries while
+    /// connected (backoff 1 s to 5 min, immediately on reconnect), holds
+    /// head-of-line order per recipient, fails permanently-refused and
+    /// expired entries with `sendFailed` on the delivery-issue stream, and
+    /// deletes delivered rows. `Ok(())` means "durably queued" — the caller
+    /// must not retry (ADR-0017); observing failures is optional.
     pub fn push_sync(&self, blob: Vec<u8>) -> Result<(), SessionError> {
         if self.destroyed.load(Ordering::Acquire) {
             return Err(SessionError::GroupDestroyed);
@@ -1086,57 +1118,15 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             }
         };
 
-        if !self
-            .client
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_connected()
-        {
-            // Blob is durably queued in the outbox; delivery is guaranteed on
-            // reconnect. Return Ok(()) — the caller should not retry (ADR-0017).
-            let seq = self.next_seq();
-            for r in &recipients {
-                self.op_log
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .append(&r.0, seq, blob.clone());
-            }
-            return Ok(());
-        }
-
-        let msg = Message::Sync { body: blob.clone() };
         let seq = self.next_seq();
-        let signing = self.signing();
-
-        let mut last_err: Option<String> = None;
-        for recipient_pub in recipients {
-            let oid = recipient_pub.0;
-            self.op_log
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .append(&oid, seq, blob.clone());
-            let result =
-                build_push_blob(&msg, recipient_pub, seq, vec![], &signing).and_then(|framed| {
-                    (self.push_factory)()
-                        .map_err(crate::relay::RelayError::PushFailed)
-                        .and_then(|transport| push_send(transport, self.relay_pub_bytes, framed))
-                });
-            match result {
-                Ok(_) => {
-                    self.op_log
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .mark_delivered(&oid, seq);
-                }
-                Err(e) => {
-                    last_err = Some(e.to_string());
-                }
+        {
+            let mut log = self.op_log.lock().unwrap_or_else(|e| e.into_inner());
+            for r in &recipients {
+                log.append(&r.0, seq, blob.clone());
             }
         }
-        match last_err {
-            None => Ok(()),
-            Some(e) => Err(SessionError::PushFailed(e)),
-        }
+        self.kick.kick();
+        Ok(())
     }
 
     /// The largest `Sync` body `send()` currently accepts, in bytes
@@ -1176,32 +1166,24 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             .subscribe(Box::new(callback));
     }
 
+    /// Queue a control-plane message (Pair, Group Manifest, Revoke) for
+    /// `recipient_pub`. ADR-0026: the control plane goes through the outbox
+    /// under the same contract as `Sync` — durable before the caller
+    /// proceeds, retried while connected, never expired — and the sender
+    /// pump delivers it. An unsupported Transport Version leaves the entry
+    /// queued until the library or relay is upgraded (ADR-0022).
     pub(crate) fn push_message(
         &self,
         msg: &Message,
         recipient_pub: NoisePublicKey,
     ) -> Result<(), SessionError> {
         let seq = self.next_seq();
-        let signing = self.signing();
-        build_push_blob(msg, recipient_pub, seq, vec![], &signing)
-            .map_err(|e| SessionError::PushFailed(e.to_string()))
-            .and_then(|framed| {
-                (self.push_factory)()
-                    .map_err(SessionError::PushFailed)
-                    .and_then(|transport| {
-                        push_send(transport, self.relay_pub_bytes, framed)
-                            .map(|_| ())
-                            .map_err(|e| match e {
-                                // Preserve the typed refusal (ADR-0022) instead
-                                // of erasing it into a string, mirroring the
-                                // reconnect loop.
-                                crate::relay::RelayError::RelayVersionUnsupported { min, max } => {
-                                    SessionError::RelayVersionUnsupported { min, max }
-                                }
-                                other => SessionError::PushFailed(other.to_string()),
-                            })
-                    })
-            })
+        self.op_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append_control(&recipient_pub.0, seq, msg.encode());
+        self.kick.kick();
+        Ok(())
     }
 
     // ── Destroy Group (ADR-0015) ──────────────────────────────────────────────
@@ -1231,10 +1213,12 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             }
         };
         for peer in peers {
-            // TODO(P1): Revoke is not queued to the outbox. If the relay is unreachable
-            // at this moment, peers will never know the group was destroyed. Fix: add
-            // control-plane messages (Revoke, GroupManifest) to the outbox with a
-            // non-Sync message type tag, and replay them on reconnect.
+            // SYNC-5: Revoke now goes through the outbox (ADR-0026 control
+            // plane) — durable before we proceed, retried while connected,
+            // and the sender pump drains it after `destroyed` is set. What
+            // is still missing is the durable Destroying state that survives
+            // a restart (the FFI wipe can delete a not-yet-accepted Revoke):
+            // that state machine is SYNC-11 (ADR-0029) scope.
             let _ = self.push_message(&Message::Revoke, peer);
         }
         *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1552,12 +1536,15 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let mut s = self.sequence.lock().unwrap_or_else(|e| e.into_inner());
         let v = *s;
         *s += 1;
+        // ADR-0026: delivered outbox rows are deleted, so the consumed
+        // sequence must be recorded durably — a restart must never re-use a
+        // sequence number, or the recipient's dedup table would drop the new
+        // message as a duplicate of the old one.
+        self.op_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_sequence(v);
         v
-    }
-
-    fn signing(&self) -> SigningKeypair {
-        let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-        SigningKeypair::from_signing_key(SigningKey::from_bytes(&ks.signing_priv))
     }
 }
 
