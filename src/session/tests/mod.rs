@@ -2,6 +2,7 @@ mod accept_member;
 mod accept_pair;
 mod connection;
 mod destroy_group;
+mod early_deliver;
 mod fanout;
 mod join_group;
 mod manifest_filter;

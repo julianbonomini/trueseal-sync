@@ -153,10 +153,39 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
     /// `WouldBlock` retries. A blocking transport with no deadline can hang
     /// forever against a silent (pre-version) relay. `connect_tcp` sets
     /// non-blocking mode for you.
+    ///
+    /// Connect with no message handler registered.
+    ///
+    /// The receive loop starts reading immediately, so a Blob delivered
+    /// before `subscribe()` is called is processed with no handler attached
+    /// and lost (SYNC-6, #98). Callers that must not miss early Delivers —
+    /// every Session path — use [`Self::connect_subscribed`] instead.
     pub fn connect(
         transport: T,
         relay_pub: NoisePublicKey,
         my_keypair: NoiseKeypair,
+    ) -> Result<Self, RelayError> {
+        Self::connect_inner(transport, relay_pub, my_keypair, None)
+    }
+
+    /// Connect with the message handler registered up front, closing the
+    /// connect/subscribe race (SYNC-6, #98): the handler is attached before
+    /// the receive loop starts reading, so no Deliver is processed — or
+    /// acked — before a handler exists (ADR-0026 recipient step 1).
+    pub fn connect_subscribed(
+        transport: T,
+        relay_pub: NoisePublicKey,
+        my_keypair: NoiseKeypair,
+        on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
+    ) -> Result<Self, RelayError> {
+        Self::connect_inner(transport, relay_pub, my_keypair, Some(Box::new(on_message)))
+    }
+
+    fn connect_inner(
+        transport: T,
+        relay_pub: NoisePublicKey,
+        my_keypair: NoiseKeypair,
+        first_callback: Option<Box<dyn Fn(Message, [u8; 32], u64) + Send + 'static>>,
     ) -> Result<Self, RelayError> {
         let my_noise_priv = my_keypair.private();
         let mut transport = transport;
@@ -173,8 +202,10 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         // Bounded channel: backpressure if the run thread falls behind.
         let (push_tx, push_rx) = mpsc::sync_channel::<PushBytes>(64);
 
+        // The first callback is registered before the run thread spawns, so
+        // no Deliver can be processed before a handler exists (SYNC-6).
         let callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64) + Send + 'static>>>> =
-            Arc::new(Mutex::new(Vec::new()));
+            Arc::new(Mutex::new(first_callback.into_iter().collect()));
         let callbacks_clone = callbacks.clone();
 
         let issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>> =
@@ -1572,14 +1603,14 @@ mod tests {
 
     // ── SYNC-6 (#98): the connect/subscribe race ────────────────────────────
 
-    /// A Blob the relay delivers in the window between `connect` and
-    /// `subscribe` must reach the handler — it must not be acked into an
-    /// empty callback list and lost (SYNC-6, ADR-0026 recipient step 1).
+    /// A Blob the relay delivers the moment the session comes up must reach
+    /// the handler — it must not be acked into an empty callback list and
+    /// lost (SYNC-6, ADR-0026 recipient step 1).
     ///
-    /// The interleaving is deterministic: the relay delivers immediately
-    /// after the handshake (the offline-inbox case), and the test subscribes
-    /// only after the relay has observed the DeliverAck — i.e. after the
-    /// Blob was processed with no handler attached.
+    /// `connect_subscribed` attaches the handler before the receive loop
+    /// starts reading, so no Deliver is processed — or acked — before a
+    /// handler exists. The relay delivers immediately after the handshake
+    /// (the offline-inbox case); there is deliberately no grace period.
     #[test]
     fn deliver_before_subscribe_reaches_the_handler() {
         let relay_kp = generate_keypair();
@@ -1621,15 +1652,25 @@ mod tests {
             });
         }
 
-        let client = RelayClient::connect(
+        let delivered: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
+        let delivered_cb = delivered.clone();
+        let _client = RelayClient::connect_subscribed(
             client_pipe,
             relay_pub,
             Keypair::new(recipient.noise.private(), recipient.noise.public_key),
+            move |msg, _author, _seq| {
+                delivered_cb.lock().unwrap().push(msg);
+            },
         )
         .expect("connect");
 
-        // Wait until the Blob has been processed — DeliverAck observed —
-        // with no handler attached yet. This makes the window deterministic.
+        assert!(
+            wait_until(|| !delivered.lock().unwrap().is_empty(), 2000),
+            "SYNC-6: a Blob delivered as the session comes up must reach the handler"
+        );
+        assert_eq!(delivered.lock().unwrap()[0], msg_to_deliver);
+        // The Blob was processed — and therefore acked — only after the
+        // handler was attached (registration precedes the receive loop).
         assert!(
             wait_until(
                 || client_frames
@@ -1639,19 +1680,7 @@ mod tests {
                     .any(|(t, _)| *t == MsgType::DeliverAck as u8),
                 2000
             ),
-            "the blob should have been processed (acked) before subscribe"
+            "the delivered blob should have been acked"
         );
-
-        let delivered: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
-        let delivered_cb = delivered.clone();
-        client.subscribe(move |msg, _author, _seq| {
-            delivered_cb.lock().unwrap().push(msg);
-        });
-
-        assert!(
-            wait_until(|| !delivered.lock().unwrap().is_empty(), 2000),
-            "SYNC-6: a Blob delivered before subscribe must reach the handler, not be lost"
-        );
-        assert_eq!(delivered.lock().unwrap()[0], msg_to_deliver);
     }
 }
