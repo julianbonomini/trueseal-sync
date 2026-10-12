@@ -37,10 +37,10 @@ fn pair_signing_pub_must_match_envelope_signer() {
     let m_noise = device_m.public_key();
     let x_signing = victim_x.signing_public_key();
 
-    let session_a = TruesealSession::connect(pa_c, relay_pub, device_a, |_, _, _| {}, nk.factory())
-        .expect("A");
-    let session_m = TruesealSession::connect(pm_c, relay_pub, device_m, |_, _, _| {}, nk.factory())
-        .expect("M");
+    let session_a =
+        TruesealSession::connect(pa_c, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("A");
+    let session_m =
+        TruesealSession::connect(pm_c, relay_pub, device_m, |_, _, _| {}, nk.factory()).expect("M");
 
     let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let r = requests.clone();
@@ -98,10 +98,10 @@ fn replayed_pair_payload_under_different_signer_is_dropped() {
     let b_noise = device_b.public_key();
     let b_signing = device_b.signing_public_key();
 
-    let session_a = TruesealSession::connect(pa_c, relay_pub, device_a, |_, _, _| {}, nk.factory())
-        .expect("A");
-    let session_m = TruesealSession::connect(pm_c, relay_pub, device_m, |_, _, _| {}, nk.factory())
-        .expect("M");
+    let session_a =
+        TruesealSession::connect(pa_c, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("A");
+    let session_m =
+        TruesealSession::connect(pm_c, relay_pub, device_m, |_, _, _| {}, nk.factory()).expect("M");
 
     let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let r = requests.clone();
@@ -151,10 +151,10 @@ fn matched_pair_still_raises_join_request_and_admits() {
     let m_noise = device_m.public_key();
     let m_signing = device_m.signing_public_key();
 
-    let session_a = TruesealSession::connect(pa_c, relay_pub, device_a, |_, _, _| {}, nk.factory())
-        .expect("A");
-    let session_m = TruesealSession::connect(pm_c, relay_pub, device_m, |_, _, _| {}, nk.factory())
-        .expect("M");
+    let session_a =
+        TruesealSession::connect(pa_c, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("A");
+    let session_m =
+        TruesealSession::connect(pm_c, relay_pub, device_m, |_, _, _| {}, nk.factory()).expect("M");
 
     let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let r = requests.clone();
