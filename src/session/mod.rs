@@ -4,9 +4,11 @@ mod test_helpers;
 #[cfg(test)]
 mod tests;
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,7 +26,7 @@ use crate::limits::PROTOCOL_SIZE_LIMIT;
 use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
 use crate::member::{member_id, member_name};
 use crate::message::{device_name, message_id, Message};
-use crate::operation_log::{MemLog, OperationLog};
+use crate::operation_log::{now_secs, MemLog, OperationLog};
 use crate::relay::{build_push_blob, push_send, RelayClient};
 
 const DEFAULT_RECONNECT_CAP: Duration = Duration::from_secs(30);
@@ -182,6 +184,70 @@ impl IssueSink {
     }
 }
 
+/// A buffered member-event sink (ADR-0026 recipient step 1: "Member events
+/// are buffered until their handlers exist").
+///
+/// The member-event callbacks register AFTER construction (`set_on_member_*`),
+/// so a Pair or manifest that arrives in the construction window would
+/// previously queue state but never fire the event (the old TODO(P6)). Now
+/// events fired before registration are buffered and flushed to the first
+/// registered handler — receiving starts on handler registration without
+/// losing anything.
+pub(super) struct EventSink {
+    pending: Vec<(String, String)>,
+    callback: Option<Box<dyn Fn(String, String) + Send + Sync>>,
+}
+
+impl EventSink {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            callback: None,
+        }
+    }
+
+    /// Fire an event: to the registered handler, or into the buffer when
+    /// none is registered yet. As elsewhere in this module, the callback
+    /// fires under the lock and must not re-enter session methods.
+    fn fire(&mut self, id: String, name: String) {
+        match &self.callback {
+            Some(cb) => cb(id, name),
+            None => self.pending.push((id, name)),
+        }
+    }
+
+    /// Register the handler; buffered events flush to it immediately.
+    fn set_callback(&mut self, cb: Box<dyn Fn(String, String) + Send + Sync>) {
+        for (id, name) in self.pending.drain(..) {
+            cb(id, name);
+        }
+        self.callback = Some(cb);
+    }
+}
+
+/// Handler attempts before the library gives up on a Blob (ADR-0026
+/// recipient step 4): 5 attempts in total with in-memory backoff between
+/// them, then ack + drop + `handlerGaveUp`. The dispatch loop is serial,
+/// so the backoff stalls this session's delivery — by design.
+const MAX_HANDLER_ATTEMPTS: u32 = 5;
+const HANDLER_BACKOFF: [Duration; 4] = [
+    Duration::from_millis(100),
+    Duration::from_millis(200),
+    Duration::from_millis(400),
+    Duration::from_millis(800),
+];
+
+/// Extract a human-readable message from a caught panic payload.
+fn panic_message(payload: Box<dyn Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "handler panicked".to_string()
+    }
+}
+
 /// Drop outbox entries over the Protocol Size Limit and report each one as
 /// `sendFailed(tooLarge)` (ADR-0025: "Outbox entries already over the limit
 /// (only in development stores) are dropped on load and raise the same
@@ -267,11 +333,14 @@ pub struct TruesealSession<T: Read + Write + Send + 'static> {
     pending_members: Arc<Mutex<HashMap<String, PendingMember>>>,
     /// Fired when a Pair message arrives inside an open pairing window.
     /// `(token, name)` — caller shows UI then calls `accept_member(token)`.
-    on_member_request: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
+    /// Buffered until the handler registers (ADR-0026 step 1).
+    on_member_request: Arc<Mutex<EventSink>>,
     /// Fired when a new member appears in an incoming manifest update.
-    on_member_joined: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
+    /// Buffered until the handler registers.
+    on_member_joined: Arc<Mutex<EventSink>>,
     /// Fired when a member disappears from an incoming manifest update (not for local device).
-    on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
+    /// Buffered until the handler registers.
+    on_member_left: Arc<Mutex<EventSink>>,
     /// The largest `Sync` body `send()` accepts. Defaults to the Protocol
     /// Size Limit; a caller may lower it (e.g. to match a stricter relay),
     /// never raise it above the protocol ceiling (ADR-0025).
@@ -298,10 +367,11 @@ pub(super) fn build_subscribe_handler(
     destroyed: Arc<AtomicBool>,
     pairing: Arc<Mutex<Option<PairingWindow>>>,
     pending_members: Arc<Mutex<HashMap<String, PendingMember>>>,
-    on_member_request: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
-    on_member_joined: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
-    on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
+    on_member_request: Arc<Mutex<EventSink>>,
+    on_member_joined: Arc<Mutex<EventSink>>,
+    on_member_left: Arc<Mutex<EventSink>>,
     issue_sink: Arc<Mutex<IssueSink>>,
+    op_log: Arc<Mutex<Box<dyn OperationLog>>>,
     on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
 ) -> impl Fn(Message, [u8; 32], u64) + Send + 'static {
     move |msg, author_signing_pub, sequence| {
@@ -343,13 +413,10 @@ pub(super) fn build_subscribe_handler(
                             signing_pub: SigningPublicKey(*signing_pub),
                         },
                     );
-                if let Some(cb) = on_member_request
+                on_member_request
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .as_ref()
-                {
-                    cb(token, name);
-                }
+                    .fire(token, name);
             }
             return;
         }
@@ -389,25 +456,54 @@ pub(super) fn build_subscribe_handler(
                 None => incoming.verify(None),
                 Some(ref current) => incoming.verify(Some(current)),
             };
-            // A manifest that fails verification is acked and dropped with a
-            // typed Delivery Issue (ADR-0027). `Unreadable(Malformed)` is the
-            // closest reason in ADR-0034's closed list — the Blob could not
-            // be authorised; SYNC-15 owns any finer control-plane taxonomy.
-            // This covers every rejection: bad signature, regression,
-            // unknown issuer, an over-bound version jump, and u64::MAX
-            // (SYNC-10). The lock is released before the sink fires, as with
-            // every callback in this handler.
+            // A manifest that fails verification is acked and dropped. The
+            // report depends on WHY it failed (ADR-0034 §2/§3, SYNC-5):
+            //
+            // - Regression (an older or identical version) is BENIGN STALE:
+            //   a relay re-delivery, a hostile-relay replay, or the loser of
+            //   concurrent issuance (ADR-0027 orders by (version, hash)).
+            //   Replays of control messages must be harmless AND unreported
+            //   — every resend would otherwise spam the issue stream.
+            // - Unauthenticated bytes (bad signature, undecodable) are
+            //   `unreadable(malformed)`.
+            // - Everything else is authenticated-but-unacceptable — an
+            //   over-bound jump, u64::MAX (SYNC-10), an unknown issuer, a
+            //   foreign group id — and raises `unauthorized`, the case
+            //   ADR-0034 keeps separate for exactly this.
+            // The lock is released before the sink fires, as with every
+            // callback in this handler.
             if let Err(err) = verdict {
+                use crate::manifest::ManifestError as ME;
                 let rejected_version = incoming.version;
+                let issue = match err {
+                    ME::VersionRegression { .. } => None,
+                    ME::DecodeFailed(_) | ME::InvalidLength { .. } | ME::InvalidSignature => {
+                        Some(DeliveryIssue::Unreadable(UnreadableReason::Malformed))
+                    }
+                    ME::VersionJumpTooLarge { .. }
+                    | ME::VersionExhausted
+                    | ME::UnknownIssuer
+                    | ME::GroupIdMismatch => Some(DeliveryIssue::Unauthorized),
+                };
                 drop(guard);
-                warn!(
-                    "[trueseal-sync] rejected GroupManifest v{}: {}",
-                    rejected_version, err
-                );
-                issue_sink
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .fire(DeliveryIssue::Unreadable(UnreadableReason::Malformed));
+                match issue {
+                    None => {
+                        // Benign stale manifests are routine (concurrent
+                        // issuance), so this logs at debug, not warn.
+                        log::debug!(
+                            "[trueseal-sync] ignoring stale GroupManifest v{rejected_version}: {err}"
+                        );
+                    }
+                    Some(issue) => {
+                        warn!(
+                            "[trueseal-sync] rejected GroupManifest v{rejected_version}: {err}"
+                        );
+                        issue_sink
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .fire(issue);
+                    }
+                }
                 return;
             }
             let excluded = !incoming.contains_signing_pub(&local_signing_pub);
@@ -447,22 +543,16 @@ pub(super) fn build_subscribe_handler(
 
             (on_manifest_changed)(incoming);
 
-            if let Some(cb) = on_member_joined
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
             {
+                let mut sink = on_member_joined.lock().unwrap_or_else(|e| e.into_inner());
                 for (id, name) in joined {
-                    cb(id, name);
+                    sink.fire(id, name);
                 }
             }
-            if let Some(cb) = on_member_left
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
             {
+                let mut sink = on_member_left.lock().unwrap_or_else(|e| e.into_inner());
                 for (id, name) in left {
-                    cb(id, name);
+                    sink.fire(id, name);
                 }
             }
 
@@ -472,7 +562,64 @@ pub(super) fn build_subscribe_handler(
             return;
         }
 
-        on_message(msg, author_signing_pub, sequence);
+        // ── Application message: library-owned dedup + handler attempts ─────
+        // ADR-0026 recipient steps 3-5. Only `Sync` reaches here today —
+        // every control variant returned above. The Message ID derives from
+        // the author's signing key and the Envelope sequence, so a relay
+        // re-delivery (new blob id, same Envelope) is recognised.
+        let mid = message_id(&author_signing_pub, sequence);
+        {
+            let log = op_log.lock().unwrap_or_else(|e| e.into_inner());
+            if log.is_handled(&mid) {
+                // Duplicate: the handler already ran for this Message ID.
+                // Return without a word — the relay acks silently. This is
+                // also the crash-recovery path: a crash between the dedup
+                // write and the DeliverAck re-delivers, lands here, and the
+                // handler does NOT run twice.
+                return;
+            }
+        }
+
+        // Run the handler: 5 attempts with in-memory backoff (ADR-0026 step
+        // 4). A panicking handler is a failed attempt — caught so the
+        // receive loop survives. A handler that never finishes stalls this
+        // session's delivery (accepted, documented); a handler that fails
+        // all attempts is acked, dropped and reported.
+        let mut last_error = String::new();
+        for attempt in 0..MAX_HANDLER_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(HANDLER_BACKOFF[(attempt - 1) as usize]);
+            }
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                on_message(msg.clone(), author_signing_pub, sequence)
+            }));
+            match result {
+                Ok(()) => {
+                    // Step 5: record the Message ID, THEN return so the
+                    // DeliverAck follows. A crash before the record commits
+                    // re-delivers and the handler runs again — the only way
+                    // an app sees a duplicate.
+                    op_log
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .record_handled(&mid, now_secs());
+                    return;
+                }
+                Err(payload) => {
+                    last_error = panic_message(payload);
+                    warn!(
+                        "[trueseal-sync] message handler failed (attempt {attempt}/{MAX_HANDLER_ATTEMPTS}, {mid}): {last_error}"
+                    );
+                }
+            }
+        }
+        issue_sink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fire(DeliveryIssue::HandlerGaveUp {
+                message_id: mid,
+                error: last_error,
+            });
     }
 }
 
@@ -617,15 +764,12 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let destroyed_cb = destroyed.clone();
         let pending_cb: Arc<Mutex<HashMap<String, PendingMember>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let on_mr_cb: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>> =
-            Arc::new(Mutex::new(None));
+        let on_mr_cb: Arc<Mutex<EventSink>> = Arc::new(Mutex::new(EventSink::new()));
         let pending_cb_ret = pending_cb.clone();
         let on_mr_cb_ret = on_mr_cb.clone();
         let pairing_cb = pairing.clone();
-        let on_mj_cb: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>> =
-            Arc::new(Mutex::new(None));
-        let on_ml_cb: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>> =
-            Arc::new(Mutex::new(None));
+        let on_mj_cb: Arc<Mutex<EventSink>> = Arc::new(Mutex::new(EventSink::new()));
+        let on_ml_cb: Arc<Mutex<EventSink>> = Arc::new(Mutex::new(EventSink::new()));
         let on_mj_cb_ret = on_mj_cb.clone();
         let on_ml_cb_ret = on_ml_cb.clone();
 
@@ -649,9 +793,25 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             on_mj_cb,
             on_ml_cb,
             issue_sink.clone(),
+            op_log.clone(),
             on_message,
         );
-        let client = RelayClient::connect_subscribed(transport, relay_pub, noise_kp, handler)?;
+        // SYNC-5: the Delivery Issue stream is one channel from the very
+        // first frame — receive-path issues (`unreadable`, `heldForUpgrade`)
+        // forward into the session sink, alongside session-raised issues.
+        let issue_forwarder = {
+            let sink = issue_sink.clone();
+            move |issue: DeliveryIssue| {
+                sink.lock().unwrap_or_else(|e| e.into_inner()).fire(issue);
+            }
+        };
+        let client = RelayClient::connect_subscribed(
+            transport,
+            relay_pub,
+            noise_kp,
+            handler,
+            Some(Box::new(issue_forwarder)),
+        )?;
 
         // SYNC-8 (#100): drop oversize entries persisted by pre-fix builds —
         // they can never be delivered and would replay forever (ADR-0025).
@@ -807,12 +967,9 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let destroyed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let pending_members: Arc<Mutex<HashMap<String, PendingMember>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let on_member_request: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>> =
-            Arc::new(Mutex::new(None));
-        let on_member_joined: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>> =
-            Arc::new(Mutex::new(None));
-        let on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>> =
-            Arc::new(Mutex::new(None));
+        let on_member_request: Arc<Mutex<EventSink>> = Arc::new(Mutex::new(EventSink::new()));
+        let on_member_joined: Arc<Mutex<EventSink>> = Arc::new(Mutex::new(EventSink::new()));
+        let on_member_left: Arc<Mutex<EventSink>> = Arc::new(Mutex::new(EventSink::new()));
 
         let transport_factory = Arc::new(transport_factory);
         let push_factory_arc: Arc<dyn Fn() -> Result<T, String> + Send + Sync + 'static> =
@@ -1202,17 +1359,13 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         (self.on_manifest_changed)(&new_manifest);
 
         // Fire onMemberJoined for the newly admitted device.
-        if let Some(cb) = self
-            .on_member_joined
+        self.on_member_joined
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            cb(
+            .fire(
                 crate::member::member_id(&signing_pub),
                 crate::member::member_name(&signing_pub),
             );
-        }
 
         // Push GroupManifest to all existing members (excluding self).
         // TODO(P1): GroupManifest pushes are not queued to the outbox. If the relay is
@@ -1235,37 +1388,37 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// The callback receives `(token, name)`. The caller passes `token` back to
     /// [`Self::accept_member`] to admit the device.
     ///
-    /// TODO(P6): This callback is registered post-construction whereas `on_message`,
-    /// `on_removed_from_group`, and `on_group_destroyed` are constructor params. There
-    /// is a window between construction and this call where an inbound Pair message
-    /// would be queued to `pending_members` but `on_member_request` would not fire.
-    /// In practice this window is closed before the relay delivers any message, but
-    /// the asymmetry is surprising. Fix: move all callbacks to the constructor or
-    /// make all of them post-construction setters.
+    /// Registered post-construction, so requests that arrive in the
+    /// construction window are buffered (ADR-0026 step 1: member events are
+    /// buffered until their handlers exist) and flush to this callback the
+    /// moment it registers. The callback fires under the sink lock and must
+    /// not re-enter session methods.
     pub fn set_on_member_request(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
-        *self
-            .on_member_request
+        self.on_member_request
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(cb));
+            .unwrap_or_else(|e| e.into_inner())
+            .set_callback(Box::new(cb));
     }
 
     /// Register the callback fired when a new member appears in an incoming manifest update.
-    /// `(id, name)` — same format as [`Self::members`].
+    /// `(id, name)` — same format as [`Self::members`]. Events that arrived
+    /// before registration flush on registration (ADR-0026 step 1).
     pub fn set_on_member_joined(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
-        *self
-            .on_member_joined
+        self.on_member_joined
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(cb));
+            .unwrap_or_else(|e| e.into_inner())
+            .set_callback(Box::new(cb));
     }
 
     /// Register the callback fired when a member disappears from an incoming manifest update.
     /// Does NOT fire when the local device is the removed one (that's `on_removed_from_group`).
-    /// `(id, name)` — same format as [`Self::members`].
+    /// `(id, name)` — same format as [`Self::members`]. Events that arrived
+    /// before registration flush on registration (ADR-0026 step 1).
     pub fn set_on_member_left(&self, cb: impl Fn(String, String) + Send + Sync + 'static) {
-        *self
-            .on_member_left
+        self.on_member_left
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(Box::new(cb));
+            .unwrap_or_else(|e| e.into_inner())
+            .set_callback(Box::new(cb));
     }
 
     /// Admit a pending member identified by their opaque `token` from `on_member_request`.

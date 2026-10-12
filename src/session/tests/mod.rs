@@ -1,6 +1,7 @@
 mod accept_member;
 mod accept_pair;
 mod connection;
+mod delivery_contract;
 mod destroy_group;
 mod early_deliver;
 mod fanout;

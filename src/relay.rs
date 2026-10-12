@@ -162,20 +162,32 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         relay_pub: NoisePublicKey,
         my_keypair: NoiseKeypair,
     ) -> Result<Self, RelayError> {
-        Self::connect_inner(transport, relay_pub, my_keypair, None)
+        Self::connect_inner(transport, relay_pub, my_keypair, None, None)
     }
 
     /// Connect with the message handler registered up front, closing the
     /// connect/subscribe race (SYNC-6, #98): the handler is attached before
     /// the receive loop starts reading, so no Deliver is processed — or
     /// acked — before a handler exists (ADR-0026 recipient step 1).
+    ///
+    /// `on_issue` is registered before the receive loop starts too
+    /// (SYNC-5): the Delivery Issue stream is one channel from the very
+    /// first frame, so an early rejection is never lost to a late
+    /// `subscribe_delivery_issues`.
     pub fn connect_subscribed(
         transport: T,
         relay_pub: NoisePublicKey,
         my_keypair: NoiseKeypair,
         on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
+        on_issue: Option<Box<dyn Fn(DeliveryIssue) + Send + 'static>>,
     ) -> Result<Self, RelayError> {
-        Self::connect_inner(transport, relay_pub, my_keypair, Some(Box::new(on_message)))
+        Self::connect_inner(
+            transport,
+            relay_pub,
+            my_keypair,
+            Some(Box::new(on_message)),
+            on_issue,
+        )
     }
 
     fn connect_inner(
@@ -183,6 +195,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         relay_pub: NoisePublicKey,
         my_keypair: NoiseKeypair,
         first_callback: Option<Box<dyn Fn(Message, [u8; 32], u64) + Send + 'static>>,
+        first_issue_callback: Option<Box<dyn Fn(DeliveryIssue) + Send + 'static>>,
     ) -> Result<Self, RelayError> {
         let my_noise_priv = my_keypair.private();
         let mut transport = transport;
@@ -205,8 +218,10 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
             Arc::new(Mutex::new(first_callback.into_iter().collect()));
         let callbacks_clone = callbacks.clone();
 
+        // The first issue callback is registered before the run thread
+        // spawns, alongside the first message callback (SYNC-5).
         let issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>> =
-            Arc::new(Mutex::new(Vec::new()));
+            Arc::new(Mutex::new(first_issue_callback.into_iter().collect()));
         let issue_callbacks_clone = issue_callbacks.clone();
 
         let is_connected = Arc::new(AtomicBool::new(true));
@@ -1734,6 +1749,7 @@ mod tests {
             move |msg, _author, _seq| {
                 delivered_cb.lock().unwrap().push(msg);
             },
+            None,
         )
         .expect("connect");
 

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 
-use crate::delivery_issue::{DeliveryIssue, UnreadableReason};
+use crate::delivery_issue::DeliveryIssue;
 use crate::device::DeviceKeypair;
 use crate::keys::{NoisePublicKey, SigningPublicKey};
 use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
@@ -135,12 +135,15 @@ impl HostileRig {
         members
     }
 
-    fn unreadable_malformed_reported(&self) -> bool {
+    /// SYNC-5 remap: an authenticated-but-unacceptable manifest (over-bound
+    /// jump, u64::MAX, unknown issuer, foreign group) is `unauthorized`
+    /// (ADR-0034 §3) — no longer the `unreadable(malformed)` stopgap.
+    fn unauthorized_reported(&self) -> bool {
         self.issues
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .any(|i| matches!(i, DeliveryIssue::Unreadable(UnreadableReason::Malformed)))
+            .any(|i| matches!(i, DeliveryIssue::Unauthorized))
     }
 }
 
@@ -165,8 +168,8 @@ fn hostile_manifest_at_max_version_never_freezes_membership() {
         "a legitimate manifest after the hostile u64::MAX one must still be accepted (members() excludes the local device)"
     );
     assert!(
-        rig.unreadable_malformed_reported(),
-        "the rejected manifest must be reported as a typed Delivery Issue"
+        rig.unauthorized_reported(),
+        "the rejected manifest must be reported as unauthorized (SYNC-5 taxonomy)"
     );
 }
 
@@ -191,8 +194,8 @@ fn hostile_manifest_with_jump_over_bound_is_rejected() {
         "a legitimate manifest after an over-bound jump must still be accepted (members() excludes the local device)"
     );
     assert!(
-        rig.unreadable_malformed_reported(),
-        "the rejected manifest must be reported as a typed Delivery Issue"
+        rig.unauthorized_reported(),
+        "the rejected manifest must be reported as unauthorized (SYNC-5 taxonomy)"
     );
 }
 
