@@ -1569,4 +1569,89 @@ mod tests {
         assert!(delivered.lock().unwrap().is_empty());
         relay.assert_only_deliver_acks();
     }
+
+    // ── SYNC-6 (#98): the connect/subscribe race ────────────────────────────
+
+    /// A Blob the relay delivers in the window between `connect` and
+    /// `subscribe` must reach the handler — it must not be acked into an
+    /// empty callback list and lost (SYNC-6, ADR-0026 recipient step 1).
+    ///
+    /// The interleaving is deterministic: the relay delivers immediately
+    /// after the handshake (the offline-inbox case), and the test subscribes
+    /// only after the relay has observed the DeliverAck — i.e. after the
+    /// Blob was processed with no handler attached.
+    #[test]
+    fn deliver_before_subscribe_reaches_the_handler() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+
+        let (client_pipe, relay_pipe) = mem_pipe_pair();
+
+        let recipient = DeviceKeypair::generate();
+        let sender_signing = SigningKeypair::generate();
+        let msg_to_deliver = Message::Sync {
+            body: b"waiting in the inbox".to_vec(),
+        };
+
+        let client_frames: Arc<Mutex<Vec<(u8, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let recipient_pub = recipient.public_key();
+            let plaintext = msg_to_deliver.encode();
+            let payload = crate::crypto::encrypt(
+                recipient_pub,
+                sender_signing.public_key_bytes(),
+                &plaintext,
+            );
+            let env = Envelope::build(1, vec![], recipient_pub, &sender_signing, payload);
+            let env_bytes = env.encode();
+            let frames_clone = client_frames.clone();
+            std::thread::spawn(move || {
+                let session = xx_accept_after_prefix(relay_pipe, relay_kp2).unwrap();
+                // Deliver immediately — no grace period for the client to
+                // subscribe first. This is the SYNC-6 offline-inbox case.
+                let mut body = 7u64.to_be_bytes().to_vec();
+                body.extend_from_slice(&env_bytes);
+                session.send(&frame(MsgType::Deliver, &body)).unwrap();
+                while let Ok(raw) = session.receive() {
+                    if let Some((t, b)) = parse(&raw) {
+                        frames_clone.lock().unwrap().push((t as u8, b.to_vec()));
+                    }
+                }
+            });
+        }
+
+        let client = RelayClient::connect(
+            client_pipe,
+            relay_pub,
+            Keypair::new(recipient.noise.private(), recipient.noise.public_key),
+        )
+        .expect("connect");
+
+        // Wait until the Blob has been processed — DeliverAck observed —
+        // with no handler attached yet. This makes the window deterministic.
+        assert!(
+            wait_until(
+                || client_frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(t, _)| *t == MsgType::DeliverAck as u8),
+                2000
+            ),
+            "the blob should have been processed (acked) before subscribe"
+        );
+
+        let delivered: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
+        let delivered_cb = delivered.clone();
+        client.subscribe(move |msg, _author, _seq| {
+            delivered_cb.lock().unwrap().push(msg);
+        });
+
+        assert!(
+            wait_until(|| !delivered.lock().unwrap().is_empty(), 2000),
+            "SYNC-6: a Blob delivered before subscribe must reach the handler, not be lost"
+        );
+        assert_eq!(delivered.lock().unwrap()[0], msg_to_deliver);
+    }
 }
