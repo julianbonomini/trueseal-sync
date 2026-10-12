@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::keys::{NoisePublicKey, SigningPublicKey};
+use crate::version;
 
 // Include the prost-generated types from proto/envelope.proto
 mod proto {
@@ -49,6 +50,10 @@ impl SigningKeypair {
 /// payload so the relay learns no stable sender identity (ADR-0018 / #49).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Envelope {
+    /// End-to-End Version (ADR-0022). Signed, and readable by the Relay.
+    /// Always `version::END_TO_END_VERSION` on envelopes this build creates;
+    /// 0 on decode means the refused pre-version format.
+    pub version: u32,
     pub sequence: u64,
     pub parents: Vec<[u8; 32]>,
     pub recipient_pub: [u8; 32],
@@ -67,12 +72,14 @@ impl Envelope {
     ) -> Self {
         let sig_bytes = sign(
             &author_keypair.0,
+            version::END_TO_END_VERSION,
             sequence,
             &parents,
             &recipient_pub.0,
             &payload,
         );
         Self {
+            version: version::END_TO_END_VERSION,
             sequence,
             parents,
             recipient_pub: recipient_pub.0,
@@ -107,11 +114,12 @@ impl Envelope {
 
     /// Verify the author signature using the author_pub extracted from the
     /// decrypted payload. Called by recipients after decryption — never by the Relay.
-    /// Signing message: sequence || parents || recipient_pub || ciphertext.
+    /// Signing message: domain || version || sequence || parents || recipient_pub || ciphertext.
     pub fn verify_with(&self, author_pub: [u8; 32]) -> Result<(), EnvelopeError> {
         let vk =
             VerifyingKey::from_bytes(&author_pub).map_err(|_| EnvelopeError::InvalidKeyLength)?;
         let msg = signing_message(
+            self.version,
             self.sequence,
             &self.parents,
             &self.recipient_pub,
@@ -125,6 +133,7 @@ impl Envelope {
     /// Encode to Protobuf bytes.
     pub fn encode(&self) -> Vec<u8> {
         let proto = proto::Envelope {
+            version: self.version,
             sequence: self.sequence,
             parents: self.parents.iter().map(|p| p.to_vec()).collect(),
             recipient_pub: self.recipient_pub.to_vec(),
@@ -158,6 +167,9 @@ impl Envelope {
             .collect::<Result<Vec<[u8; 32]>, _>>()?;
 
         Ok(Self {
+            // proto3 defaults a missing field to 0 — the reserved version of
+            // the refused pre-version format (ADR-0022).
+            version: proto.version,
             sequence: proto.sequence,
             parents,
             recipient_pub,
@@ -168,14 +180,18 @@ impl Envelope {
 }
 
 /// The canonical message bytes that are signed/verified.
-/// sequence (8 LE) || each parent (32) || recipient_pub (32) || ciphertext
+/// domain || version (4 LE) || sequence (8 LE) || each parent (32) || recipient_pub (32) || ciphertext
+/// The domain separator carries the End-to-End Version (ADR-0022), and the
+/// version field is itself signed, so neither can be altered in transit.
 fn signing_message(
+    e2e_version: u32,
     sequence: u64,
     parents: &[[u8; 32]],
     recipient_pub: &[u8; 32],
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut msg = Vec::new();
+    let mut msg = version::envelope_signing_domain();
+    msg.extend_from_slice(&e2e_version.to_le_bytes());
     msg.extend_from_slice(&sequence.to_le_bytes());
     for p in parents {
         msg.extend_from_slice(p);
@@ -187,12 +203,13 @@ fn signing_message(
 
 fn sign(
     key: &SigningKey,
+    e2e_version: u32,
     sequence: u64,
     parents: &[[u8; 32]],
     recipient_pub: &[u8; 32],
     payload: &[u8],
 ) -> [u8; 64] {
-    let msg = signing_message(sequence, parents, recipient_pub, payload);
+    let msg = signing_message(e2e_version, sequence, parents, recipient_pub, payload);
     key.sign(&msg).to_bytes()
 }
 
@@ -393,6 +410,51 @@ mod tests {
         assert!(
             env.verify_with(author.public_key_bytes()).is_err(),
             "tampered payload should fail verification"
+        );
+    }
+
+    // ── SYNC-1: End-to-End Version binding (ADR-0022) ─────────────────────────
+
+    /// Every envelope this build creates carries the End-to-End Version.
+    #[test]
+    fn built_envelope_carries_the_end_to_end_version() {
+        let (env, _) = make_envelope();
+        assert_eq!(env.version, crate::version::END_TO_END_VERSION);
+        // ... through encode/decode too.
+        let decoded = Envelope::decode(&env.encode()).expect("decode");
+        assert_eq!(decoded.version, crate::version::END_TO_END_VERSION);
+    }
+
+    /// The version field is signed: tampering with it invalidates the
+    /// signature, so it cannot be altered in transit.
+    #[test]
+    fn tampered_version_fails_verification() {
+        let (mut env, author) = make_envelope();
+        env.version += 1;
+        assert!(
+            env.verify_with(author.public_key_bytes()).is_err(),
+            "a relabelled version must fail verification"
+        );
+    }
+
+    /// A pre-version-format envelope (no version field on the wire) decodes
+    /// with version 0 — the reserved version the receiver refuses.
+    #[test]
+    fn pre_version_format_decodes_as_version_zero() {
+        // Hand-encode the old shape: same fields, version field absent.
+        // prost omits zero-valued scalar fields, so any envelope whose proto
+        // encoding lacks field 7 decodes with version 0.
+        let (env, _) = make_envelope();
+        // Hand-encode the old shape: same fields, version field absent.
+        let mut raw = Vec::new();
+        // sequence (field 1) omitted — defaults to 0, like the old format.
+        prost::encoding::bytes::encode(3, &env.recipient_pub.to_vec(), &mut raw);
+        prost::encoding::bytes::encode(5, &env.signature.to_vec(), &mut raw);
+        prost::encoding::bytes::encode(6, &env.payload, &mut raw);
+        let decoded = Envelope::decode(&raw).expect("old-format bytes still decode");
+        assert_eq!(
+            decoded.version, 0,
+            "absent version field decodes as 0 (reserved)"
         );
     }
 }

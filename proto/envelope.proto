@@ -11,6 +11,11 @@ package trueseal.sync.v0;
 // application-level metadata inside the encrypted payload. The Relay
 // has no knowledge of any of it.
 message Envelope {
+  // End-to-End Version (ADR-0022). Signed along with every other field.
+  // The only Envelope field besides recipient_pub and payload the Relay may
+  // read. 0 is reserved and means the refused pre-version format.
+  uint32 version = 7;
+
   // Device-scoped monotonic counter. Used by the Relay to order Envelopes
   // within a recipient's Inbox.
   uint64 sequence = 1;
