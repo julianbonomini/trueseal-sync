@@ -1,3 +1,5 @@
+use std::sync::{Arc, Mutex};
+
 use crate::device::DeviceKeypair;
 use crate::operation_log::MemLog;
 
@@ -17,6 +19,7 @@ fn create_offline_returns_session_immediately() {
         device,
         |_, _, _| {},
         Box::new(MemLog::new()),
+        Arc::new(Mutex::new(None)),
         || {},
         |_| {},
         || {},
@@ -44,6 +47,7 @@ fn offline_session_send_returns_not_in_group() {
         device,
         |_, _, _| {},
         Box::new(MemLog::new()),
+        Arc::new(Mutex::new(None)),
         || {},
         |_| {},
         || {},
@@ -81,6 +85,7 @@ fn offline_session_with_manifest_queues_to_outbox() {
         device,
         |_, _, _| {},
         Box::new(MemLog::new()),
+        Arc::new(Mutex::new(None)),
         || {},
         |_| {},
         || {},
@@ -160,6 +165,7 @@ fn unsupported_transport_version_leaves_outbox_queued() {
         device,
         |_, _, _| {},
         Box::new(MemLog::new()),
+        Arc::new(Mutex::new(None)),
         || {},
         |_| {},
         || {},

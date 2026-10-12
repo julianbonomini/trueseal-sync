@@ -71,6 +71,7 @@ fn slow_cap() -> Option<usize> {
 use trueseal_sync::{
     device::DeviceKeypair,
     keys::NoisePublicKey,
+    manifest::GroupManifest,
     message::Message,
     session::TruesealSession,
     store::{PersistentLog, Store},
@@ -119,7 +120,14 @@ fn main() {
 
     // Load any previously saved manifest so the device restores its group on
     // restart — essential for guaranteed delivery / offline drain testing.
+    // SYNC-7 (#99): seed the session's manifest slot BEFORE the reconnect
+    // loop starts, so early Deliver frames are judged against the persisted
+    // membership (restoring afterwards reopens the manifest hijack).
     let existing_manifest = store.load_group_manifest().expect("load manifest");
+    if existing_manifest.is_some() {
+        println!("group manifest restored");
+    }
+    let manifest_slot: Arc<Mutex<Option<GroupManifest>>> = Arc::new(Mutex::new(existing_manifest));
 
     // Separate store connection for the on_manifest_changed callback.
     // SQLite WAL mode allows concurrent connections to the same file.
@@ -152,6 +160,7 @@ fn main() {
             }
         },
         op_log,
+        manifest_slot,
         // on_removed_from_group
         || {
             println!("\n[removed from group]");
@@ -228,12 +237,6 @@ fn main() {
         })),
     )
     .expect("start session");
-
-    // Restore group manifest — reconnect loop will replay the outbox on connect.
-    if let Some(m) = existing_manifest {
-        session.set_manifest(m);
-        println!("group manifest restored");
-    }
 
     // ── Event callbacks ───────────────────────────────────────────────────────
 

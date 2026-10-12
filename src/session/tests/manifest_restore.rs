@@ -11,6 +11,10 @@
 //!
 //! The relays in these tests deliver immediately after the handshake —
 //! there is no grace period for the manifest to be restored.
+//!
+//! The red commits show both defects against the old seam; the tests below
+//! now run against the fixed seam, where the caller seeds the manifest slot
+//! at construction and passes it to `connect_background`.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -98,15 +102,12 @@ fn one_shot_pipe_factory(pipe: MemPipe) -> impl Fn() -> Result<MemPipe, String> 
     }
 }
 
-/// A restarted member briefly has NO manifest: a `Sync` pushed by a
-/// non-member in that window passes the (no-op) filter and reaches the
-/// handler. It must be discarded — the device is a member of a group that
-/// does not contain the sender.
+/// A restarted member must never behave like an unjoined device: a `Sync`
+/// pushed by a non-member the moment the session connects is discarded,
+/// because the persisted manifest is already in place.
 ///
-/// RED against the current seam: `connect_background` starts with
-/// `manifest == None` and the persisted manifest is set only afterwards
-/// (here: after the Deliver has been processed — exactly the `ffi.rs`
-/// order), so the non-member's Sync is delivered.
+/// Red against the old seam (manifest restored after connect): the intruder's
+/// Sync passed the no-op `None` filter and reached the handler.
 #[test]
 fn non_member_sync_during_restart_window_is_discarded() {
     let relay_kp = make_relay_kp();
@@ -125,13 +126,14 @@ fn non_member_sync_during_restart_window_is_discarded() {
     let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(vec![]));
     let rc = received.clone();
 
-    let session = TruesealSession::<MemPipe>::connect_background(
+    let _session = TruesealSession::<MemPipe>::connect_background(
         relay_pub,
         device_a,
         move |msg, _author, _seq| {
             rc.lock().unwrap().push(msg);
         },
         Box::new(MemLog::new()),
+        Arc::new(Mutex::new(Some(persisted))),
         || {},
         |_| {},
         || {},
@@ -141,11 +143,6 @@ fn non_member_sync_during_restart_window_is_discarded() {
         None,
     )
     .expect("session");
-
-    // Current FFI/CLI order: the manifest is restored only AFTER the
-    // reconnect loop (and the first Deliver) has started.
-    std::thread::sleep(Duration::from_millis(300)); // let the Deliver be processed
-    session.set_manifest(persisted);
 
     // Give the receive loop ample time, then assert the intruder's Sync
     // never reached the handler.
@@ -157,12 +154,122 @@ fn non_member_sync_during_restart_window_is_discarded() {
     );
 }
 
-/// A newer valid manifest delivered right after restart must be kept — the
-/// stale persisted copy must NOT overwrite it.
+/// A `Sync` from a group member, waiting in the inbox at restart, is judged
+/// against the persisted manifest on first delivery and reaches the handler.
+#[test]
+fn member_sync_is_judged_against_persisted_manifest_on_first_delivery() {
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let device_a = DeviceKeypair::generate();
+    let device_b = DeviceKeypair::generate();
+
+    let persisted = persisted_manifest(&device_a, &device_b);
+
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let body = deliver_body(1, b"from member", &device_a, &device_b);
+    spawn_immediate_relay(pipe_relay, &relay_kp, vec![frame(MsgType::Deliver, &body)]);
+
+    let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(vec![]));
+    let rc = received.clone();
+
+    let _session = TruesealSession::<MemPipe>::connect_background(
+        relay_pub,
+        device_a,
+        move |msg, _author, _seq| {
+            rc.lock().unwrap().push(msg);
+        },
+        Box::new(MemLog::new()),
+        Arc::new(Mutex::new(Some(persisted))),
+        || {},
+        |_| {},
+        || {},
+        one_shot_pipe_factory(pipe_client),
+        || Err("push factory unused".into()),
+        Some(Duration::from_millis(50)),
+        None,
+    )
+    .expect("session");
+
+    wait_for(
+        || {
+            matches!(
+                received.lock().unwrap().first(),
+                Some(Message::Sync { body }) if body == b"from member"
+            )
+        },
+        Duration::from_secs(3),
+    );
+}
+
+/// A `Sync` delivered right after restart carries the correct sender noise
+/// key: the FFI's attribution closure shares the seeded manifest slot, so
+/// the lookup succeeds from the very first Deliver.
+#[test]
+fn sender_noise_key_resolves_from_seeded_manifest_after_restart() {
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let device_a = DeviceKeypair::generate();
+    let device_b = DeviceKeypair::generate();
+
+    let persisted = persisted_manifest(&device_a, &device_b);
+    let b_noise = device_b.public_key().0;
+
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let body = deliver_body(1, b"attributed", &device_a, &device_b);
+    spawn_immediate_relay(pipe_relay, &relay_kp, vec![frame(MsgType::Deliver, &body)]);
+
+    // Mirror the FFI wiring (ffi.rs create): one shared, pre-seeded slot;
+    // the closure resolves the sender's noise pub through it.
+    let manifest_slot: Arc<Mutex<Option<GroupManifest>>> = Arc::new(Mutex::new(Some(persisted)));
+    let manifest_cb = manifest_slot.clone();
+    let sender_pubs: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
+    let sp = sender_pubs.clone();
+
+    let _session = TruesealSession::<MemPipe>::connect_background(
+        relay_pub,
+        device_a,
+        move |msg, author_signing_pub, _seq| {
+            if matches!(msg, Message::Sync { .. }) {
+                let sender_noise_pub = manifest_cb
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|m| m.noise_pub_for_signing(&author_signing_pub))
+                    .map(|k| k.0.to_vec())
+                    .unwrap_or_default();
+                sp.lock().unwrap().push(sender_noise_pub);
+            }
+        },
+        Box::new(MemLog::new()),
+        manifest_slot,
+        || {},
+        |_| {},
+        || {},
+        one_shot_pipe_factory(pipe_client),
+        || Err("push factory unused".into()),
+        Some(Duration::from_millis(50)),
+        None,
+    )
+    .expect("session");
+
+    wait_for(
+        || !sender_pubs.lock().unwrap().is_empty(),
+        Duration::from_secs(3),
+    );
+    assert_eq!(
+        sender_pubs.lock().unwrap()[0],
+        b_noise.to_vec(),
+        "SYNC-7: a Sync delivered right after restart must carry the sender's \
+         noise key resolved from the persisted manifest"
+    );
+}
+
+/// A newer valid manifest delivered right after restart is kept — with the
+/// slot seeded at construction there is no later `set_manifest` of the stale
+/// persisted copy that could overwrite it.
 ///
-/// RED against the current seam: the FFI's `set_manifest(persisted)` runs
-/// after the window and overwrites the v2 that already arrived, so memory
-/// (and, via `on_manifest_changed`, potentially the store) regresses to v1.
+/// Red against the old seam: the FFI's `set_manifest(persisted v1)` ran after
+/// the window and regressed memory to v1.
 #[test]
 fn newer_manifest_delivered_during_restart_window_is_kept() {
     let relay_kp = make_relay_kp();
@@ -214,6 +321,7 @@ fn newer_manifest_delivered_during_restart_window_is_kept() {
         device_a,
         |_, _, _| {},
         Box::new(MemLog::new()),
+        Arc::new(Mutex::new(Some(v1))),
         || {},
         |_| {},
         || {},
@@ -224,30 +332,17 @@ fn newer_manifest_delivered_during_restart_window_is_kept() {
     )
     .expect("session");
 
-    // Wait for v2 to arrive and be applied (genesis accept: slot is None).
+    // v2 arrives the moment the session connects and is verified against the
+    // seeded v1 (issuer is a current member, version increments).
     wait_for(
-        || {
-            session
-                .manifest
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|m| m.version)
-                == Some(2)
-        },
+        || session.manifest.lock().unwrap().as_ref().map(|m| m.version) == Some(2),
         Duration::from_secs(3),
     );
 
-    // Current FFI/CLI order: restore the persisted v1 AFTER connect.
-    session.set_manifest(v1);
-
+    // It stays v2 — nothing restores the stale persisted copy afterwards.
+    std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
-        session
-            .manifest
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|m| m.version),
+        session.manifest.lock().unwrap().as_ref().map(|m| m.version),
         Some(2),
         "SYNC-7: a newer manifest delivered during the restart window must \
          not be overwritten by the stale persisted copy"

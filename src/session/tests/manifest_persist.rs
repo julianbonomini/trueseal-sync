@@ -316,11 +316,27 @@ fn manifest_restore_via_connect_background() {
     let store_a2_cb = store_a.clone();
     let store_a3 = store_a.clone();
 
+    // Restore manifest from store BEFORE any relay connection — this is the
+    // FFI flow (SYNC-7, #99): the slot is seeded at construction, so the
+    // reconnect loop never observes a transient `None`.
+    let restored = store_a3
+        .lock()
+        .unwrap()
+        .load_group_manifest()
+        .expect("load")
+        .expect("manifest for A2");
+    assert_eq!(
+        restored.members.len(),
+        2,
+        "A2 manifest has 2 members before connect"
+    );
+
     let session_a2: TruesealSession<MemPipeSimple> = TruesealSession::connect_background(
         relay_pub,
         DeviceKeypair::from_bytes(a_noise_priv, a_signing_priv).expect("reconstruct A"),
         |_, _, _| {},
         Box::new(MemLog::new()),
+        Arc::new(Mutex::new(Some(restored))),
         || {},
         move |m| {
             let _ = store_a2_cb.lock().unwrap().save_group_manifest(m);
@@ -338,20 +354,6 @@ fn manifest_restore_via_connect_background() {
         None,
     )
     .expect("session A2");
-
-    // Restore manifest from store BEFORE any relay connection — this is the FFI flow.
-    let restored = store_a3
-        .lock()
-        .unwrap()
-        .load_group_manifest()
-        .expect("load")
-        .expect("manifest for A2");
-    assert_eq!(
-        restored.members.len(),
-        2,
-        "A2 manifest has 2 members before connect"
-    );
-    session_a2.set_manifest(restored);
 
     // Wait for A2 to reconnect via the factory.
     std::thread::sleep(Duration::from_millis(300));

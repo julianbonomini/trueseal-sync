@@ -141,6 +141,7 @@ fn queued_blob_reaches_handler_after_reconnect() {
             rc.lock().unwrap().push(msg);
         },
         Box::new(MemLog::new()),
+        Arc::new(Mutex::new(None)),
         || {},
         |_| {},
         || {},

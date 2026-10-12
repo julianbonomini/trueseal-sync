@@ -202,14 +202,19 @@ impl TruesealFfiSession {
         let relay_pub_key =
             noise_pub_from_bytes(&relay_pub).map_err(|_| SessionError::InvalidRelayPublicKey)?;
 
-        // Late-bind slot: filled after the session is built so the on_message
-        // closure can look up sender noise pub from the session's manifest.
-        let manifest_slot: Arc<Mutex<Option<Arc<Mutex<Option<crate::manifest::GroupManifest>>>>>> =
-            Arc::new(Mutex::new(None));
+        // SYNC-7 (#99): the manifest slot is created and seeded from the store
+        // BEFORE the session (and its reconnect loop) starts, so the receive
+        // path never observes a transient `None`. The on_message closure shares
+        // the same slot for sender attribution, so it resolves the sender's
+        // noise key from the very first Deliver — no late-bind window.
+        // A store read error leaves the slot empty, matching the previous
+        // restore-failure tolerance: `create()` stays infallible (ADR-0017).
+        let manifest: Arc<Mutex<Option<crate::manifest::GroupManifest>>> =
+            Arc::new(Mutex::new(store.load_group_manifest().ok().flatten()));
         // Wrap callbacks in Arc so the on_message closure can be Clone
         // (required by connect_background for the reconnect loop).
         let on_message = Arc::new(on_message);
-        let manifest_slot_cb = manifest_slot.clone();
+        let manifest_cb = manifest.clone();
 
         // Open a second store handle for PersistentLog (same DB file, separate connection).
         let log_store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
@@ -218,12 +223,6 @@ impl TruesealFfiSession {
             }
         })?;
 
-        // Open a third store handle for manifest persistence.
-        let manifest_store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
-            SessionError::InvalidNamespace {
-                msg: format!("store: {e}"),
-            }
-        })?;
         let manifest_store_save = Arc::new(Mutex::new(
             Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
                 SessionError::InvalidNamespace {
@@ -249,25 +248,19 @@ impl TruesealFfiSession {
             keypair,
             move |msg, author_signing_pub, sequence| {
                 if let Message::Sync { body } = msg {
-                    let sender_noise_pub = manifest_slot_cb
+                    let sender_noise_pub = manifest_cb
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .as_ref()
-                        .and_then(|m| {
-                            m.lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .as_ref()
-                                .and_then(|manifest| {
-                                    manifest.noise_pub_for_signing(&author_signing_pub)
-                                })
-                                .map(|k| k.0.to_vec())
-                        })
+                        .and_then(|manifest| manifest.noise_pub_for_signing(&author_signing_pub))
+                        .map(|k| k.0.to_vec())
                         .unwrap_or_default();
                     let message_id = crate::message::message_id(&author_signing_pub, sequence);
                     on_message.on_message(body, sender_noise_pub, message_id);
                 }
             },
             Box::new(PersistentLog::new(log_store)),
+            manifest,
             move || {
                 on_removed_from_group.on_removed_from_group();
             },
@@ -297,14 +290,6 @@ impl TruesealFfiSession {
             }),
         )
         .map_err(SessionError::from)?;
-
-        // Restore manifest from store if one was persisted in a previous session.
-        if let Ok(Some(manifest)) = manifest_store.load_group_manifest() {
-            inner.set_manifest(manifest);
-        }
-
-        // Wire the manifest arc into the closure's slot now that the session exists.
-        *manifest_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(inner.manifest.clone());
 
         Ok(Arc::new(Self { inner }))
     }
