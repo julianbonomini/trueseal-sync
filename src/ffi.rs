@@ -45,6 +45,11 @@ pub enum SessionError {
     /// retry with the same body fails the same way.
     #[error("payload too large: maximum {max} bytes")]
     PayloadTooLarge { max: u32 },
+    /// The current manifest's version cannot be incremented — issuing would
+    /// produce `u64::MAX`, which receivers reject (SYNC-10, ADR-0027).
+    /// Membership is exhausted; the group's Devices must pair again.
+    #[error("manifest version exhausted: cannot issue a new version")]
+    ManifestVersionExhausted,
 }
 
 impl From<CoreSessionError> for SessionError {
@@ -64,6 +69,7 @@ impl From<CoreSessionError> for SessionError {
                 SessionError::RelayVersionUnsupported { min, max }
             }
             CoreSessionError::PayloadTooLarge { max } => SessionError::PayloadTooLarge { max },
+            CoreSessionError::ManifestVersionExhausted => SessionError::ManifestVersionExhausted,
         }
     }
 }

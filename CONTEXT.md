@@ -68,6 +68,10 @@ _Avoid_: group key, group address, channel ID
 A monotonically increasing integer scoped to a Group ID. Increments on every membership change. When two members issue the same version concurrently, every Device picks the same winner, and the issuer whose change lost re-applies it automatically (see Pending Membership Change). Not scoped per device.
 _Avoid_: epoch, generation, revision
 
+**Maximum Manifest Version Jump**:
+The largest version increase a Device accepts between its current Group Manifest and an incoming one: 1,024. Honest issuers always step by one, so a larger jump marks a hostile or corrupt manifest; it is acked, dropped and reported as a Delivery Issue. A manifest at the largest representable version (`u64::MAX`) is always rejected — it could never be incremented, so accepting it would freeze membership for good. A Device that somehow falls more than 1,024 versions behind can no longer accept manifests and must re-pair.
+_Avoid_: version cap, epoch limit
+
 **Protocol Version**:
 The general concept of which wire format a component speaks. Split into two independent numbers: Transport Version and End-to-End Version. Unrelated to Manifest Version (which counts membership changes) and to package versions (which never imply wire compatibility).
 _Avoid_: version (unqualified), epoch, protocol revision
