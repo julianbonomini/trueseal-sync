@@ -3,6 +3,7 @@
 uniffi::setup_scaffolding!();
 
 pub mod crypto;
+pub mod delivery_issue;
 pub mod device;
 pub mod envelope;
 pub mod ffi;
@@ -15,6 +16,8 @@ pub mod relay;
 pub mod revocation;
 pub mod session;
 pub mod store;
+pub mod version;
 
 pub use keys::{NoisePublicKey, SigningPublicKey};
 pub use operation_log::LogEntry;
+pub use version::{END_TO_END_VERSION, TRANSPORT_VERSION};
