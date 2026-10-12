@@ -784,7 +784,15 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                     .and_then(|transport| {
                         push_send(transport, self.relay_pub_bytes, framed)
                             .map(|_| ())
-                            .map_err(|e| SessionError::PushFailed(e.to_string()))
+                            .map_err(|e| match e {
+                                // Preserve the typed refusal (ADR-0022) instead
+                                // of erasing it into a string, mirroring the
+                                // reconnect loop.
+                                crate::relay::RelayError::RelayVersionUnsupported { min, max } => {
+                                    SessionError::RelayVersionUnsupported { min, max }
+                                }
+                                other => SessionError::PushFailed(other.to_string()),
+                            })
                     })
             })
     }
@@ -1138,10 +1146,22 @@ impl TruesealSession<TcpStream> {
         keypair: DeviceKeypair,
         on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
     ) -> Result<Self, SessionError> {
+        // Non-blocking on both the receive stream and every push stream, so
+        // the Transport Version exchange's deadline is effective (a silent
+        // pre-version relay surfaces as a typed timeout, not a hang) and a
+        // blocking receive can't starve concurrent sends. This matches the
+        // FFI and CLI factories.
         let stream =
             TcpStream::connect(addr).map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
+        stream
+            .set_nonblocking(true)
+            .map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
         let addr = addr.to_string();
-        let push_factory = move || TcpStream::connect(&addr).map_err(|e| e.to_string());
+        let push_factory = move || {
+            let s = TcpStream::connect(&addr).map_err(|e| e.to_string())?;
+            s.set_nonblocking(true).map_err(|e| e.to_string())?;
+            Ok(s)
+        };
         Self::connect(stream, relay_pub, keypair, on_message, push_factory)
     }
 }

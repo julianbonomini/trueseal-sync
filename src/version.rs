@@ -356,6 +356,24 @@ mod tests {
         assert_ne!(addressed_encryption_hkdf_info(), addressed_encryption_aad());
     }
 
+    /// The exact binding bytes are pinned, so a revert to the legacy
+    /// unversioned info string or a dropped AAD domain fails this test even
+    /// though every encrypt/decrypt round-trip would still pass. Stopgap
+    /// until the SYNC-2 JSON test vectors pin these bytes cross-repo.
+    #[test]
+    fn binding_bytes_are_pinned() {
+        assert_eq!(
+            addressed_encryption_hkdf_info(),
+            b"trueseal-sync addressed encryption v1"
+        );
+        assert_eq!(
+            addressed_encryption_aad(),
+            b"trueseal-sync addressed encryption aad v1"
+        );
+        assert_eq!(envelope_signing_domain(), b"trueseal-sync envelope v1\0");
+        assert_eq!(manifest_signing_domain(), b"trueseal-sync manifest v1\0");
+    }
+
     #[test]
     fn parse_unsupported_reply_accepts_the_documented_form() {
         assert_eq!(parse_unsupported_reply(b"unsupported 1..1\n"), Some((1, 1)));

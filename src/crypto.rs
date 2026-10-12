@@ -204,6 +204,47 @@ mod tests {
         );
     }
 
+    /// A blob sealed under the LEGACY scheme (unversioned HKDF info
+    /// `trueseal-sync addressed encryption v0`, no AAD — the pre-ADR-0022
+    /// format) must fail to decrypt now. Pins the version binding in the
+    /// scheme itself: reverting crypto.rs to the legacy info or dropping the
+    /// AAD makes this test fail even though round-trips would still pass.
+    /// Stopgap until the SYNC-2 JSON test vectors pin the bytes cross-repo.
+    #[test]
+    fn legacy_unversioned_blob_fails_to_decrypt() {
+        let (priv_b, pub_b) = generate_keypair();
+        let author_pub = [0x07u8; 32];
+        let plaintext = b"sealed before versions existed";
+
+        // Reproduce the legacy seal, self-contained: ephemeral DH, HKDF-SHA256
+        // with the v0 info string, ChaCha20-Poly1305 with NO associated data.
+        let mut inner = Vec::new();
+        inner.extend_from_slice(&author_pub);
+        inner.extend_from_slice(plaintext);
+        let eph_secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let eph_public = PublicKey::from(&eph_secret);
+        let shared = eph_secret.diffie_hellman(&PublicKey::from(pub_b.0));
+        let hk = Hkdf::<Sha256>::new(None, shared.as_bytes());
+        let mut key = [0u8; 32];
+        hk.expand(b"trueseal-sync addressed encryption v0", &mut key)
+            .expect("HKDF expand failed");
+        let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("valid key length");
+        let nonce = Nonce::default();
+        let ct = cipher.encrypt(&nonce, inner.as_ref()).expect("encryption");
+        let mut legacy_blob = Vec::new();
+        legacy_blob.extend_from_slice(eph_public.as_bytes());
+        legacy_blob.extend_from_slice(nonce.as_slice());
+        legacy_blob.extend_from_slice(&ct);
+
+        assert!(
+            matches!(
+                decrypt(priv_b, &legacy_blob),
+                Err(CryptoError::DecryptionFailed)
+            ),
+            "a blob sealed under the legacy v0 scheme must not decrypt under v1"
+        );
+    }
+
     /// Truncated ciphertext (too short) returns CryptoError::DecryptionFailed.
     #[test]
     fn truncated_ciphertext_returns_error() {

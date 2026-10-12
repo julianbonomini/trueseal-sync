@@ -146,6 +146,13 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
     /// The version prefix is sent in plaintext first and becomes the Noise
     /// prologue (ADR-0022): a relay that refuses it answers
     /// `unsupported min..max`, surfaced as `RelayError::RelayVersionUnsupported`.
+    ///
+    /// The transport must be non-blocking (reads return `WouldBlock` when no
+    /// data is ready) or carry its own read/write deadlines: the version
+    /// exchange and the session loops enforce their timeouts through
+    /// `WouldBlock` retries. A blocking transport with no deadline can hang
+    /// forever against a silent (pre-version) relay. `connect_tcp` sets
+    /// non-blocking mode for you.
     pub fn connect(
         transport: T,
         relay_pub: NoisePublicKey,
@@ -485,6 +492,13 @@ use std::net::TcpStream;
 
 impl RelayClient<TcpStream> {
     /// Connect to a relay over TCP at `addr`.
+    ///
+    /// The stream is put in non-blocking mode before the Transport Version
+    /// exchange, so a silent (pre-version) relay surfaces as a typed timeout
+    /// (within the exchange deadline, 10 s) instead of hanging a blocking
+    /// `read()` forever. Non-blocking is also the mode the FFI and CLI run
+    /// every session in: a blocking receive would hold the session lock for
+    /// the whole `read()` syscall and starve concurrent sends.
     pub fn connect_tcp(
         addr: &str,
         relay_pub: NoisePublicKey,
@@ -492,6 +506,9 @@ impl RelayClient<TcpStream> {
     ) -> Result<Self, RelayError> {
         let stream =
             TcpStream::connect(addr).map_err(|e| RelayError::ConnectionFailed(e.to_string()))?;
+        stream
+            .set_nonblocking(true)
+            .map_err(|e| RelayError::ConnectionFailed(e.to_string()))?;
         Self::connect(stream, relay_pub, my_keypair)
     }
 }
@@ -508,6 +525,10 @@ impl RelayClient<TcpStream> {
 ///
 /// The relay sees only the ephemeral key — a fresh keypair is generated on
 /// every call and discarded after the session (ADR-0002 / #51).
+///
+/// Like `RelayClient::connect`, the transport must be non-blocking or carry
+/// its own deadlines — otherwise a silent (pre-version) relay hangs the
+/// version exchange on a blocking `read()` forever.
 pub fn push_send<T: Read + Write + Send>(
     transport: T,
     relay_pub: [u8; 32],
@@ -553,12 +574,19 @@ mod tests {
     struct MemPipe {
         read_buf: Arc<Mutex<Vec<u8>>>,
         write_buf: Arc<Mutex<Vec<u8>>>,
+        /// Set by the peer when IT drops — this end then reads EOF.
         closed: Arc<std::sync::atomic::AtomicBool>,
+        /// Set when this end drops — the peer then reads EOF.
+        peer_closed: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl Drop for MemPipe {
         fn drop(&mut self) {
-            self.closed
+            // Signal EOF to the PEER: set the flag the other end observes,
+            // like closing a real socket does. (This previously set the flag
+            // this pipe observes about itself, so a dropped relay never EOFed
+            // the client.)
+            self.peer_closed
                 .store(true, std::sync::atomic::Ordering::Release);
         }
     }
@@ -599,11 +627,13 @@ mod tests {
                 read_buf: ba.clone(),
                 write_buf: ab.clone(),
                 closed: b_closed.clone(),
+                peer_closed: a_closed.clone(),
             },
             MemPipe {
                 read_buf: ab.clone(),
                 write_buf: ba.clone(),
                 closed: a_closed.clone(),
+                peer_closed: b_closed,
             },
         )
     }
@@ -1196,6 +1226,74 @@ mod tests {
             matches!(result, Err(RelayError::HandshakeFailed(_))),
             "mismatched prologue must fail the handshake, got {:?}",
             result.err()
+        );
+    }
+
+    /// The NK push path gets the same prologue binding: a relay that answers
+    /// `supported` but handshakes with different prologue bytes fails.
+    #[test]
+    fn nk_push_with_mismatched_prologue_breaks_the_handshake() {
+        let relay_kp = generate_keypair();
+        let relay_pub = relay_kp.public_key;
+        let (client_pipe, mut relay_pipe) = mem_pipe_pair();
+        std::thread::spawn(move || {
+            let _prefix = crate::version::fake_relay_accept_prefix(&mut relay_pipe);
+            let kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+            // Handshake with a DIFFERENT prologue than the prefix bytes.
+            let _ = trueseal_noise::session_nk::accept(relay_pipe, kp2, b"wrong prologue");
+        });
+
+        let result = push_send(client_pipe, relay_pub, frame(MsgType::Push, b"x"));
+        // The relay's accept fails on the prologue mismatch and it drops the
+        // connection. Depending on scheduling the initiator sees that either
+        // while dialing or while waiting for the Ack — never a successful push.
+        assert!(
+            matches!(
+                result,
+                Err(RelayError::HandshakeFailed(_)) | Err(RelayError::PushFailed(_))
+            ),
+            "mismatched prologue must fail the push, got {:?}",
+            result.err()
+        );
+    }
+
+    /// A silent pre-version relay (accepts TCP, never replies) must surface
+    /// as a typed timeout, not hang a blocking read forever — the
+    /// `connect_tcp` stream is non-blocking so the exchange deadline applies.
+    /// Pre-fix this test never returns.
+    #[test]
+    fn silent_relay_surfaces_a_timeout_not_a_hang() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        std::thread::spawn(move || {
+            // Accept and stay silent, holding the connection open.
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                drop(stream);
+            }
+        });
+
+        let device = DeviceKeypair::generate();
+        let start = std::time::Instant::now();
+        let result = RelayClient::connect_tcp(
+            &addr.to_string(),
+            NoisePublicKey(generate_keypair().public_key),
+            Keypair::new(device.noise.private(), device.noise.public_key),
+        );
+        let elapsed = start.elapsed();
+
+        match result {
+            Err(RelayError::HandshakeFailed(msg)) => assert!(
+                msg.contains("timed out"),
+                "expected a typed timeout, got {msg:?}"
+            ),
+            Err(other) => panic!("expected a HandshakeFailed timeout, got {other:?}"),
+            Ok(_) => panic!("a silent relay must not connect successfully"),
+        }
+        // The exchange deadline is 10 s; well clear of a hang, generous for CI.
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "took {elapsed:?} — deadline did not fire"
         );
     }
 

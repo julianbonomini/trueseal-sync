@@ -445,7 +445,6 @@ mod tests {
         // prost omits zero-valued scalar fields, so any envelope whose proto
         // encoding lacks field 7 decodes with version 0.
         let (env, _) = make_envelope();
-        // Hand-encode the old shape: same fields, version field absent.
         let mut raw = Vec::new();
         // sequence (field 1) omitted — defaults to 0, like the old format.
         prost::encoding::bytes::encode(3, &env.recipient_pub.to_vec(), &mut raw);
