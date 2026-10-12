@@ -80,39 +80,40 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
         };
 
         let noise_kp = NoiseKeypair::new(noise_priv, noise_pub_key);
-        let new_client = match RelayClient::connect(transport, relay_pub, noise_kp) {
-            Ok(c) => c,
-            Err(crate::relay::RelayError::RelayVersionUnsupported { min, max }) => {
-                // The relay refuses our Transport Version (ADR-0022). Keep
-                // retrying — the relay may be upgraded — and leave every
-                // outbox entry queued.
-                log::warn!(
-                    "relay supports Transport Version {min}..={max}, \
-                     this build speaks {}; outbox stays queued",
-                    crate::version::TRANSPORT_VERSION
-                );
-                continue;
-            }
-            Err(_) => continue,
-        };
-
-        // Reinstall the full manifest-aware subscription using the shared handler.
-        {
-            new_client.subscribe(super::build_subscribe_handler(
-                keys.clone(),
-                manifest.clone(),
-                on_removed_from_group.clone(),
-                on_manifest_changed.clone(),
-                on_group_destroyed.clone(),
-                destroyed.clone(),
-                pairing.clone(),
-                pending_members.clone(),
-                on_member_request.clone(),
-                on_member_joined.clone(),
-                on_member_left.clone(),
-                on_message.clone(),
-            ));
-        }
+        // SYNC-6 (#98): build the full manifest-aware handler first and
+        // register it inside connect, before the receive loop starts
+        // reading — a Blob queued while this device was down arrives the
+        // moment the new session comes up.
+        let handler = super::build_subscribe_handler(
+            keys.clone(),
+            manifest.clone(),
+            on_removed_from_group.clone(),
+            on_manifest_changed.clone(),
+            on_group_destroyed.clone(),
+            destroyed.clone(),
+            pairing.clone(),
+            pending_members.clone(),
+            on_member_request.clone(),
+            on_member_joined.clone(),
+            on_member_left.clone(),
+            on_message.clone(),
+        );
+        let new_client =
+            match RelayClient::connect_subscribed(transport, relay_pub, noise_kp, handler) {
+                Ok(c) => c,
+                Err(crate::relay::RelayError::RelayVersionUnsupported { min, max }) => {
+                    // The relay refuses our Transport Version (ADR-0022). Keep
+                    // retrying — the relay may be upgraded — and leave every
+                    // outbox entry queued.
+                    log::warn!(
+                        "relay supports Transport Version {min}..={max}, \
+                         this build speaks {}; outbox stays queued",
+                        crate::version::TRANSPORT_VERSION
+                    );
+                    continue;
+                }
+                Err(_) => continue,
+            };
 
         *client.lock().unwrap_or_else(|e| e.into_inner()) = new_client;
         backoff = Duration::from_secs(1);

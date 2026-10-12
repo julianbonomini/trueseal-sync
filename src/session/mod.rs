@@ -487,9 +487,11 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let on_mj_cb_ret = on_mj_cb.clone();
         let on_ml_cb_ret = on_ml_cb.clone();
 
-        let client = RelayClient::connect(transport, relay_pub, noise_kp)?;
-
-        client.subscribe(build_subscribe_handler(
+        // SYNC-6 (#98): the handler is built first and registered inside
+        // connect, before the receive loop starts reading. A Blob queued in
+        // the inbox while this device was offline arrives the moment the
+        // session comes up — subscribing afterwards would lose it.
+        let handler = build_subscribe_handler(
             keys_cb,
             manifest_cb,
             on_rfg_cb,
@@ -502,7 +504,8 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             on_mj_cb,
             on_ml_cb,
             on_message,
-        ));
+        );
+        let client = RelayClient::connect_subscribed(transport, relay_pub, noise_kp, handler)?;
 
         // Restore sequence counter from the op log so it never re-uses a
         // sequence number after a process restart (ADR-0011).
