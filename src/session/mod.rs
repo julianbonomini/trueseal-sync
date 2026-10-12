@@ -16,7 +16,7 @@ use log::warn;
 use thiserror::Error;
 use trueseal_noise::keypair::Keypair as NoiseKeypair;
 
-use crate::delivery_issue::{DeliveryIssue, SendFailedReason};
+use crate::delivery_issue::{DeliveryIssue, SendFailedReason, UnreadableReason};
 use crate::device::DeviceKeypair;
 use crate::envelope::SigningKeypair;
 use crate::keys::{NoisePublicKey, SigningPublicKey};
@@ -69,6 +69,12 @@ pub enum SessionError {
     /// the same way.
     #[error("payload too large: maximum {max} bytes")]
     PayloadTooLarge { max: u32 },
+    /// The current manifest's version cannot be incremented — issuing would
+    /// produce `u64::MAX`, which receivers reject because it can never be
+    /// incremented (SYNC-10, ADR-0027). Checked arithmetic: no panic, no
+    /// wrap. Membership is exhausted; the group's Devices must pair again.
+    #[error("manifest version exhausted: cannot issue a new version")]
+    ManifestVersionExhausted,
 }
 
 impl From<crate::relay::RelayError> for SessionError {
@@ -137,7 +143,7 @@ pub(super) struct PendingMember {
 /// to every subscriber. The buffer is one-shot — it drains on the first
 /// subscribe, and the dropped entries are gone from the log — so a report
 /// still reaches the app exactly once across reloads.
-struct IssueSink {
+pub(super) struct IssueSink {
     pending: Vec<DeliveryIssue>,
     callbacks: Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>,
 }
@@ -295,6 +301,7 @@ pub(super) fn build_subscribe_handler(
     on_member_request: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
     on_member_joined: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
     on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
+    issue_sink: Arc<Mutex<IssueSink>>,
     on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
 ) -> impl Fn(Message, [u8; 32], u64) + Send + 'static {
     move |msg, author_signing_pub, sequence| {
@@ -378,72 +385,89 @@ pub(super) fn build_subscribe_handler(
         if let Message::GroupManifest { manifest: incoming } = &msg {
             let local_signing_pub = keys.lock().unwrap_or_else(|e| e.into_inner()).signing_pub.0;
             let mut guard = manifest.lock().unwrap_or_else(|e| e.into_inner());
-            let accept = match *guard {
-                None => incoming.verify(None).is_ok(),
-                Some(ref current) => incoming.verify(Some(current)).is_ok(),
+            let verdict = match *guard {
+                None => incoming.verify(None),
+                Some(ref current) => incoming.verify(Some(current)),
             };
-            if accept {
-                let excluded = !incoming.contains_signing_pub(&local_signing_pub);
-
-                let (joined, left): (Vec<_>, Vec<_>) = {
-                    let prev_pubs: std::collections::HashSet<[u8; 32]> = guard
-                        .as_ref()
-                        .map(|m| m.members.iter().map(|mm| mm.signing_pub.0).collect())
-                        .unwrap_or_default();
-                    let next_pubs: std::collections::HashSet<[u8; 32]> =
-                        incoming.members.iter().map(|mm| mm.signing_pub.0).collect();
-                    let joined = incoming
-                        .members
-                        .iter()
-                        .filter(|mm| !prev_pubs.contains(&mm.signing_pub.0))
-                        .map(|mm| (member_id(&mm.signing_pub), member_name(&mm.signing_pub)))
-                        .collect();
-                    let left = guard
-                        .as_ref()
-                        .map(|m| {
-                            m.members
-                                .iter()
-                                .filter(|mm| {
-                                    !next_pubs.contains(&mm.signing_pub.0)
-                                        // Don't fire onMemberLeft for local device.
-                                        && mm.signing_pub.0 != local_signing_pub
-                                })
-                                .map(|mm| {
-                                    (member_id(&mm.signing_pub), member_name(&mm.signing_pub))
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    (joined, left)
-                };
-
-                *guard = Some(incoming.clone());
-                drop(guard); // release lock BEFORE firing any callback
-
-                (on_manifest_changed)(incoming);
-
-                if let Some(cb) = on_member_joined
+            // A manifest that fails verification is acked and dropped with a
+            // typed Delivery Issue (ADR-0027). `Unreadable(Malformed)` is the
+            // closest reason in ADR-0034's closed list — the Blob could not
+            // be authorised; SYNC-15 owns any finer control-plane taxonomy.
+            // This covers every rejection: bad signature, regression,
+            // unknown issuer, an over-bound version jump, and u64::MAX
+            // (SYNC-10). The lock is released before the sink fires, as with
+            // every callback in this handler.
+            if let Err(err) = verdict {
+                let rejected_version = incoming.version;
+                drop(guard);
+                warn!(
+                    "[trueseal-sync] rejected GroupManifest v{}: {}",
+                    rejected_version, err
+                );
+                issue_sink
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .as_ref()
-                {
-                    for (id, name) in joined {
-                        cb(id, name);
-                    }
-                }
-                if let Some(cb) = on_member_left
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .as_ref()
-                {
-                    for (id, name) in left {
-                        cb(id, name);
-                    }
-                }
+                    .fire(DeliveryIssue::Unreadable(UnreadableReason::Malformed));
+                return;
+            }
+            let excluded = !incoming.contains_signing_pub(&local_signing_pub);
 
-                if excluded {
-                    (on_removed_from_group)();
+            let (joined, left): (Vec<_>, Vec<_>) = {
+                let prev_pubs: std::collections::HashSet<[u8; 32]> = guard
+                    .as_ref()
+                    .map(|m| m.members.iter().map(|mm| mm.signing_pub.0).collect())
+                    .unwrap_or_default();
+                let next_pubs: std::collections::HashSet<[u8; 32]> =
+                    incoming.members.iter().map(|mm| mm.signing_pub.0).collect();
+                let joined = incoming
+                    .members
+                    .iter()
+                    .filter(|mm| !prev_pubs.contains(&mm.signing_pub.0))
+                    .map(|mm| (member_id(&mm.signing_pub), member_name(&mm.signing_pub)))
+                    .collect();
+                let left = guard
+                    .as_ref()
+                    .map(|m| {
+                        m.members
+                            .iter()
+                            .filter(|mm| {
+                                !next_pubs.contains(&mm.signing_pub.0)
+                                    // Don't fire onMemberLeft for local device.
+                                    && mm.signing_pub.0 != local_signing_pub
+                            })
+                            .map(|mm| (member_id(&mm.signing_pub), member_name(&mm.signing_pub)))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (joined, left)
+            };
+
+            *guard = Some(incoming.clone());
+            drop(guard); // release lock BEFORE firing any callback
+
+            (on_manifest_changed)(incoming);
+
+            if let Some(cb) = on_member_joined
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                for (id, name) in joined {
+                    cb(id, name);
                 }
+            }
+            if let Some(cb) = on_member_left
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                for (id, name) in left {
+                    cb(id, name);
+                }
+            }
+
+            if excluded {
+                (on_removed_from_group)();
             }
             return;
         }
@@ -605,6 +629,9 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let on_mj_cb_ret = on_mj_cb.clone();
         let on_ml_cb_ret = on_ml_cb.clone();
 
+        let op_log: Arc<Mutex<Box<dyn OperationLog>>> = Arc::new(Mutex::new(op_log));
+        let issue_sink = Arc::new(Mutex::new(IssueSink::new()));
+
         // SYNC-6 (#98): the handler is built first and registered inside
         // connect, before the receive loop starts reading. A Blob queued in
         // the inbox while this device was offline arrives the moment the
@@ -621,12 +648,11 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             on_mr_cb,
             on_mj_cb,
             on_ml_cb,
+            issue_sink.clone(),
             on_message,
         );
         let client = RelayClient::connect_subscribed(transport, relay_pub, noise_kp, handler)?;
 
-        let op_log: Arc<Mutex<Box<dyn OperationLog>>> = Arc::new(Mutex::new(op_log));
-        let issue_sink = Arc::new(Mutex::new(IssueSink::new()));
         // SYNC-8 (#100): drop oversize entries persisted by pre-fix builds —
         // they can never be delivered and would replay forever (ADR-0025).
         // The reports buffer in the sink until the first subscriber registers.
@@ -705,6 +731,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let on_mr_arc = session.on_member_request.clone();
         let on_mj_arc = session.on_member_joined.clone();
         let on_ml_arc = session.on_member_left.clone();
+        let issue_sink_arc = session.issue_sink.clone();
         let push_factory_arc = session.push_factory.clone();
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
         let on_cc: Arc<dyn Fn(bool) + Send + Sync + 'static> = on_connection_changed
@@ -727,6 +754,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 on_mr_arc,
                 on_mj_arc,
                 on_ml_arc,
+                issue_sink_arc,
                 transport_factory,
                 push_factory_arc,
                 cap,
@@ -855,6 +883,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 on_member_request,
                 on_member_joined,
                 on_member_left,
+                issue_sink,
                 transport_factory,
                 push_factory_for_reconnect,
                 cap,
@@ -1126,10 +1155,28 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                     )
                 }
                 Some(current) => {
+                    // SYNC-10 (#102): checked arithmetic. Unreachable in
+                    // practice — receivers reject u64::MAX and bound the
+                    // jump — so a refusal stays a silent `false` here; the
+                    // typed admission API is SYNC-15 scope.
+                    let next_version = match current
+                        .version
+                        .checked_add(1)
+                        .filter(|&v| v < u64::MAX)
+                    {
+                        Some(v) => v,
+                        None => {
+                            warn!(
+                                "[trueseal-sync] refusing admission: manifest version {} is exhausted",
+                                current.version
+                            );
+                            return false;
+                        }
+                    };
                     // Extend existing manifest.
                     let mut members = current.members.clone();
                     members.push(new_member);
-                    GroupManifest::new(current.group_id, current.version + 1, members, &signing_key)
+                    GroupManifest::new(current.group_id, next_version, members, &signing_key)
                 }
             }
         };
@@ -1273,12 +1320,15 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 .cloned()
                 .collect();
 
-            let new_manifest = GroupManifest::new(
-                current.group_id,
-                current.version + 1,
-                remaining,
-                &signing_key,
-            );
+            // SYNC-10 (#102): checked arithmetic — never panic, wrap, or
+            // issue a u64::MAX manifest every receiver rejects (ADR-0027).
+            let next_version = current
+                .version
+                .checked_add(1)
+                .filter(|&v| v < u64::MAX)
+                .ok_or(SessionError::ManifestVersionExhausted)?;
+            let new_manifest =
+                GroupManifest::new(current.group_id, next_version, remaining, &signing_key);
 
             // Notify: all remaining members excluding self.
             let self_noise = self

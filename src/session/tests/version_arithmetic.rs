@@ -18,7 +18,7 @@ use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
 use crate::message::Message;
 
 use super::super::test_helpers::*;
-use super::super::TruesealSession;
+use super::super::{SessionError, TruesealSession};
 
 fn member(noise_pub: NoisePublicKey, signing_pub: SigningPublicKey, name: &str) -> ManifestMember {
     ManifestMember {
@@ -248,7 +248,7 @@ fn remove_member_at_max_issuable_version_returns_typed_error() {
 
     let result = session.remove_member(b_signing);
     assert!(
-        result.is_err(),
+        matches!(result, Err(SessionError::ManifestVersionExhausted)),
         "issuing past the maximum allowed version must fail with a typed error"
     );
     assert_eq!(
@@ -297,7 +297,7 @@ fn remove_member_at_u64_max_does_not_panic_or_wrap() {
 
     let result = session.remove_member(b_signing);
     assert!(
-        result.is_err(),
+        matches!(result, Err(SessionError::ManifestVersionExhausted)),
         "issuing from u64::MAX must fail typed, not panic or wrap"
     );
     assert_eq!(session.members().len(), 1);

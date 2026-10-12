@@ -29,13 +29,14 @@ The guiding rule from ADR-0026 applies: nothing the app must get right for corre
 ### Manifest format and ordering
 
 - A manifest adds `parent`, the hash of the manifest it was built on. The genesis manifest has no parent. `parent` is covered by the manifest signature, whose signing input is domain-separated (ADR-0022).
-- An issuer always sets `version = base.version + 1`, using checked arithmetic.
+- An issuer always sets `version = base.version + 1`, using checked arithmetic. When the base version cannot be incremented, issuance fails with the typed `ManifestVersionExhausted` error — it never panics or wraps (SYNC-10).
 - A receiver accepts an incoming manifest if all of the following hold:
   - the signature verifies;
   - the group ID matches;
   - the issuer is a member of the receiver's current manifest;
   - `(version, hash)` is strictly greater than the current manifest's;
-  - the version jump is within a sanity bound.
+  - the version jump is within the **Maximum Manifest Version Jump: 1024** (bound fixed 2026-10-12 by SYNC-10; `MAX_MANIFEST_VERSION_JUMP` in `src/manifest.rs`). Honest issuers always step by one — a re-applied Pending Membership Change is `W.version + 1` too — so a larger jump marks a hostile or corrupt manifest. A Device that somehow misses more than 1024 membership changes can no longer accept manifests and must re-pair; that is the documented tradeoff of any sanity bound. The bound goes into the SYNC-2 test vectors.
+  - the version is not `u64::MAX` — it could never be incremented, so accepting it would freeze membership for good. Rejected as genesis or update (SYNC-10).
   On an equal version, the **lower** manifest hash wins. A manifest that fails is acked and dropped with a typed event (ADR-0026).
 - **Maximum Group Size is 32 members.** An admission that would exceed it is refused locally with a typed error. A test proves that a 32-member manifest fits in one frame (ADR-0025).
 

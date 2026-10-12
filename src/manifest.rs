@@ -3,6 +3,19 @@ use rand::rngs::OsRng;
 
 use crate::keys::{NoisePublicKey, SigningPublicKey};
 
+/// The Maximum Manifest Version Jump: the largest version increase a
+/// receiver accepts between its current Group Manifest and an incoming one
+/// (ADR-0027 "Manifest format and ordering", bound fixed at 1024 by SYNC-10).
+///
+/// Honest issuers always step by one — a re-applied Pending Membership
+/// Change is `W.version + 1` too — so a larger jump marks a hostile or
+/// corrupt manifest. The bound's job is to stop a single manifest from
+/// freezing the group (the `u64::MAX` attack), not to bound honest churn,
+/// which is human-scale: a Device that somehow misses more than 1024
+/// membership changes can no longer accept manifests and must re-pair.
+/// Recorded in CONTEXT.md and added to the test vectors by SYNC-2.
+pub const MAX_MANIFEST_VERSION_JUMP: u64 = 1024;
+
 // ── Proto generated types ─────────────────────────────────────────────────────
 
 mod proto {
@@ -41,6 +54,16 @@ pub enum ManifestError {
     InvalidSignature,
     #[error("version regression: incoming {incoming} <= current {current}")]
     VersionRegression { incoming: u64, current: u64 },
+    #[error(
+        "version jump too large: incoming {incoming} is more than {max} above current {current}"
+    )]
+    VersionJumpTooLarge {
+        incoming: u64,
+        current: u64,
+        max: u64,
+    },
+    #[error("version exhausted: u64::MAX can never be incremented; accepting it would freeze membership")]
+    VersionExhausted,
     #[error("group id mismatch: incoming manifest belongs to a different group")]
     GroupIdMismatch,
     #[error("unknown issuer: issued_by not in previous manifest members")]
@@ -94,6 +117,13 @@ impl GroupManifest {
     pub fn verify(&self, previous: Option<&GroupManifest>) -> Result<(), ManifestError> {
         use ed25519_dalek::{Signature, VerifyingKey};
 
+        // SYNC-10 (#102): a manifest at u64::MAX can never be incremented,
+        // so accepting it would freeze membership for good — reject it on
+        // receipt, as genesis or update (ADR-0027).
+        if self.version == u64::MAX {
+            return Err(ManifestError::VersionExhausted);
+        }
+
         // Check issuer is in previous manifest (skip for genesis)
         if let Some(prev) = previous {
             if self.group_id != prev.group_id {
@@ -103,6 +133,16 @@ impl GroupManifest {
                 return Err(ManifestError::VersionRegression {
                     incoming: self.version,
                     current: prev.version,
+                });
+            }
+            // SYNC-10 (#102): bound the version jump. Subtraction is safe —
+            // the regression check above guarantees self.version > prev.version.
+            let jump = self.version - prev.version;
+            if jump > MAX_MANIFEST_VERSION_JUMP {
+                return Err(ManifestError::VersionJumpTooLarge {
+                    incoming: self.version,
+                    current: prev.version,
+                    max: MAX_MANIFEST_VERSION_JUMP,
                 });
             }
             let issuer_known = prev
@@ -424,7 +464,10 @@ mod tests {
         let hostile = GroupManifest::new(group_id, u64::MAX, vec![member], &key);
 
         assert!(
-            hostile.verify(Some(&v1)).is_err(),
+            matches!(
+                hostile.verify(Some(&v1)),
+                Err(ManifestError::VersionExhausted)
+            ),
             "a manifest at u64::MAX can never be incremented; accepting it freezes membership"
         );
     }
@@ -437,7 +480,7 @@ mod tests {
         let hostile = GroupManifest::new(new_group_id(), u64::MAX, vec![member], &key);
 
         assert!(
-            hostile.verify(None).is_err(),
+            matches!(hostile.verify(None), Err(ManifestError::VersionExhausted)),
             "a genesis at u64::MAX freezes the group from the start"
         );
     }
@@ -449,11 +492,22 @@ mod tests {
         let group_id = new_group_id();
 
         let v1 = GroupManifest::new(group_id, 1, vec![member.clone()], &key);
-        // One past the sanity bound of 1024 (ADR-0027).
-        let far = GroupManifest::new(group_id, 1 + 1024 + 1, vec![member], &key);
+        // One past the Maximum Manifest Version Jump (ADR-0027).
+        let far = GroupManifest::new(
+            group_id,
+            1 + MAX_MANIFEST_VERSION_JUMP + 1,
+            vec![member],
+            &key,
+        );
 
         assert!(
-            far.verify(Some(&v1)).is_err(),
+            matches!(
+                far.verify(Some(&v1)),
+                Err(ManifestError::VersionJumpTooLarge {
+                    max: MAX_MANIFEST_VERSION_JUMP,
+                    ..
+                })
+            ),
             "a version jump beyond the sanity bound must be rejected"
         );
     }
@@ -466,7 +520,8 @@ mod tests {
 
         let v1 = GroupManifest::new(group_id, 1, vec![member.clone()], &key);
         // Exactly at the bound — accepted before and after the fix.
-        let at_bound = GroupManifest::new(group_id, 1 + 1024, vec![member], &key);
+        let at_bound =
+            GroupManifest::new(group_id, 1 + MAX_MANIFEST_VERSION_JUMP, vec![member], &key);
 
         assert!(
             at_bound.verify(Some(&v1)).is_ok(),

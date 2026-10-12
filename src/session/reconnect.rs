@@ -14,7 +14,7 @@ use crate::message::Message;
 use crate::operation_log::OperationLog;
 use crate::relay::{build_push_blob, push_send, RelayClient};
 
-use super::{KeyState, PendingMember};
+use super::{IssueSink, KeyState, PendingMember};
 
 /// Polls for relay disconnect, backs off, reconnects, and replays the outbox.
 /// Runs in a background thread spawned by `connect_with_reconnect`.
@@ -34,6 +34,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     on_member_request: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
     on_member_joined: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
     on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
+    issue_sink: Arc<Mutex<IssueSink>>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     push_factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
@@ -96,6 +97,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             on_member_request.clone(),
             on_member_joined.clone(),
             on_member_left.clone(),
+            issue_sink.clone(),
             on_message.clone(),
         );
         let new_client =
