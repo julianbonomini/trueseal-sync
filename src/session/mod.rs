@@ -7,20 +7,23 @@ mod tests;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
+use log::warn;
 use thiserror::Error;
 use trueseal_noise::keypair::Keypair as NoiseKeypair;
 
+use crate::delivery_issue::{DeliveryIssue, SendFailedReason};
 use crate::device::DeviceKeypair;
 use crate::envelope::SigningKeypair;
 use crate::keys::{NoisePublicKey, SigningPublicKey};
+use crate::limits::PROTOCOL_SIZE_LIMIT;
 use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
 use crate::member::{member_id, member_name};
-use crate::message::{device_name, Message};
+use crate::message::{device_name, message_id, Message};
 use crate::operation_log::{MemLog, OperationLog};
 use crate::relay::{build_push_blob, push_send, RelayClient};
 
@@ -59,6 +62,13 @@ pub enum SessionError {
     /// stay queued; the relay (or this client) must be upgraded.
     #[error("relay supports Transport Version {min}..={max}")]
     RelayVersionUnsupported { min: u32, max: u32 },
+    /// The `Sync` body exceeds this session's payload limit — at most the
+    /// Protocol Size Limit of 61,440 bytes (ADR-0025). Checked
+    /// synchronously in `send()`: the body never entered the Outbox and no
+    /// Sequence was consumed. Permanent — a retry with the same body fails
+    /// the same way.
+    #[error("payload too large: maximum {max} bytes")]
+    PayloadTooLarge { max: u32 },
 }
 
 impl From<crate::relay::RelayError> for SessionError {
@@ -119,6 +129,60 @@ pub(super) struct PendingMember {
     pub signing_pub: SigningPublicKey,
 }
 
+/// Drop outbox entries over the Protocol Size Limit and report each one as
+/// `sendFailed(tooLarge)` (ADR-0025: "Outbox entries already over the limit
+/// (only in development stores) are dropped on load and raise the same
+/// permanent-failure event"; ADR-0034 §3).
+///
+/// `send()` refuses oversize bodies before they are queued, so only entries
+/// written by a pre-fix build can trigger this. Each entry is removed
+/// permanently on the first load that sees it, so the report fires exactly
+/// once per entry. The drop is measured against the protocol ceiling, not
+/// the session's (possibly lowered) payload limit: an entry queued while a
+/// higher limit was in effect is still deliverable.
+fn drop_oversize_outbox_entries(
+    op_log: &Arc<Mutex<Box<dyn OperationLog>>>,
+    signing_pub: &[u8; 32],
+    issue_callbacks: &Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>>,
+) {
+    let oversized: Vec<(u64, [u8; 32])> = {
+        let mut log = op_log.lock().unwrap_or_else(|e| e.into_inner());
+        let oversized: Vec<(u64, [u8; 32])> = log
+            .undelivered_entries()
+            .into_iter()
+            .filter(|entry| entry.blob.len() > PROTOCOL_SIZE_LIMIT)
+            .map(|entry| (entry.sequence, entry.object_id))
+            .collect();
+        for (sequence, object_id) in &oversized {
+            log.remove(object_id, *sequence);
+        }
+        oversized
+    };
+    if oversized.is_empty() {
+        return;
+    }
+    warn!(
+        "[trueseal-sync] dropped {} oversize outbox {} on load (Protocol Size Limit is {} bytes)",
+        oversized.len(),
+        if oversized.len() == 1 {
+            "entry"
+        } else {
+            "entries"
+        },
+        PROTOCOL_SIZE_LIMIT
+    );
+    let callbacks = issue_callbacks.lock().unwrap_or_else(|e| e.into_inner());
+    for (sequence, _) in &oversized {
+        let issue = DeliveryIssue::SendFailed {
+            message_id: message_id(signing_pub, *sequence),
+            reason: SendFailedReason::TooLarge,
+        };
+        for cb in callbacks.iter() {
+            cb(issue.clone());
+        }
+    }
+}
+
 // ── TruesealSession ───────────────────────────────────────────────────────────────
 
 /// The opinionated session facade (ADR-0010 / ADR-0014).
@@ -158,6 +222,15 @@ pub struct TruesealSession<T: Read + Write + Send + 'static> {
     on_member_joined: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
     /// Fired when a member disappears from an incoming manifest update (not for local device).
     on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
+    /// The largest `Sync` body `send()` accepts. Defaults to the Protocol
+    /// Size Limit; a caller may lower it (e.g. to match a stricter relay),
+    /// never raise it above the protocol ceiling (ADR-0025).
+    max_payload_bytes: AtomicUsize,
+    /// Subscribers for Delivery Issues raised by the session itself —
+    /// currently `sendFailed(tooLarge)` for outbox entries dropped on load
+    /// (ADR-0025). Receive-path issues are raised on the RelayClient
+    /// (SYNC-1); SYNC-15 unifies the surface on the FFI.
+    issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>>,
 }
 
 /// Builds the full manifest-aware subscribe handler.
@@ -507,9 +580,24 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         );
         let client = RelayClient::connect_subscribed(transport, relay_pub, noise_kp, handler)?;
 
+        let op_log: Arc<Mutex<Box<dyn OperationLog>>> = Arc::new(Mutex::new(op_log));
+        let issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        // SYNC-8 (#100): drop oversize entries persisted by pre-fix builds —
+        // they can never be delivered and would replay forever (ADR-0025).
+        {
+            let signing_pub = keys.lock().unwrap_or_else(|e| e.into_inner()).signing_pub.0;
+            drop_oversize_outbox_entries(&op_log, &signing_pub, &issue_callbacks);
+        }
+
         // Restore sequence counter from the op log so it never re-uses a
         // sequence number after a process restart (ADR-0011).
-        let initial_seq = op_log.max_sequence().map(|s| s + 1).unwrap_or(0);
+        let initial_seq = op_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .max_sequence()
+            .map(|s| s + 1)
+            .unwrap_or(0);
 
         Ok(Self {
             client: Arc::new(Mutex::new(client)),
@@ -518,7 +606,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             keys,
             sequence: Arc::new(Mutex::new(initial_seq)),
             pairing,
-            op_log: Arc::new(Mutex::new(op_log)),
+            op_log,
             manifest,
             on_removed_from_group,
             on_manifest_changed,
@@ -528,6 +616,8 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             on_member_request: on_mr_cb_ret,
             on_member_joined: on_mj_cb_ret,
             on_member_left: on_ml_cb_ret,
+            max_payload_bytes: AtomicUsize::new(PROTOCOL_SIZE_LIMIT),
+            issue_callbacks,
         })
     }
 
@@ -659,6 +749,15 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         // Stub client: permanently disconnected — the reconnect loop will replace it.
         let client: Arc<Mutex<RelayClient<T>>> = Arc::new(Mutex::new(RelayClient::disconnected()));
         let op_log_arc: Arc<Mutex<Box<dyn OperationLog>>> = Arc::new(Mutex::new(op_log));
+        let issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+
+        // SYNC-8 (#100): drop oversize entries persisted by pre-fix builds —
+        // they can never be delivered and would replay forever (ADR-0025).
+        {
+            let signing_pub = keys.lock().unwrap_or_else(|e| e.into_inner()).signing_pub.0;
+            drop_oversize_outbox_entries(&op_log_arc, &signing_pub, &issue_callbacks);
+        }
 
         // Restore sequence counter from the op log so it never re-uses a
         // sequence number after a process restart (ADR-0011).
@@ -686,6 +785,8 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             on_member_request: on_member_request.clone(),
             on_member_joined: on_member_joined.clone(),
             on_member_left: on_member_left.clone(),
+            max_payload_bytes: AtomicUsize::new(PROTOCOL_SIZE_LIMIT),
+            issue_callbacks: issue_callbacks.clone(),
         };
 
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
@@ -726,6 +827,14 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     pub fn push_sync(&self, blob: Vec<u8>) -> Result<(), SessionError> {
         if self.destroyed.load(Ordering::Acquire) {
             return Err(SessionError::GroupDestroyed);
+        }
+        // ADR-0025: the Protocol Size Limit is checked synchronously, before
+        // anything is written to the Operation Log. An oversize body never
+        // enters the Outbox (where it would replay forever — the relay's
+        // refusal is permanent) and never consumes a Sequence.
+        let max = self.max_payload_bytes.load(Ordering::Acquire);
+        if blob.len() > max {
+            return Err(SessionError::PayloadTooLarge { max: max as u32 });
         }
         let recipients: Vec<NoisePublicKey> = {
             let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
@@ -797,6 +906,38 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             None => Ok(()),
             Some(e) => Err(SessionError::PushFailed(e)),
         }
+    }
+
+    /// The largest `Sync` body `send()` currently accepts, in bytes
+    /// (ADR-0025). Defaults to the Protocol Size Limit (`PROTOCOL_SIZE_LIMIT`).
+    pub fn max_payload_bytes(&self) -> usize {
+        self.max_payload_bytes.load(Ordering::Acquire)
+    }
+
+    /// Lower the payload limit for this session — e.g. to match a stricter
+    /// relay's Relay Size Limit. Values above the Protocol Size Limit are
+    /// clamped to it: the protocol ceiling can never be raised (ADR-0025).
+    /// Returns the effective limit.
+    ///
+    /// Applies to subsequent `send()` calls only; entries already in the
+    /// Outbox are governed by the protocol ceiling (see
+    /// `drop_oversize_outbox_entries`).
+    pub fn set_max_payload_bytes(&self, requested: usize) -> usize {
+        let effective = requested.min(PROTOCOL_SIZE_LIMIT);
+        self.max_payload_bytes.store(effective, Ordering::Release);
+        effective
+    }
+
+    /// Subscribe to Delivery Issues raised by this session (ADR-0034 §3) —
+    /// currently `sendFailed(tooLarge)` for outbox entries dropped on load
+    /// (ADR-0025). Receive-path issues (`unreadable`, `heldForUpgrade`) are
+    /// raised on the RelayClient's own channel (SYNC-1); SYNC-15 unifies the
+    /// surface on the FFI.
+    pub fn subscribe_delivery_issues(&self, callback: impl Fn(DeliveryIssue) + Send + 'static) {
+        self.issue_callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Box::new(callback));
     }
 
     pub(crate) fn push_message(

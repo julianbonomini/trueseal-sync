@@ -26,6 +26,16 @@ pub enum UnreadableReason {
     DroppedWhileHeld,
 }
 
+/// Why the library gave up sending an outgoing message (ADR-0034 §3).
+/// Every reason is permanent — the message is never retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendFailedReason {
+    /// The body exceeds the Protocol Size Limit (ADR-0025). Only reachable
+    /// for outbox entries written by a build from before the `send()` check.
+    TooLarge,
+    // SYNC-5 and SYNC-12 add `Malformed` and `Expired` (30-day `Sync` expiry).
+}
+
 /// A typed, device-local report from the library (ADR-0034 §3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryIssue {
@@ -35,4 +45,10 @@ pub enum DeliveryIssue {
     /// It is held unacked on the Relay (up to the cap) so an upgrade
     /// recovers it.
     HeldForUpgrade(u32),
+    /// An outgoing message was dropped without delivery. Carries the
+    /// Message ID the send would have had, so the app can correlate.
+    SendFailed {
+        message_id: String,
+        reason: SendFailedReason,
+    },
 }
