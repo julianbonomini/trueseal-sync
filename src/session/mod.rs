@@ -1352,9 +1352,9 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             );
 
         // Push GroupManifest to all existing members (excluding self).
-        // TODO(P1): GroupManifest pushes are not queued to the outbox. If the relay is
-        // unreachable here, the new member never receives the manifest and cannot sync.
-        // Fix: queue control-plane messages to the outbox alongside Sync messages.
+        // SYNC-5: the manifest goes through the outbox (ADR-0026 control
+        // plane) — queued durably above, delivered by the sender pump even
+        // if the relay is unreachable right now.
         let msg = Message::GroupManifest {
             manifest: new_manifest,
         };
@@ -1490,9 +1490,9 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let msg = Message::GroupManifest {
             manifest: new_manifest,
         };
-        // TODO(P1): GroupManifest pushes from remove_member are not queued to the
-        // outbox. If delivery fails, the removed member is never notified and
-        // remaining members don't converge. Fix: outbox support for control-plane messages.
+        // SYNC-5: through the outbox (ADR-0026 control plane) — a failed or
+        // offline delivery is retried by the sender pump, so the removed
+        // member and the remaining members converge.
         // Push to remaining members (excluding self).
         for peer in &notify {
             let _ = self.push_message(&msg, *peer);
