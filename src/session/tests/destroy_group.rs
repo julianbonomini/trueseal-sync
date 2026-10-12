@@ -373,6 +373,7 @@ fn destroy_group_stops_outbox_replay() {
         device,
         |_, _, _| {},
         Box::new(MemLog::new()),
+        Arc::new(Mutex::new(None)),
         || {},
         |_| {},
         move || {

@@ -607,6 +607,15 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// `push_sync` queues to the outbox.
     /// A background reconnect loop connects to the relay when available using `transport_factory`.
     ///
+    /// `manifest` is the session's manifest slot, owned and seeded by the CALLER
+    /// before this constructor runs (SYNC-7, #99): a restarted device loads its
+    /// persisted Group Manifest into it up front, so the receive path never
+    /// observes a transient `None` and early Deliver frames are judged against
+    /// the persisted membership. Restoring afterwards instead would reopen the
+    /// manifest hijack and could overwrite a newer manifest that arrived first.
+    /// Callers that keep a clone (e.g. the FFI's sender-attribution closure)
+    /// observe every later manifest update through the same slot.
+    ///
     /// Per ADR-0017 / PHILOSOPHY: `create()` is infallible. Use this constructor at the
     /// FFI boundary so `create()` always succeeds regardless of relay reachability.
     pub fn connect_background(
@@ -614,6 +623,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         keypair: DeviceKeypair,
         on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static + Clone,
         op_log: Box<dyn OperationLog>,
+        manifest: Arc<Mutex<Option<GroupManifest>>>,
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
@@ -624,7 +634,6 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     ) -> Result<Self, SessionError> {
         // Build all arcs directly — mirrors connect_full but without an initial transport.
         let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
-        let manifest: Arc<Mutex<Option<GroupManifest>>> = Arc::new(Mutex::new(None));
         let pairing: Arc<Mutex<Option<PairingWindow>>> = Arc::new(Mutex::new(None));
         let on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static> =
             Arc::new(on_removed_from_group);
