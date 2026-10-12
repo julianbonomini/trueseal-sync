@@ -650,3 +650,56 @@ fn receive_path_issues_reach_session_subscribers() {
         Duration::from_secs(3),
     );
 }
+
+/// Per-sender ordering (ADR-0026): messages from one Device reach the
+/// handler in the order that Device sent them. Dispatch is serial, so the
+/// relay's arrival order is the handler's order.
+#[test]
+fn per_sender_order_is_preserved() {
+    let relay_kp = make_relay_kp();
+    let device = DeviceKeypair::generate();
+    let sender = SigningKeypair::generate();
+
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+
+    let device_pub = device.public_key();
+    let received: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(vec![]));
+    let received_cb = received.clone();
+    let _session = TruesealSession::<MemPipe>::connect_full(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        move |_msg, _author, seq| {
+            received_cb.lock().unwrap().push(seq);
+        },
+        Box::new(MemLog::new()),
+        || {},
+        |_| {},
+        || {},
+        || Err("push factory unused".into()),
+    )
+    .expect("session");
+
+    for (blob_id, seq) in [(1u64, 1u64), (2, 2), (3, 3)] {
+        relay.deliver(
+            blob_id,
+            &Message::Sync {
+                body: format!("m{seq}").into_bytes(),
+            },
+            device_pub,
+            &sender,
+            seq,
+        );
+    }
+
+    wait_for(
+        || received.lock().unwrap().len() == 3,
+        Duration::from_secs(3),
+    );
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec![1, 2, 3],
+        "the handler sees one sender's messages in send order"
+    );
+}
