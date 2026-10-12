@@ -1495,7 +1495,7 @@ dependencies = [
 [[package]]
 name = "trueseal-noise"
 version = "0.1.0"
-source = "git+https://github.com/julianbonomini/trueseal-noise?tag=v0.1.4#d704ad21a6497139fbceb250a3c408254324c97c"
+source = "git+https://github.com/julianbonomini/trueseal-noise?rev=6cea366a741e618709503f0a41c4f58d5973c381#6cea366a741e618709503f0a41c4f58d5973c381"
 dependencies = [
  "rand",
  "snow",
