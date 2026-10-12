@@ -132,12 +132,12 @@ fn accept_pair_without_window_returns_false() {
     let (nk_rx, nk) = nk_push_channel();
     let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
     std::thread::spawn(move || {
-        let _ = trueseal_noise::session_xx::accept(pipe_relay, relay_kp2);
+        let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2);
         // drain nk_rx so push_factory doesn't block if accidentally called
         while let Ok(pipe) = nk_rx.recv() {
             let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
             std::thread::spawn(move || {
-                if let Ok(sess) = trueseal_noise::session_nk::accept(pipe, kp) {
+                if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(pipe, kp) {
                     if sess.receive().is_ok() {
                         let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
                     }

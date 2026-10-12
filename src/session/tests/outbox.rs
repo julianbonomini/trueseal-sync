@@ -1,8 +1,9 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::version::testutil::xx_accept_after_prefix;
 use ed25519_dalek::SigningKey;
-use trueseal_noise::{keypair::Keypair, session_xx::accept};
+use trueseal_noise::keypair::Keypair;
 
 use crate::device::DeviceKeypair;
 use crate::envelope::Envelope;
@@ -23,12 +24,13 @@ fn push_sync_appends_and_marks_delivered() {
     {
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _s = accept(pipe_relay, relay_kp2).unwrap();
+            let _s = xx_accept_after_prefix(pipe_relay, relay_kp2).unwrap();
             // Accept NK push connections and drain them so push_send succeeds.
             while let Ok(nk_pipe) = nk_rx.recv() {
                 let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp)
+                    {
                         if sess.receive().is_ok() {
                             let _ = sess.send(&frame(MsgType::Ack, &[]));
                         }
@@ -86,7 +88,7 @@ fn undelivered_entries_replayed_after_reconnect() {
     {
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _s = accept(pipe1_relay, relay_kp2).unwrap();
+            let _s = xx_accept_after_prefix(pipe1_relay, relay_kp2).unwrap();
             std::thread::sleep(Duration::from_secs(10));
         });
     }
@@ -98,13 +100,14 @@ fn undelivered_entries_replayed_after_reconnect() {
     {
         let relay_kp3 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _s = accept(pipe2_relay, relay_kp3).unwrap();
+            let _s = xx_accept_after_prefix(pipe2_relay, relay_kp3).unwrap();
             // Accept NK push connections and record their envelope bodies.
             while let Ok(nk_pipe) = nk_rx.recv() {
                 let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
                 let rx2 = rx.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp)
+                    {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
@@ -186,7 +189,7 @@ fn push_sync_while_disconnected_queues_and_returns_ok() {
     {
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let s = accept(pipe_relay, relay_kp2).unwrap();
+            let s = xx_accept_after_prefix(pipe_relay, relay_kp2).unwrap();
             loop {
                 if s.receive().is_err() {
                     break;
@@ -265,13 +268,14 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
     {
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _s = accept(pipe2_relay, relay_kp2).unwrap();
+            let _s = xx_accept_after_prefix(pipe2_relay, relay_kp2).unwrap();
             // Count NK push connections as received pushes.
             while let Ok(nk_pipe) = nk_rx2.recv() {
                 let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
                 let rr2 = rr.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp)
+                    {
                         if sess.receive().is_ok() {
                             let _ = sess.send(&frame(MsgType::Ack, &[]));
                             let (lock, cvar) = &*rr2;

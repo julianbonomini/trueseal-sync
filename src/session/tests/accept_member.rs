@@ -145,13 +145,13 @@ fn accept_member_with_unknown_token_returns_false() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
+            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
             // drain nk connections
             while let Ok(p) = nk_rx.recv() {
                 let kp2 =
                     trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(p, kp2) {
                         if sess.receive().is_ok() {
                             let _ =
                                 sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));

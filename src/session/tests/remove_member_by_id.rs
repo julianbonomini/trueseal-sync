@@ -17,7 +17,7 @@ fn remove_member_by_id_removes_the_member() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
+            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
         });
     }
 
@@ -70,7 +70,7 @@ fn remove_member_by_id_unknown_returns_member_not_found() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
+            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
         });
     }
 
@@ -118,7 +118,7 @@ fn remove_member_by_id_no_manifest_returns_not_in_group() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
+            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
         });
     }
 

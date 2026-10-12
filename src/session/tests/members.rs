@@ -17,7 +17,7 @@ fn members_empty_when_no_manifest() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
+            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
         });
     }
     let device = DeviceKeypair::generate();
@@ -46,7 +46,7 @@ fn members_excludes_local_device() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
+            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
         });
     }
 
@@ -96,7 +96,7 @@ fn members_id_and_name_are_stable() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
+            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
         });
     }
 

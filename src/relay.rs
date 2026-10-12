@@ -11,9 +11,11 @@ use trueseal_noise::{
 };
 
 use crate::crypto;
+use crate::delivery_issue::{DeliveryIssue, UnreadableReason};
 use crate::envelope::Envelope;
 use crate::keys::NoisePublicKey;
 use crate::message::Message;
+use crate::version::{self, TransportVersionError};
 
 /// Maximum serialised envelope size the client will attempt to push (1 MiB).
 /// trueseal-sync is the protocol authority — this constant must match the relay's
@@ -38,6 +40,22 @@ pub enum RelayError {
     /// Non-retryable — the outbox must not replay this blob indefinitely.
     #[error("push rejected by relay")]
     PushRejected,
+    /// The relay refused our Transport Version and reported the range it
+    /// supports (ADR-0022). Not a per-blob rejection — outbox entries stay
+    /// queued; the relay (or this client) must be upgraded.
+    #[error("relay supports Transport Version {min}..={max}")]
+    RelayVersionUnsupported { min: u32, max: u32 },
+}
+
+impl From<TransportVersionError> for RelayError {
+    fn from(e: TransportVersionError) -> Self {
+        match e {
+            TransportVersionError::Unsupported { min, max } => {
+                RelayError::RelayVersionUnsupported { min, max }
+            }
+            TransportVersionError::Exchange(msg) => RelayError::HandshakeFailed(msg),
+        }
+    }
 }
 
 /// Wire protocol framing over the Noise session.
@@ -113,20 +131,31 @@ pub struct RelayClient<T: Read + Write + Send + 'static> {
     push_tx: mpsc::SyncSender<PushBytes>,
     /// Callbacks receive the decoded Message and the sender's signing public key ([u8;32]).
     callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64) + Send + 'static>>>>,
+    /// Callbacks receive typed Delivery Issues (ADR-0034). Never sent to the
+    /// relay or the sender.
+    issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>>,
     /// True while the background run loop is alive; set to false when relay disconnects.
     is_connected: Arc<AtomicBool>,
     _transport: PhantomData<T>,
 }
 
 impl<T: Read + Write + Send + 'static> RelayClient<T> {
-    /// Perform a Noise XX handshake over `transport` and verify the relay's identity.
+    /// Perform the Transport Version exchange, then a Noise XX handshake over
+    /// `transport`, and verify the relay's identity.
+    ///
+    /// The version prefix is sent in plaintext first and becomes the Noise
+    /// prologue (ADR-0022): a relay that refuses it answers
+    /// `unsupported min..max`, surfaced as `RelayError::RelayVersionUnsupported`.
     pub fn connect(
         transport: T,
         relay_pub: NoisePublicKey,
         my_keypair: NoiseKeypair,
     ) -> Result<Self, RelayError> {
         let my_noise_priv = my_keypair.private();
-        let session = dial(transport, my_keypair).map_err(RelayError::HandshakeFailed)?;
+        let mut transport = transport;
+        let prologue = version::exchange_transport_version(&mut transport)?;
+        let session =
+            dial(transport, my_keypair, &prologue).map_err(RelayError::HandshakeFailed)?;
 
         if session.remote_public_key() != relay_pub.0 {
             return Err(RelayError::HandshakeFailed(
@@ -141,6 +170,10 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
             Arc::new(Mutex::new(Vec::new()));
         let callbacks_clone = callbacks.clone();
 
+        let issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let issue_callbacks_clone = issue_callbacks.clone();
+
         let is_connected = Arc::new(AtomicBool::new(true));
         let is_connected_clone = is_connected.clone();
 
@@ -150,6 +183,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
                 session,
                 push_rx,
                 callbacks_clone,
+                issue_callbacks_clone,
                 my_noise_priv,
                 is_connected_clone,
             );
@@ -158,6 +192,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         Ok(Self {
             push_tx,
             callbacks,
+            issue_callbacks,
             is_connected,
             _transport: PhantomData,
         })
@@ -188,6 +223,16 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
             .push(Box::new(callback));
     }
 
+    /// Register a callback invoked with typed Delivery Issues: incoming Blobs
+    /// the library rejected or is holding for an upgrade (ADR-0034).
+    /// Device-local only — never sent to the relay or the sender.
+    pub fn subscribe_delivery_issues(&self, callback: impl Fn(DeliveryIssue) + Send + 'static) {
+        self.issue_callbacks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Box::new(callback));
+    }
+
     /// Returns true while the background run loop is alive (relay connected).
     /// Becomes false when the relay disconnects or the transport fails.
     pub fn is_connected(&self) -> bool {
@@ -205,6 +250,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         Self {
             push_tx,
             callbacks: Arc::new(Mutex::new(Vec::new())),
+            issue_callbacks: Arc::new(Mutex::new(Vec::new())),
             is_connected: Arc::new(AtomicBool::new(false)),
             _transport: PhantomData,
         }
@@ -246,6 +292,7 @@ fn run_loop<T: Read + Write + Send + 'static>(
     session: Session<T>,
     push_rx: mpsc::Receiver<PushBytes>,
     callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64) + Send + 'static>>>>,
+    issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>>,
     my_noise_priv: [u8; 32],
     is_connected: Arc<AtomicBool>,
 ) {
@@ -294,37 +341,135 @@ fn run_loop<T: Read + Write + Send + 'static>(
     });
 
     // This thread: dispatches received messages to callbacks.
+    //
+    // Newer-End-to-End-Version Blobs held unacked (blob ids, in arrival order),
+    // awaiting a library upgrade (ADR-0022). In-memory per Receive Session: if
+    // the session drops, the relay re-delivers and they are held again.
+    let mut held: std::collections::VecDeque<[u8; 8]> = std::collections::VecDeque::new();
+    let mut held_set: std::collections::HashSet<[u8; 8]> = std::collections::HashSet::new();
+
+    let fire_issue =
+        |issue_callbacks: &Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>>,
+         issue: DeliveryIssue| {
+            let cbs = issue_callbacks.lock().unwrap_or_else(|e| e.into_inner());
+            for cb in cbs.iter() {
+                cb(issue.clone());
+            }
+        };
+
     for result in recv_rx {
         match result {
             Err(_) => break,
             Ok(raw) => {
                 if let Some((MsgType::Deliver, body)) = parse(&raw) {
                     // ADR-0020: Deliver body = [blob_id: 8 bytes][proto Envelope].
-                    // Send DeliverAck immediately on receipt — before decryption —
-                    // so the relay learns nothing about decryption outcome (zero trust).
-                    if body.len() >= 8 {
-                        let blob_id = &body[0..8];
-                        let _ = session.send(&frame(MsgType::DeliverAck, blob_id));
-                        let envelope_bytes = &body[8..];
-                        if let Ok(env) = Envelope::decode(envelope_bytes) {
-                            if let Ok((author_pub, plaintext)) =
-                                crypto::decrypt(my_noise_priv, &env.payload)
-                            {
-                                if env.verify_with(author_pub).is_ok() {
-                                    if let Ok(msg) = Message::decode(&plaintext) {
-                                        let cbs =
-                                            callbacks.lock().unwrap_or_else(|e| e.into_inner());
-                                        for cb in cbs.iter() {
-                                            cb(msg.clone(), author_pub, env.sequence);
-                                        }
-                                    }
+                    let blob_id: [u8; 8] = match body.get(0..8).and_then(|b| b.try_into().ok()) {
+                        Some(id) => id,
+                        None => {
+                            // A Deliver frame with no blob id is malformed;
+                            // there is nothing to ack.
+                            fire_issue(
+                                &issue_callbacks,
+                                DeliveryIssue::Unreadable(UnreadableReason::Malformed),
+                            );
+                            continue;
+                        }
+                    };
+                    let envelope_bytes = &body[8..];
+
+                    // ADR-0022: the End-to-End Version is checked BEFORE any
+                    // DeliverAck. Nothing but the DeliverAck (to the relay)
+                    // ever leaves this device on a rejection path.
+                    let env = match Envelope::decode(envelope_bytes) {
+                        Ok(env) => env,
+                        Err(_) => {
+                            // Undecodable envelope: ack and drop (malformed).
+                            let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
+                            fire_issue(
+                                &issue_callbacks,
+                                DeliveryIssue::Unreadable(UnreadableReason::Malformed),
+                            );
+                            continue;
+                        }
+                    };
+
+                    if env.version > version::END_TO_END_VERSION {
+                        // Newer version: hold unacked so an upgrade recovers it.
+                        if held_set.insert(blob_id) {
+                            held.push_back(blob_id);
+                            fire_issue(
+                                &issue_callbacks,
+                                DeliveryIssue::HeldForUpgrade(env.version),
+                            );
+                            if held.len() > version::MAX_HELD_BLOBS {
+                                // Cap overflow: ack and drop the oldest held blob.
+                                if let Some(oldest) = held.pop_front() {
+                                    held_set.remove(&oldest);
+                                    let _ = session.send(&frame(MsgType::DeliverAck, &oldest));
+                                    fire_issue(
+                                        &issue_callbacks,
+                                        DeliveryIssue::Unreadable(
+                                            UnreadableReason::DroppedWhileHeld,
+                                        ),
+                                    );
                                 }
                             }
+                        }
+                        // A duplicate delivery of an already-held blob changes
+                        // nothing and stays unacked.
+                        continue;
+                    }
+
+                    if env.version < version::END_TO_END_VERSION {
+                        // Older version — including 0, the refused pre-version
+                        // format: ack and drop, never reaches a handler.
+                        let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
+                        fire_issue(
+                            &issue_callbacks,
+                            DeliveryIssue::Unreadable(UnreadableReason::SenderOutdated),
+                        );
+                        continue;
+                    }
+
+                    // Supported version: ack immediately — before decryption —
+                    // so the relay learns nothing about the decryption outcome
+                    // (zero trust, ADR-0020). Decrypt/verify failures are then
+                    // reported as malformed; the blob is already acked and gone.
+                    let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
+                    let decoded = crypto::decrypt(my_noise_priv, &env.payload).and_then(
+                        |(author_pub, plaintext)| {
+                            if env.verify_with(author_pub).is_ok() {
+                                Message::decode(&plaintext)
+                                    .map(|msg| (author_pub, msg))
+                                    .map_err(|_| crate::crypto::CryptoError::DecryptionFailed)
+                            } else {
+                                Err(crate::crypto::CryptoError::DecryptionFailed)
+                            }
+                        },
+                    );
+                    match decoded {
+                        Ok((author_pub, msg)) => {
+                            let cbs = callbacks.lock().unwrap_or_else(|e| e.into_inner());
+                            for cb in cbs.iter() {
+                                cb(msg.clone(), author_pub, env.sequence);
+                            }
+                        }
+                        Err(_) => {
+                            fire_issue(
+                                &issue_callbacks,
+                                DeliveryIssue::Unreadable(UnreadableReason::Malformed),
+                            );
                         }
                     }
                 } else if let Some((MsgType::Heartbeat, _)) = parse(&raw) {
                     // Echo Heartbeat back to keep the Receive Session alive (ADR-0019).
                     let _ = session.send(&frame(MsgType::Heartbeat, &[]));
+                } else if parse(&raw).is_none() {
+                    // An unknown frame type or unparseable bytes (ADR-0034: malformed).
+                    fire_issue(
+                        &issue_callbacks,
+                        DeliveryIssue::Unreadable(UnreadableReason::Malformed),
+                    );
                 }
                 // MsgType::Ack on XX session: silently drop (defensive).
             }
@@ -370,7 +515,12 @@ pub fn push_send<T: Read + Write + Send>(
 ) -> Result<(), RelayError> {
     use trueseal_noise::keypair::generate_keypair;
     let fresh_kp = generate_keypair();
-    let session = trueseal_noise::session_nk::dial(transport, fresh_kp, relay_pub)
+    let mut transport = transport;
+    // Transport Version exchange first (ADR-0022); the prefix becomes the
+    // Noise prologue. A refusal surfaces as RelayVersionUnsupported and the
+    // outbox entry stays queued.
+    let prologue = version::exchange_transport_version(&mut transport)?;
+    let session = trueseal_noise::session_nk::dial(transport, fresh_kp, relay_pub, &prologue)
         .map_err(RelayError::HandshakeFailed)?;
     session.send(&blob).map_err(RelayError::PushFailed)?;
     // Block until the relay confirms persistence (ADR-0019).
@@ -393,12 +543,10 @@ mod tests {
     use crate::envelope::SigningKeypair;
     use crate::keys::NoisePublicKey;
     use crate::message::Message;
+    use crate::version::testutil::xx_accept_after_prefix;
     use std::io;
     use std::sync::{Arc, Mutex};
-    use trueseal_noise::{
-        keypair::{generate_keypair, Keypair},
-        session_xx::accept,
-    };
+    use trueseal_noise::keypair::{generate_keypair, Keypair};
 
     // ── In-memory bidirectional pipe ──────────────────────────────────────────
 
@@ -467,7 +615,7 @@ mod tests {
         let received = Arc::new(Mutex::new(Vec::<Envelope>::new()));
         let received_clone = received.clone();
         std::thread::spawn(move || {
-            let session = accept(relay_pipe, relay_keypair).unwrap();
+            let session = xx_accept_after_prefix(relay_pipe, relay_keypair).unwrap();
             while let Ok(raw) = session.receive() {
                 if let Some((MsgType::Push, body)) = parse(&raw) {
                     // Push body layout (ADR-0019): [recipient_pub: 32][envelope_proto: ...]
@@ -561,8 +709,8 @@ mod tests {
     /// push_send returns PushRejected when relay sends an Error frame.
     #[test]
     fn push_send_returns_push_rejected_on_error_frame() {
+        use crate::version::testutil::nk_accept_after_prefix as nk_accept;
         use trueseal_noise::keypair::generate_keypair;
-        use trueseal_noise::session_nk::accept as nk_accept;
 
         let relay_kp = generate_keypair();
         let relay_pub = relay_kp.public_key;
@@ -609,7 +757,7 @@ mod tests {
 
         let (client_pipe, relay_pipe) = mem_pipe_pair();
         std::thread::spawn(move || {
-            let _ = accept(relay_pipe, relay_kp2);
+            let _ = xx_accept_after_prefix(relay_pipe, relay_kp2);
         });
 
         let device = DeviceKeypair::generate();
@@ -654,7 +802,7 @@ mod tests {
             let env_bytes = env.encode();
 
             std::thread::spawn(move || {
-                let session = accept(relay_pipe, relay_kp2).unwrap();
+                let session = xx_accept_after_prefix(relay_pipe, relay_kp2).unwrap();
                 // ADR-0020: Deliver body = [blob_id: 8 bytes][envelope_proto]
                 let mut deliver_body = 0u64.to_be_bytes().to_vec();
                 deliver_body.extend_from_slice(&env_bytes);
@@ -709,8 +857,8 @@ mod tests {
             let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
             let relay_kp_b = Keypair::new(relay_kp.private(), relay_kp.public_key);
             std::thread::spawn(move || {
-                let sess_a = accept(pipe_a_relay, relay_kp_a).unwrap();
-                let sess_b = accept(pipe_b_relay, relay_kp_b).unwrap();
+                let sess_a = xx_accept_after_prefix(pipe_a_relay, relay_kp_a).unwrap();
+                let sess_b = xx_accept_after_prefix(pipe_b_relay, relay_kp_b).unwrap();
                 // Receive Push from B, route as Deliver to A
                 while let Ok(raw) = sess_b.receive() {
                     if let Some((MsgType::Push, body)) = parse(&raw) {
@@ -783,5 +931,544 @@ mod tests {
             },
             "A should receive B's Pair message with B's public keys"
         );
+    }
+
+    // ── SYNC-1: fixed protocol versions with typed rejection (ADR-0022) ──────
+
+    use crate::delivery_issue::{DeliveryIssue, UnreadableReason};
+
+    fn wait_until(cond: impl Fn() -> bool, millis: u64) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(millis);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    /// Build a validly-shaped envelope addressed to an arbitrary recipient,
+    /// then stamp it with the given End-to-End Version. The version gate runs
+    /// before decryption, so the payload need not decrypt for gate tests.
+    fn envelope_bytes_with_version(version: u32) -> Vec<u8> {
+        let author = SigningKeypair::generate();
+        let recipient = DeviceKeypair::generate();
+        let mut env = Envelope::build(
+            1,
+            vec![],
+            recipient.public_key(),
+            &author,
+            b"irrelevant".to_vec(),
+        );
+        env.version = version;
+        env.encode()
+    }
+
+    /// A fake relay that speaks the prefix exchange, records every frame the
+    /// client sends, and delivers envelopes on demand.
+    struct DeliverRelay {
+        /// Every frame the client sent, as (msg_type_byte, body).
+        client_frames: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
+        deliver_tx: mpsc::Sender<(u64, Vec<u8>)>,
+    }
+
+    impl DeliverRelay {
+        fn deliver(&self, blob_id: u64, envelope_bytes: Vec<u8>) {
+            self.deliver_tx
+                .send((blob_id, envelope_bytes))
+                .expect("relay alive");
+        }
+
+        fn deliver_acks(&self) -> Vec<Vec<u8>> {
+            self.client_frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(t, _)| *t == MsgType::DeliverAck as u8)
+                .map(|(_, b)| b.clone())
+                .collect()
+        }
+
+        /// Nothing but DeliverAck may leave the client on a rejection path —
+        /// in particular nothing is ever sent back towards the sender.
+        fn assert_only_deliver_acks(&self) {
+            let frames = self.client_frames.lock().unwrap();
+            assert!(
+                frames.iter().all(|(t, _)| *t == MsgType::DeliverAck as u8),
+                "client sent a non-DeliverAck frame: {:?}",
+                frames.iter().map(|(t, _)| *t).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    fn spawn_deliver_relay(relay_pipe: MemPipe, relay_keypair: Keypair) -> DeliverRelay {
+        let client_frames = Arc::new(Mutex::new(Vec::<(u8, Vec<u8>)>::new()));
+        let (deliver_tx, deliver_rx) = mpsc::channel::<(u64, Vec<u8>)>();
+        let frames_clone = client_frames.clone();
+        std::thread::spawn(move || {
+            let session =
+                crate::version::testutil::xx_accept_after_prefix(relay_pipe, relay_keypair)
+                    .expect("relay accept");
+            let session = Arc::new(session);
+            // Sender half: deliver envelopes the test asks for.
+            let send_session = session.clone();
+            std::thread::spawn(move || {
+                // Give the client a moment to register its subscriptions
+                // before the first deliver.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                for (blob_id, env_bytes) in deliver_rx {
+                    let mut body = blob_id.to_be_bytes().to_vec();
+                    body.extend_from_slice(&env_bytes);
+                    if send_session.send(&frame(MsgType::Deliver, &body)).is_err() {
+                        break;
+                    }
+                }
+            });
+            // Recorder half: every frame the client sends.
+            while let Ok(raw) = session.receive() {
+                if let Some((t, body)) = parse(&raw) {
+                    frames_clone.lock().unwrap().push((t as u8, body.to_vec()));
+                }
+            }
+        });
+        DeliverRelay {
+            client_frames,
+            deliver_tx,
+        }
+    }
+
+    /// Connect a client to a DeliverRelay, returning the client plus the
+    /// recorded Delivery Issues and handled messages.
+    #[allow(clippy::type_complexity)]
+    fn connect_to_deliver_relay(
+        relay_pub: NoisePublicKey,
+        client_pipe: MemPipe,
+    ) -> (
+        RelayClient<MemPipe>,
+        Arc<Mutex<Vec<DeliveryIssue>>>,
+        Arc<Mutex<Vec<Message>>>,
+    ) {
+        let device = DeviceKeypair::generate();
+        let client = RelayClient::connect(
+            client_pipe,
+            relay_pub,
+            Keypair::new(device.noise.private(), device.noise.public_key),
+        )
+        .expect("connect");
+        let issues: Arc<Mutex<Vec<DeliveryIssue>>> = Arc::new(Mutex::new(Vec::new()));
+        let issues_cb = issues.clone();
+        client.subscribe_delivery_issues(move |issue| {
+            issues_cb.lock().unwrap().push(issue);
+        });
+        let delivered: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
+        let delivered_cb = delivered.clone();
+        client.subscribe(move |msg, _author, _seq| {
+            delivered_cb.lock().unwrap().push(msg);
+        });
+        (client, issues, delivered)
+    }
+
+    /// A relay that refuses the Transport Version replies `unsupported min..max`
+    /// and the client surfaces RelayVersionUnsupported — before any handshake.
+    #[test]
+    fn connect_surfaces_relay_version_unsupported() {
+        let (client_pipe, mut relay_pipe) = mem_pipe_pair();
+        std::thread::spawn(move || {
+            let mut prefix = [0u8; crate::version::TRANSPORT_PREFIX_LEN];
+            use std::io::Read;
+            // Read the client prefix, then refuse.
+            let mut filled = 0;
+            while filled < prefix.len() {
+                match relay_pipe.read(&mut prefix[filled..]) {
+                    Ok(0) => return,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => return,
+                }
+            }
+            use std::io::Write;
+            let _ = relay_pipe.write_all(b"unsupported 1..1\n");
+        });
+
+        let device = DeviceKeypair::generate();
+        let result = RelayClient::connect(
+            client_pipe,
+            NoisePublicKey(generate_keypair().public_key),
+            Keypair::new(device.noise.private(), device.noise.public_key),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(RelayError::RelayVersionUnsupported { min: 1, max: 1 })
+            ),
+            "expected RelayVersionUnsupported{{1,1}}, got {:?}",
+            result.err()
+        );
+    }
+
+    /// A relay supporting only newer versions reports its own range verbatim.
+    #[test]
+    fn connect_reports_the_relays_supported_range() {
+        let (client_pipe, mut relay_pipe) = mem_pipe_pair();
+        std::thread::spawn(move || {
+            let mut prefix = [0u8; crate::version::TRANSPORT_PREFIX_LEN];
+            use std::io::Read;
+            let mut filled = 0;
+            while filled < prefix.len() {
+                match relay_pipe.read(&mut prefix[filled..]) {
+                    Ok(0) => return,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => return,
+                }
+            }
+            use std::io::Write;
+            let _ = relay_pipe.write_all(b"unsupported 2..4\n");
+        });
+
+        let device = DeviceKeypair::generate();
+        let result = RelayClient::connect(
+            client_pipe,
+            NoisePublicKey(generate_keypair().public_key),
+            Keypair::new(device.noise.private(), device.noise.public_key),
+        );
+        assert!(matches!(
+            result,
+            Err(RelayError::RelayVersionUnsupported { min: 2, max: 4 })
+        ));
+    }
+
+    /// NK push sessions get the same typed refusal.
+    #[test]
+    fn push_send_surfaces_relay_version_unsupported() {
+        let (client_pipe, mut relay_pipe) = mem_pipe_pair();
+        std::thread::spawn(move || {
+            let mut prefix = [0u8; crate::version::TRANSPORT_PREFIX_LEN];
+            use std::io::Read;
+            let mut filled = 0;
+            while filled < prefix.len() {
+                match relay_pipe.read(&mut prefix[filled..]) {
+                    Ok(0) => return,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(_) => return,
+                }
+            }
+            use std::io::Write;
+            let _ = relay_pipe.write_all(b"unsupported 1..1\n");
+        });
+
+        let result = push_send(client_pipe, [7u8; 32], frame(MsgType::Push, b"x"));
+        assert!(matches!(
+            result,
+            Err(RelayError::RelayVersionUnsupported { min: 1, max: 1 })
+        ));
+    }
+
+    /// The Transport Version is cryptographically bound: a relay that answers
+    /// `supported` but handshakes with different prologue bytes fails.
+    #[test]
+    fn mismatched_prologue_breaks_the_handshake() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let (client_pipe, mut relay_pipe) = mem_pipe_pair();
+        std::thread::spawn(move || {
+            let _prefix = crate::version::fake_relay_accept_prefix(&mut relay_pipe);
+            let kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+            // Handshake with a DIFFERENT prologue than the prefix bytes.
+            let _ = trueseal_noise::session_xx::accept(relay_pipe, kp2, b"wrong prologue");
+        });
+
+        let device = DeviceKeypair::generate();
+        let result = RelayClient::connect(
+            client_pipe,
+            relay_pub,
+            Keypair::new(device.noise.private(), device.noise.public_key),
+        );
+        assert!(
+            matches!(result, Err(RelayError::HandshakeFailed(_))),
+            "mismatched prologue must fail the handshake, got {:?}",
+            result.err()
+        );
+    }
+
+    /// A newer-version Blob is held UNACKED, raises heldForUpgrade, and never
+    /// reaches the handler (ADR-0022).
+    #[test]
+    fn newer_version_blob_is_held_unacked() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let (client_pipe, relay_pipe) = mem_pipe_pair();
+        let relay = spawn_deliver_relay(relay_pipe, relay_kp2);
+        let (_client, issues, delivered) = connect_to_deliver_relay(relay_pub, client_pipe);
+
+        relay.deliver(
+            42,
+            envelope_bytes_with_version(crate::version::END_TO_END_VERSION + 1),
+        );
+
+        assert!(
+            wait_until(
+                || issues
+                    .lock()
+                    .unwrap()
+                    .contains(&DeliveryIssue::HeldForUpgrade(
+                        crate::version::END_TO_END_VERSION + 1
+                    )),
+                3000
+            ),
+            "heldForUpgrade should fire"
+        );
+        // Quiet period: no DeliverAck for a held blob.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            relay.deliver_acks().is_empty(),
+            "a held blob must stay unacked"
+        );
+        assert!(
+            delivered.lock().unwrap().is_empty(),
+            "held blob never reaches the handler"
+        );
+    }
+
+    /// Boundary: exactly MAX_HELD_BLOBS newer blobs are all held — no drops.
+    #[test]
+    fn held_cap_boundary_holds_exactly_max() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let (client_pipe, relay_pipe) = mem_pipe_pair();
+        let relay = spawn_deliver_relay(relay_pipe, relay_kp2);
+        let (_client, issues, _delivered) = connect_to_deliver_relay(relay_pub, client_pipe);
+
+        let newer = envelope_bytes_with_version(crate::version::END_TO_END_VERSION + 1);
+        for id in 0..crate::version::MAX_HELD_BLOBS as u64 {
+            relay.deliver(id, newer.clone());
+        }
+
+        assert!(
+            wait_until(
+                || issues
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|i| matches!(i, DeliveryIssue::HeldForUpgrade(_)))
+                    .count()
+                    == crate::version::MAX_HELD_BLOBS,
+                5000
+            ),
+            "all 100 blobs should be held"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            relay.deliver_acks().is_empty(),
+            "nothing dropped at the cap boundary"
+        );
+        assert!(
+            !issues.lock().unwrap().contains(&DeliveryIssue::Unreadable(
+                UnreadableReason::DroppedWhileHeld
+            )),
+            "no droppedWhileHeld at exactly the cap"
+        );
+    }
+
+    /// Cap overflow: the 101st newer blob acks and drops the oldest with
+    /// droppedWhileHeld; the rest stay held (ADR-0022, ADR-0034).
+    #[test]
+    fn held_cap_overflow_acks_and_drops_the_oldest() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let (client_pipe, relay_pipe) = mem_pipe_pair();
+        let relay = spawn_deliver_relay(relay_pipe, relay_kp2);
+        let (_client, issues, _delivered) = connect_to_deliver_relay(relay_pub, client_pipe);
+
+        let newer = envelope_bytes_with_version(crate::version::END_TO_END_VERSION + 1);
+        for id in 0..=crate::version::MAX_HELD_BLOBS as u64 {
+            relay.deliver(id, newer.clone());
+        }
+
+        assert!(
+            wait_until(
+                || issues.lock().unwrap().contains(&DeliveryIssue::Unreadable(
+                    UnreadableReason::DroppedWhileHeld
+                )),
+                5000
+            ),
+            "overflow should drop the oldest"
+        );
+        assert!(
+            wait_until(|| relay.deliver_acks().len() == 1, 2000),
+            "exactly one ack"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let acks = relay.deliver_acks();
+        assert_eq!(acks.len(), 1, "only the oldest blob is acked and dropped");
+        assert_eq!(
+            acks[0],
+            0u64.to_be_bytes().to_vec(),
+            "the acked blob is the OLDEST held one (blob 0)"
+        );
+        relay.assert_only_deliver_acks();
+    }
+
+    /// A duplicate delivery of an already-held blob changes nothing: no second
+    /// issue, no ack.
+    #[test]
+    fn duplicate_delivery_of_held_blob_is_a_noop() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let (client_pipe, relay_pipe) = mem_pipe_pair();
+        let relay = spawn_deliver_relay(relay_pipe, relay_kp2);
+        let (_client, issues, _delivered) = connect_to_deliver_relay(relay_pub, client_pipe);
+
+        let newer = envelope_bytes_with_version(crate::version::END_TO_END_VERSION + 1);
+        relay.deliver(7, newer.clone());
+        relay.deliver(7, newer);
+
+        assert!(wait_until(|| !issues.lock().unwrap().is_empty(), 3000));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let held_count = issues
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| matches!(i, DeliveryIssue::HeldForUpgrade(_)))
+            .count();
+        assert_eq!(
+            held_count, 1,
+            "one heldForUpgrade despite duplicate delivery"
+        );
+        assert!(relay.deliver_acks().is_empty(), "still unacked");
+    }
+
+    /// An unversioned (pre-version-format) Blob decodes with version 0: it is
+    /// acked and dropped with senderOutdated and never reaches a handler
+    /// (ADR-0022: today's format is refused).
+    #[test]
+    fn unversioned_blob_is_acked_dropped_and_reported_sender_outdated() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let (client_pipe, relay_pipe) = mem_pipe_pair();
+        let relay = spawn_deliver_relay(relay_pipe, relay_kp2);
+        let (_client, issues, delivered) = connect_to_deliver_relay(relay_pub, client_pipe);
+
+        relay.deliver(9, envelope_bytes_with_version(0));
+
+        assert!(
+            wait_until(
+                || issues
+                    .lock()
+                    .unwrap()
+                    .contains(&DeliveryIssue::Unreadable(UnreadableReason::SenderOutdated)),
+                3000
+            ),
+            "senderOutdated should fire"
+        );
+        assert!(
+            wait_until(|| !relay.deliver_acks().is_empty(), 2000),
+            "acked and dropped"
+        );
+        assert!(
+            delivered.lock().unwrap().is_empty(),
+            "never reaches the handler"
+        );
+        relay.assert_only_deliver_acks();
+    }
+
+    /// An older-version Blob is acked and dropped with senderOutdated.
+    #[test]
+    fn older_version_blob_is_acked_dropped_and_reported_sender_outdated() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let (client_pipe, relay_pipe) = mem_pipe_pair();
+        let relay = spawn_deliver_relay(relay_pipe, relay_kp2);
+        let (_client, issues, delivered) = connect_to_deliver_relay(relay_pub, client_pipe);
+
+        // Any version below END_TO_END_VERSION is "older" (0 is the only such
+        // value today; the check is a comparison, not a special case).
+        relay.deliver(
+            10,
+            envelope_bytes_with_version(crate::version::END_TO_END_VERSION - 1),
+        );
+
+        assert!(wait_until(
+            || issues
+                .lock()
+                .unwrap()
+                .contains(&DeliveryIssue::Unreadable(UnreadableReason::SenderOutdated)),
+            3000
+        ));
+        assert!(wait_until(|| !relay.deliver_acks().is_empty(), 2000));
+        assert!(delivered.lock().unwrap().is_empty());
+        relay.assert_only_deliver_acks();
+    }
+
+    /// A malformed (undecodable) Blob is acked and dropped with malformed, and
+    /// never reaches a handler (ADR-0034 §3).
+    #[test]
+    fn malformed_blob_is_acked_dropped_and_reported_malformed() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let (client_pipe, relay_pipe) = mem_pipe_pair();
+        let relay = spawn_deliver_relay(relay_pipe, relay_kp2);
+        let (_client, issues, delivered) = connect_to_deliver_relay(relay_pub, client_pipe);
+
+        relay.deliver(11, b"not a protobuf envelope".to_vec());
+
+        assert!(
+            wait_until(
+                || issues
+                    .lock()
+                    .unwrap()
+                    .contains(&DeliveryIssue::Unreadable(UnreadableReason::Malformed)),
+                3000
+            ),
+            "malformed should fire"
+        );
+        assert!(wait_until(|| !relay.deliver_acks().is_empty(), 2000));
+        assert!(delivered.lock().unwrap().is_empty());
+        relay.assert_only_deliver_acks();
+    }
+
+    /// A supported-version Blob that fails authentication (garbage payload) is
+    /// acked (zero-trust ack timing, ADR-0020) and reported malformed.
+    #[test]
+    fn undecryptable_blob_is_reported_malformed_and_never_handled() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let (client_pipe, relay_pipe) = mem_pipe_pair();
+        let relay = spawn_deliver_relay(relay_pipe, relay_kp2);
+        let (_client, issues, delivered) = connect_to_deliver_relay(relay_pub, client_pipe);
+
+        relay.deliver(
+            12,
+            envelope_bytes_with_version(crate::version::END_TO_END_VERSION),
+        );
+
+        assert!(
+            wait_until(
+                || issues
+                    .lock()
+                    .unwrap()
+                    .contains(&DeliveryIssue::Unreadable(UnreadableReason::Malformed)),
+                3000
+            ),
+            "undecryptable payload should report malformed"
+        );
+        assert!(delivered.lock().unwrap().is_empty());
+        relay.assert_only_deliver_acks();
     }
 }

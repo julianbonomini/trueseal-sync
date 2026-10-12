@@ -90,11 +90,11 @@ fn join_group_invalid_token_returns_error() {
     let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
     let (nk_rx2, nk2) = nk_push_channel();
     std::thread::spawn(move || {
-        let _ = trueseal_noise::session_xx::accept(pipe_relay, relay_kp2);
+        let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2);
         while let Ok(p) = nk_rx2.recv() {
             let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
             std::thread::spawn(move || {
-                if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp) {
+                if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(p, kp) {
                     if sess.receive().is_ok() {
                         let _ = sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
                     }

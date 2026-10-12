@@ -21,12 +21,12 @@ fn destroy_group_fires_on_group_destroyed_on_initiator() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
+            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
             while let Ok(p) = nk_rx.recv() {
                 let kp2 =
                     trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(p, kp2) {
                         if sess.receive().is_ok() {
                             let _ =
                                 sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
@@ -135,12 +135,12 @@ fn push_sync_after_destroy_returns_group_destroyed() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
+            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
             while let Ok(p) = nk_rx.recv() {
                 let kp2 =
                     trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(p, kp2) {
                         if sess.receive().is_ok() {
                             let _ =
                                 sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
@@ -239,12 +239,12 @@ fn on_group_destroyed_callback_wipes_store() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = trueseal_noise::session_xx::accept(pipe_relay, kp);
+            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
             while let Ok(p) = nk_rx.recv() {
                 let kp2 =
                     trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(p, kp2) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(p, kp2) {
                         if sess.receive().is_ok() {
                             let _ =
                                 sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
@@ -338,7 +338,7 @@ fn destroy_group_stops_outbox_replay() {
         let relay_kp2 =
             trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let s = match trueseal_noise::session_xx::accept(pipe_relay, relay_kp2) {
+            let s = match crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2) {
                 Ok(s) => s,
                 Err(_) => return,
             };

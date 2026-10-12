@@ -1,8 +1,9 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::version::testutil::xx_accept_after_prefix;
 use ed25519_dalek::SigningKey;
-use trueseal_noise::{keypair::Keypair, session_xx::accept};
+use trueseal_noise::keypair::Keypair;
 
 use crate::device::DeviceKeypair;
 use crate::message::Message;
@@ -269,14 +270,16 @@ fn revoke_from_unknown_device_is_ignored() {
         let relay_kp_a = Keypair::new(relay_kp.private(), relay_kp.public_key);
         let relay_kp_s = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let sess_a = std::sync::Arc::new(accept(pipe_a_relay, relay_kp_a).unwrap());
-            let _sess_s = accept(pipe_stranger_relay, relay_kp_s).unwrap();
+            let sess_a =
+                std::sync::Arc::new(xx_accept_after_prefix(pipe_a_relay, relay_kp_a).unwrap());
+            let _sess_s = xx_accept_after_prefix(pipe_stranger_relay, relay_kp_s).unwrap();
             // Route NK pushes from stranger to A (deliberate routing to test discard).
             while let Ok(nk_pipe) = nk_rx.recv() {
                 let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
                 let sess_a2 = sess_a.clone();
                 std::thread::spawn(move || {
-                    if let Ok(sess) = trueseal_noise::session_nk::accept(nk_pipe, kp) {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp)
+                    {
                         if let Ok(raw) = sess.receive() {
                             if let Some((MsgType::Push, body)) = parse(&raw) {
                                 if body.len() >= 32 {
@@ -376,7 +379,7 @@ fn destroy_group_with_no_manifest_fires_callback_and_is_terminal() {
     {
         let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = accept(pipe_relay, relay_kp2);
+            let _ = xx_accept_after_prefix(pipe_relay, relay_kp2);
         });
     }
 
