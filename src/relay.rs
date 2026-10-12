@@ -468,11 +468,7 @@ fn run_loop<T: Read + Write + Send + 'static>(
                         continue;
                     }
 
-                    // Supported version: ack immediately — before decryption —
-                    // so the relay learns nothing about the decryption outcome
-                    // (zero trust, ADR-0020). Decrypt/verify failures are then
-                    // reported as malformed; the blob is already acked and gone.
-                    let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
+                    // Supported version. Decrypt, verify and decode first.
                     let decoded = crypto::decrypt(my_noise_priv, &env.payload).and_then(
                         |(author_pub, plaintext)| {
                             if env.verify_with(author_pub).is_ok() {
@@ -486,12 +482,29 @@ fn run_loop<T: Read + Write + Send + 'static>(
                     );
                     match decoded {
                         Ok((author_pub, msg)) => {
+                            // ADR-0026 (superseding ADR-0020's ack-on-receipt):
+                            // the DeliverAck leaves this device only after
+                            // every handler has FINISHED with the Blob. The
+                            // dispatch loop is serial, so handlers run one at
+                            // a time, in arrival order; a handler that never
+                            // finishes stalls delivery for this session (an
+                            // accepted, documented trade-off — apps that want
+                            // a timeout put one in their handler). The relay
+                            // can observe handling latency; that metadata
+                            // cost is documented in ADR-0026.
                             let cbs = callbacks.lock().unwrap_or_else(|e| e.into_inner());
                             for cb in cbs.iter() {
                                 cb(msg.clone(), author_pub, env.sequence);
                             }
+                            drop(cbs);
+                            let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
                         }
                         Err(_) => {
+                            // Undecodable or unauthenticated: the library
+                            // decided the Blob is unusable — ack and drop it
+                            // (ADR-0026 step 3) and report malformed. Nothing
+                            // but the DeliverAck ever leaves this device.
+                            let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
                             fire_issue(
                                 &issue_callbacks,
                                 DeliveryIssue::Unreadable(UnreadableReason::Malformed),
@@ -1131,6 +1144,63 @@ mod tests {
             delivered_cb.lock().unwrap().push(msg);
         });
         (client, issues, delivered)
+    }
+
+    /// ADR-0026: the DeliverAck leaves this device only AFTER every handler
+    /// has finished with the Blob — never on receipt. A handler that is
+    /// still running (here: blocked on a channel) must hold the ack; the
+    /// relay keeps the Blob and would re-deliver on a new session.
+    /// Red before SYNC-5: the ack went out before decryption.
+    #[test]
+    fn deliver_ack_waits_for_the_handler() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let (client_pipe, relay_pipe) = mem_pipe_pair();
+        let relay = spawn_deliver_relay(relay_pipe, relay_kp2);
+
+        let device = DeviceKeypair::generate();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let client = RelayClient::connect(
+            client_pipe,
+            relay_pub,
+            Keypair::new(device.noise.private(), device.noise.public_key),
+        )
+        .expect("connect");
+        client.subscribe(move |_msg, _author, _seq| {
+            // The handler blocks until the test releases it.
+            release_rx.recv().ok();
+        });
+
+        let sender_signing = SigningKeypair::generate();
+        let plaintext = Message::Sync {
+            body: b"hi".to_vec(),
+        }
+        .encode();
+        let payload = crypto::encrypt(
+            device.public_key(),
+            sender_signing.public_key_bytes(),
+            &plaintext,
+        );
+        let env = Envelope::build(1, vec![], device.public_key(), &sender_signing, payload);
+        relay.deliver(7, env.encode());
+
+        // While the handler is blocked the relay must see NO DeliverAck —
+        // the Blob is not yet handled, so it is not yet acknowledged.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            relay.deliver_acks().is_empty(),
+            "no DeliverAck may leave the device while the handler is still running"
+        );
+
+        // Once the handler finishes, the ack goes out with the right blob id.
+        release_tx.send(()).unwrap();
+        assert!(
+            wait_until(|| relay.deliver_acks().len() == 1, 2_000),
+            "the ack follows the handler's completion"
+        );
+        assert_eq!(relay.deliver_acks()[0], 7u64.to_be_bytes());
+        relay.assert_only_deliver_acks();
     }
 
     /// A relay that refuses the Transport Version replies `unsupported min..max`
