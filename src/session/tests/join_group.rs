@@ -115,3 +115,64 @@ fn join_group_invalid_token_returns_error() {
         result
     );
 }
+
+/// A relay that refuses the push's Transport Version surfaces the typed
+/// RelayVersionUnsupported through join_group — not a stringified PushFailed.
+/// PR #116 preserved it in push_message; join_group must not re-erase it.
+#[test]
+fn join_group_surfaces_typed_relay_version_unsupported() {
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    // Receive session: a normal XX accept so connect succeeds and the
+    // background receive loop has a live relay.
+    std::thread::spawn(move || {
+        let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        if let Ok(sess) = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp) {
+            while sess.receive().is_ok() {}
+        }
+    });
+    // Push sessions: the relay reads the prefix and refuses the Transport
+    // Version, exactly as a pre-version relay would.
+    let refusing_factory = move || {
+        let (client, mut relay) = mem_pipe_pair();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let mut prefix = [0u8; crate::version::TRANSPORT_PREFIX_LEN];
+            let mut filled = 0;
+            while filled < prefix.len() {
+                match relay.read(&mut prefix[filled..]) {
+                    Ok(0) => return,
+                    Ok(n) => filled += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(_) => return,
+                }
+            }
+            let _ = relay.write_all(b"unsupported 1..1\n");
+        });
+        Ok(client)
+    };
+
+    let device = DeviceKeypair::generate();
+    let session = TruesealSession::connect(
+        pipe_client,
+        relay_pub,
+        device,
+        |_, _, _| {},
+        refusing_factory,
+    )
+    .expect("connect");
+
+    let token = session.pairing_token();
+    let result = session.join_group(&token);
+    assert!(
+        matches!(
+            result,
+            Err(super::super::SessionError::RelayVersionUnsupported { min: 1, max: 1 })
+        ),
+        "join_group must surface the typed refusal, got {:?}",
+        result
+    );
+}

@@ -19,7 +19,14 @@ fn connection_changed_fires_true_on_initial_connect() {
         let relay_kp2 =
             trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2);
+            // Hold the session open like a real relay; dropping it right after
+            // the handshake would EOF the client immediately (Drop on MemPipe
+            // signals the peer).
+            if let Ok(sess) =
+                crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2)
+            {
+                while sess.receive().is_ok() {}
+            }
         });
     }
 
@@ -74,7 +81,11 @@ fn connection_changed_fires_sequence_on_disconnect_and_reconnect() {
         let relay_kp2 =
             trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = crate::version::testutil::xx_accept_after_prefix(pipe1_relay, relay_kp2);
+            if let Ok(sess) =
+                crate::version::testutil::xx_accept_after_prefix(pipe1_relay, relay_kp2)
+            {
+                while sess.receive().is_ok() {}
+            }
         });
     }
 
@@ -84,7 +95,11 @@ fn connection_changed_fires_sequence_on_disconnect_and_reconnect() {
         let relay_kp3 =
             trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = crate::version::testutil::xx_accept_after_prefix(pipe2_relay, relay_kp3);
+            if let Ok(sess) =
+                crate::version::testutil::xx_accept_after_prefix(pipe2_relay, relay_kp3)
+            {
+                while sess.receive().is_ok() {}
+            }
         });
     }
 
