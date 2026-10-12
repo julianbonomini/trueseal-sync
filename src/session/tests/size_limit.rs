@@ -20,7 +20,7 @@ use crate::operation_log::{MemLog, OperationLog};
 use crate::relay::build_push_blob;
 
 use super::super::test_helpers::*;
-use super::super::{drop_oversize_outbox_entries, SessionError, TruesealSession};
+use super::super::{drop_oversize_outbox_entries, IssueSink, SessionError, TruesealSession};
 use super::make_two_member_manifest;
 
 fn offline_session_with_manifest() -> TruesealSession<MemPipeSimple> {
@@ -264,18 +264,20 @@ fn drop_reports_each_oversize_entry_once() {
 
     let reports: Arc<Mutex<Vec<DeliveryIssue>>> = Arc::new(Mutex::new(Vec::new()));
     let reports_cb = reports.clone();
-    let issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>> =
-        Arc::new(Mutex::new(vec![Box::new(move |issue| {
+    let sink = Arc::new(Mutex::new(IssueSink::new()));
+    sink.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .subscribe(Box::new(move |issue| {
             reports_cb
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(issue);
-        })]));
+        }));
 
-    drop_oversize_outbox_entries(&op_log, &signing_pub, &issue_callbacks);
+    drop_oversize_outbox_entries(&op_log, &signing_pub, &sink);
     // A second load (e.g. the next process start) reports nothing — the
     // entries are gone.
-    drop_oversize_outbox_entries(&op_log, &signing_pub, &issue_callbacks);
+    drop_oversize_outbox_entries(&op_log, &signing_pub, &sink);
 
     let fired = reports.lock().unwrap_or_else(|e| e.into_inner());
     assert_eq!(
@@ -306,6 +308,70 @@ fn drop_reports_each_oversize_entry_once() {
         .undelivered_entries();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].sequence, 5);
+}
+
+/// The load-time reports must reach an app that subscribes AFTER the
+/// session is constructed — in real usage they fire during
+/// `connect_background`, before `subscribe_delivery_issues` can be called,
+/// so they are buffered and flushed to the first subscriber. Regression for
+/// the review finding that the reports fired to zero subscribers and were
+/// lost.
+#[test]
+fn drop_reports_reach_a_subscriber_after_construction() {
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let device = DeviceKeypair::generate();
+    let signing_pub = device.signing_public_key().0;
+    let remote = DeviceKeypair::generate();
+
+    let mut log = MemLog::new();
+    log.append(
+        &remote.public_key().0,
+        7,
+        vec![0u8; PROTOCOL_SIZE_LIMIT + 1],
+    );
+
+    let session = TruesealSession::<MemPipeSimple>::connect_background(
+        relay_pub,
+        device,
+        |_, _, _| {},
+        Box::new(log),
+        Arc::new(Mutex::new(None)),
+        || {},
+        |_| {},
+        || {},
+        || Err("unreachable".into()),
+        || Err("push factory unused in size-limit tests".into()),
+        None,
+        None,
+    )
+    .expect("offline session");
+
+    let reports: Arc<Mutex<Vec<DeliveryIssue>>> = Arc::new(Mutex::new(Vec::new()));
+    let reports_cb = reports.clone();
+    session.subscribe_delivery_issues(move |issue| {
+        reports_cb
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(issue);
+    });
+
+    let fired = reports.lock().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(
+        fired.len(),
+        1,
+        "the buffered report is flushed to the first subscriber"
+    );
+    match &fired[0] {
+        DeliveryIssue::SendFailed {
+            message_id: id,
+            reason,
+        } => {
+            assert_eq!(*reason, SendFailedReason::TooLarge);
+            assert_eq!(*id, message_id(&signing_pub, 7));
+        }
+        other => panic!("expected SendFailed, got {other:?}"),
+    }
 }
 
 /// The load-time drop works against the real SQLite-backed outbox, not only
@@ -373,12 +439,48 @@ fn every_message_type_fits_one_frame_at_the_limit() {
             .len()
     };
 
-    let sync = framed_len(Message::Sync {
-        body: vec![0x42u8; PROTOCOL_SIZE_LIMIT],
-    });
+    let sync_framed = build_push_blob(
+        &Message::Sync {
+            body: vec![0x42u8; PROTOCOL_SIZE_LIMIT],
+        },
+        recipient.public_key(),
+        1,
+        vec![],
+        &signing,
+    )
+    .expect("Sync at the Protocol Size Limit must fit one frame");
     assert!(
-        sync <= NOISE_FRAME_PLAINTEXT_MAX,
-        "Sync at the Protocol Size Limit must fit one frame: {sync} > {NOISE_FRAME_PLAINTEXT_MAX}"
+        sync_framed.len() <= NOISE_FRAME_PLAINTEXT_MAX,
+        "Sync at the Protocol Size Limit must fit one frame: {} > {NOISE_FRAME_PLAINTEXT_MAX}",
+        sync_framed.len()
+    );
+
+    // The restated 65,519 ceiling is only a claim until the real transport
+    // agrees: push the frame through an actual trueseal-noise XX session,
+    // so a noise-side change to the frame ceiling fails this test.
+    let relay_kp = make_relay_kp();
+    let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+    let (client_end, relay_end) = mem_pipe_pair();
+    let relay_thread = std::thread::spawn(move || {
+        let sess = crate::version::testutil::xx_accept_after_prefix(relay_end, relay_kp2)
+            .expect("relay accept");
+        sess.receive().expect("receive the framed push")
+    });
+    let mut transport = client_end;
+    let prologue =
+        crate::version::exchange_transport_version(&mut transport).expect("prefix exchange");
+    let sess = trueseal_noise::session_xx::dial(
+        transport,
+        trueseal_noise::keypair::Keypair::new(sender.noise.private(), sender.noise.public_key),
+        &prologue,
+    )
+    .expect("dial");
+    sess.send(&sync_framed)
+        .expect("a Sync at the Protocol Size Limit must fit a real Noise frame");
+    let got = relay_thread.join().expect("relay thread panicked");
+    assert_eq!(
+        got, sync_framed,
+        "the frame survives the real session round-trip byte-for-byte"
     );
 
     // The largest allowed Group Manifest: 32 members (ADR-0027) with

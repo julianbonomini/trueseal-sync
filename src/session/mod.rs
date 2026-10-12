@@ -129,6 +129,53 @@ pub(super) struct PendingMember {
     pub signing_pub: SigningPublicKey,
 }
 
+/// Session-side Delivery Issue channel (ADR-0034 §3).
+///
+/// The load-time reports of ADR-0025 fire during construction, before any
+/// subscriber can exist, so issues fired with no subscribers are buffered
+/// and flushed to the first subscriber; issues fired after subscription go
+/// to every subscriber. The buffer is one-shot — it drains on the first
+/// subscribe, and the dropped entries are gone from the log — so a report
+/// still reaches the app exactly once across reloads.
+struct IssueSink {
+    pending: Vec<DeliveryIssue>,
+    callbacks: Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>,
+}
+
+impl IssueSink {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            callbacks: Vec::new(),
+        }
+    }
+
+    /// Fire an issue: to every subscriber, or into the buffer when there are
+    /// none yet. As elsewhere in this module, callbacks fire under the lock
+    /// and must not re-enter session methods.
+    fn fire(&mut self, issue: DeliveryIssue) {
+        if self.callbacks.is_empty() {
+            self.pending.push(issue);
+            return;
+        }
+        for cb in &self.callbacks {
+            cb(issue.clone());
+        }
+    }
+
+    /// Register a subscriber. The first subscriber immediately receives
+    /// everything buffered since construction; later subscribers see only
+    /// issues fired after they register.
+    fn subscribe(&mut self, callback: Box<dyn Fn(DeliveryIssue) + Send + 'static>) {
+        if self.callbacks.is_empty() {
+            for issue in self.pending.drain(..) {
+                callback(issue);
+            }
+        }
+        self.callbacks.push(callback);
+    }
+}
+
 /// Drop outbox entries over the Protocol Size Limit and report each one as
 /// `sendFailed(tooLarge)` (ADR-0025: "Outbox entries already over the limit
 /// (only in development stores) are dropped on load and raise the same
@@ -143,7 +190,7 @@ pub(super) struct PendingMember {
 fn drop_oversize_outbox_entries(
     op_log: &Arc<Mutex<Box<dyn OperationLog>>>,
     signing_pub: &[u8; 32],
-    issue_callbacks: &Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>>,
+    issue_sink: &Arc<Mutex<IssueSink>>,
 ) {
     let oversized: Vec<(u64, [u8; 32])> = {
         let mut log = op_log.lock().unwrap_or_else(|e| e.into_inner());
@@ -171,15 +218,12 @@ fn drop_oversize_outbox_entries(
         },
         PROTOCOL_SIZE_LIMIT
     );
-    let callbacks = issue_callbacks.lock().unwrap_or_else(|e| e.into_inner());
+    let mut sink = issue_sink.lock().unwrap_or_else(|e| e.into_inner());
     for (sequence, _) in &oversized {
-        let issue = DeliveryIssue::SendFailed {
+        sink.fire(DeliveryIssue::SendFailed {
             message_id: message_id(signing_pub, *sequence),
             reason: SendFailedReason::TooLarge,
-        };
-        for cb in callbacks.iter() {
-            cb(issue.clone());
-        }
+        });
     }
 }
 
@@ -226,11 +270,12 @@ pub struct TruesealSession<T: Read + Write + Send + 'static> {
     /// Size Limit; a caller may lower it (e.g. to match a stricter relay),
     /// never raise it above the protocol ceiling (ADR-0025).
     max_payload_bytes: AtomicUsize,
-    /// Subscribers for Delivery Issues raised by the session itself —
-    /// currently `sendFailed(tooLarge)` for outbox entries dropped on load
-    /// (ADR-0025). Receive-path issues are raised on the RelayClient
-    /// (SYNC-1); SYNC-15 unifies the surface on the FFI.
-    issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>>,
+    /// Delivery Issues raised by the session itself — currently
+    /// `sendFailed(tooLarge)` for outbox entries dropped on load
+    /// (ADR-0025). Buffered until the first subscriber registers, so the
+    /// load-time reports are never lost. Receive-path issues are raised on
+    /// the RelayClient (SYNC-1); SYNC-15 unifies the surface on the FFI.
+    issue_sink: Arc<Mutex<IssueSink>>,
 }
 
 /// Builds the full manifest-aware subscribe handler.
@@ -581,13 +626,13 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let client = RelayClient::connect_subscribed(transport, relay_pub, noise_kp, handler)?;
 
         let op_log: Arc<Mutex<Box<dyn OperationLog>>> = Arc::new(Mutex::new(op_log));
-        let issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let issue_sink = Arc::new(Mutex::new(IssueSink::new()));
         // SYNC-8 (#100): drop oversize entries persisted by pre-fix builds —
         // they can never be delivered and would replay forever (ADR-0025).
+        // The reports buffer in the sink until the first subscriber registers.
         {
             let signing_pub = keys.lock().unwrap_or_else(|e| e.into_inner()).signing_pub.0;
-            drop_oversize_outbox_entries(&op_log, &signing_pub, &issue_callbacks);
+            drop_oversize_outbox_entries(&op_log, &signing_pub, &issue_sink);
         }
 
         // Restore sequence counter from the op log so it never re-uses a
@@ -617,7 +662,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             on_member_joined: on_mj_cb_ret,
             on_member_left: on_ml_cb_ret,
             max_payload_bytes: AtomicUsize::new(PROTOCOL_SIZE_LIMIT),
-            issue_callbacks,
+            issue_sink,
         })
     }
 
@@ -749,14 +794,14 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         // Stub client: permanently disconnected — the reconnect loop will replace it.
         let client: Arc<Mutex<RelayClient<T>>> = Arc::new(Mutex::new(RelayClient::disconnected()));
         let op_log_arc: Arc<Mutex<Box<dyn OperationLog>>> = Arc::new(Mutex::new(op_log));
-        let issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let issue_sink = Arc::new(Mutex::new(IssueSink::new()));
 
         // SYNC-8 (#100): drop oversize entries persisted by pre-fix builds —
         // they can never be delivered and would replay forever (ADR-0025).
+        // The reports buffer in the sink until the first subscriber registers.
         {
             let signing_pub = keys.lock().unwrap_or_else(|e| e.into_inner()).signing_pub.0;
-            drop_oversize_outbox_entries(&op_log_arc, &signing_pub, &issue_callbacks);
+            drop_oversize_outbox_entries(&op_log_arc, &signing_pub, &issue_sink);
         }
 
         // Restore sequence counter from the op log so it never re-uses a
@@ -786,7 +831,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             on_member_joined: on_member_joined.clone(),
             on_member_left: on_member_left.clone(),
             max_payload_bytes: AtomicUsize::new(PROTOCOL_SIZE_LIMIT),
-            issue_callbacks: issue_callbacks.clone(),
+            issue_sink: issue_sink.clone(),
         };
 
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
@@ -930,14 +975,19 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
 
     /// Subscribe to Delivery Issues raised by this session (ADR-0034 §3) —
     /// currently `sendFailed(tooLarge)` for outbox entries dropped on load
-    /// (ADR-0025). Receive-path issues (`unreadable`, `heldForUpgrade`) are
-    /// raised on the RelayClient's own channel (SYNC-1); SYNC-15 unifies the
-    /// surface on the FFI.
+    /// (ADR-0025). Those load-time reports fire during construction, so they
+    /// are buffered and flushed to the first subscriber; issues raised after
+    /// subscription go to every subscriber.
+    ///
+    /// Receive-path issues (`unreadable`, `heldForUpgrade`) are raised on the
+    /// RelayClient's own channel (SYNC-1); SYNC-15 unifies the surface on
+    /// the FFI. Callbacks fire under the sink lock and must not re-enter
+    /// session methods.
     pub fn subscribe_delivery_issues(&self, callback: impl Fn(DeliveryIssue) + Send + 'static) {
-        self.issue_callbacks
+        self.issue_sink
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(Box::new(callback));
+            .subscribe(Box::new(callback));
     }
 
     pub(crate) fn push_message(
