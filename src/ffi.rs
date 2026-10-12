@@ -39,6 +39,12 @@ pub enum SessionError {
     /// supports (ADR-0022). Outbox entries stay queued.
     #[error("relay supports Transport Version {min}..={max}")]
     RelayVersionUnsupported { min: u32, max: u32 },
+    /// The `Sync` body exceeds the payload limit — at most the Protocol
+    /// Size Limit of 61,440 bytes (ADR-0025; `payloadTooLarge{max}` in
+    /// ADR-0028's error list). The body was never queued. Permanent — a
+    /// retry with the same body fails the same way.
+    #[error("payload too large: maximum {max} bytes")]
+    PayloadTooLarge { max: u32 },
 }
 
 impl From<CoreSessionError> for SessionError {
@@ -57,6 +63,7 @@ impl From<CoreSessionError> for SessionError {
             CoreSessionError::RelayVersionUnsupported { min, max } => {
                 SessionError::RelayVersionUnsupported { min, max }
             }
+            CoreSessionError::PayloadTooLarge { max } => SessionError::PayloadTooLarge { max },
         }
     }
 }

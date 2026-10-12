@@ -31,6 +31,10 @@ pub struct LogEntry {
 pub trait OperationLog: Send {
     fn append(&mut self, object_id: &[u8; 32], sequence: u64, blob: Vec<u8>);
     fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64);
+    /// Permanently delete one entry. Used to drop entries that can never be
+    /// delivered (e.g. over the Protocol Size Limit, ADR-0025) — unlike
+    /// `mark_delivered`, the entry is gone, not just confirmed.
+    fn remove(&mut self, object_id: &[u8; 32], sequence: u64);
     /// Returns undelivered entries sorted by global sequence ascending.
     fn undelivered_entries(&self) -> Vec<LogEntry>;
     fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<LogEntry>;
@@ -82,6 +86,15 @@ impl OperationLog for MemLog {
         if let Some(map) = self.inner.get_mut(object_id) {
             if let Some(entry) = map.get_mut(&sequence) {
                 entry.delivered = true;
+            }
+        }
+    }
+
+    fn remove(&mut self, object_id: &[u8; 32], sequence: u64) {
+        if let Some(map) = self.inner.get_mut(object_id) {
+            map.remove(&sequence);
+            if map.is_empty() {
+                self.inner.remove(object_id);
             }
         }
     }

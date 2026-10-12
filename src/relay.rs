@@ -14,13 +14,9 @@ use crate::crypto;
 use crate::delivery_issue::{DeliveryIssue, UnreadableReason};
 use crate::envelope::Envelope;
 use crate::keys::NoisePublicKey;
+use crate::limits::MAX_ENVELOPE_BYTES;
 use crate::message::Message;
 use crate::version::{self, TransportVersionError};
-
-/// Maximum serialised envelope size the client will attempt to push (1 MiB).
-/// trueseal-sync is the protocol authority — this constant must match the relay's
-/// configurable default (`relay.max_envelope_bytes`).
-pub const MAX_ENVELOPE_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Error)]
 pub enum RelayError {
@@ -32,7 +28,8 @@ pub enum RelayError {
     ReceiveFailed(String),
     #[error("handshake failed: {0}")]
     HandshakeFailed(String),
-    /// The serialised envelope exceeds MAX_ENVELOPE_BYTES.
+    /// The serialised envelope exceeds `limits::MAX_ENVELOPE_BYTES` — the
+    /// largest envelope that still fits in one Noise frame (ADR-0025).
     /// Non-retryable — the outbox must not replay this blob.
     #[error("envelope too large")]
     EnvelopeTooLarge,
@@ -300,7 +297,9 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
 /// Encrypts `message` to `recipient_pub`, wraps it in a signed Envelope, and
 /// returns the wire-framed bytes ready to hand to `push_send` (ADR-0018).
 /// Returns `Err(RelayError::EnvelopeTooLarge)` if the serialised envelope
-/// exceeds `MAX_ENVELOPE_BYTES` — checked after serialisation, before framing.
+/// exceeds `limits::MAX_ENVELOPE_BYTES` (the one-frame ceiling, ADR-0025) —
+/// checked after serialisation, before framing. `Sync` bodies are refused
+/// earlier, at the Protocol Size Limit in `send()`.
 pub fn build_push_blob(
     message: &Message,
     recipient_pub: NoisePublicKey,
@@ -745,13 +744,17 @@ mod tests {
         assert_eq!(stored.len(), 1, "relay should have received one envelope");
     }
 
-    /// build_push_blob returns EnvelopeTooLarge when envelope exceeds MAX_ENVELOPE_BYTES.
+    /// build_push_blob returns EnvelopeTooLarge when the serialised envelope
+    /// cannot fit in one Noise frame (limits::MAX_ENVELOPE_BYTES, ADR-0025).
+    /// This is the internal backstop for control messages; `Sync` bodies are
+    /// refused earlier at the Protocol Size Limit in `send()`.
     #[test]
     fn build_push_blob_rejects_oversized_envelope() {
         let sender = DeviceKeypair::generate();
         let recipient = DeviceKeypair::generate();
-        // Craft a message whose serialised envelope exceeds MAX_ENVELOPE_BYTES.
-        let huge_body = vec![0u8; MAX_ENVELOPE_BYTES + 1];
+        // A body at the Envelope limit always serialises over it (message tag
+        // and encryption overhead are added on top).
+        let huge_body = vec![0u8; MAX_ENVELOPE_BYTES];
         let msg = Message::Sync { body: huge_body };
         let result = build_push_blob(
             &msg,

@@ -8,6 +8,7 @@ pub mod device;
 pub mod envelope;
 pub mod ffi;
 pub mod keys;
+pub mod limits;
 pub mod manifest;
 pub mod member;
 pub mod message;
@@ -19,5 +20,6 @@ pub mod store;
 pub mod version;
 
 pub use keys::{NoisePublicKey, SigningPublicKey};
+pub use limits::PROTOCOL_SIZE_LIMIT;
 pub use operation_log::LogEntry;
 pub use version::{END_TO_END_VERSION, TRANSPORT_VERSION};

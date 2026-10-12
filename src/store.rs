@@ -237,6 +237,15 @@ impl OperationLog for PersistentLog {
         }
     }
 
+    fn remove(&mut self, object_id: &[u8; 32], sequence: u64) {
+        if let Err(e) = self.store.conn.execute(
+            "DELETE FROM outbox WHERE object_id = ?1 AND sequence = ?2",
+            rusqlite::params![object_id.as_slice(), sequence as i64],
+        ) {
+            warn!("[trueseal-sync] outbox remove failed (seq={sequence}): {e}");
+        }
+    }
+
     fn undelivered_entries(&self) -> Vec<LogEntry> {
         let mut stmt = self
             .store
