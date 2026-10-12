@@ -11,6 +11,7 @@ mod members;
 mod nk_push;
 mod offline;
 mod outbox;
+mod pair_signer_binding;
 mod pairing;
 mod panic_safety;
 mod push;
