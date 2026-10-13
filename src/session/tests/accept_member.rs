@@ -43,7 +43,7 @@ fn pair_inside_window_fires_on_member_request() {
     });
 
     // Open a pairing window and give B the token to send a Pair message.
-    let pairing_token = session_a.pairing_token();
+    let pairing_token = session_a.pairing_token().expect("pairing window opens");
 
     let session_b = TruesealSession::connect_full(
         pipe_b_client,
@@ -105,7 +105,7 @@ fn accept_member_with_valid_token_returns_true() {
         *tr.lock().unwrap() = Some(token);
     });
 
-    let pairing_token = session_a.pairing_token();
+    let pairing_token = session_a.pairing_token().expect("pairing window opens");
 
     let session_b = TruesealSession::connect_full(
         pipe_b_client,
@@ -239,7 +239,7 @@ fn pair_outside_window_does_not_fire_callback() {
     // B tries to join using the fake token — the Pair goes to fake_initiator, not A.
     // This won't fire A's callback. Instead, construct a scenario where B sends to A
     // with no window open: directly use the pairing_token from A but cancel first.
-    let a_pairing_token = session_a.pairing_token();
+    let a_pairing_token = session_a.pairing_token().expect("pairing window opens");
     session_a.cancel_pairing(); // close window before B sends
 
     let _ = session_b.join_group(&a_pairing_token);

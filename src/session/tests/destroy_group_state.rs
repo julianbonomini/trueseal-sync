@@ -14,6 +14,9 @@
 //! - Revoke is ignored in `pendingJoin`, `notJoined` and `destroying`;
 //!   replaying a Revoke changes no state (ADR-0034).
 //! - No `Sync` is sent and no handler runs while Destroying.
+//! - A Destroying device admits no one (B12 review): `pairing_token` and
+//!   `accept_pair` fail typed `GroupDestroyed`, and inbound Pairs are
+//!   dropped — a joiner can never be stranded in a dying group.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -741,7 +744,7 @@ fn revoke_ignored_in_not_joined_and_pending_join() {
     assert!(session_b.op_log.lock().unwrap().destroying().is_none());
 
     // pendingJoin: B asked to join via A's token and is waiting.
-    let token = session_a.pairing_token();
+    let token = session_a.pairing_token().expect("pairing window opens");
     session_b.join_group(&token).expect("join");
     assert_eq!(session_b.group_status(), GroupStatus::PendingJoin);
     let control_before = session_b.op_log.lock().unwrap().undelivered_entries().len();
@@ -1079,4 +1082,61 @@ fn no_handler_runs_while_destroying() {
         0,
         "no handler runs while Destroying"
     );
+}
+
+/// ADR-0029 (B12 review): a Destroying device admits no one. Opening a
+/// Pairing Window mid-Destroy fails typed, `accept_pair` refuses typed,
+/// and no manifest is ever built — a joiner admitted into a dying group
+/// would be stranded: every other device is Destroying or wiped and
+/// drops its manifests.
+#[test]
+fn pairing_is_refused_while_destroying() {
+    let me = DeviceKeypair::generate();
+    let other = DeviceKeypair::generate();
+    let (session, _relay, _destroyed, _gate) = gated_destroy_session(&me);
+    session.set_manifest(GroupManifest::new(
+        new_group_id(),
+        1,
+        vec![member_of(&me), member_of(&other)],
+        &sk_of(&me),
+    ));
+    session.destroy_group().expect("member can destroy");
+    assert_eq!(session.group_status(), GroupStatus::Destroying);
+
+    // Opening a window fails typed — no token, no window.
+    assert!(
+        matches!(
+            session.pairing_token(),
+            Err(SessionError::GroupDestroyed)
+        ),
+        "pairing_token must fail typed while Destroying"
+    );
+
+    // Admission refuses typed, and nothing is built or queued.
+    let joiner = DeviceKeypair::generate();
+    let result = session.accept_pair(joiner.public_key(), joiner.signing_public_key());
+    assert!(
+        matches!(result, Err(SessionError::GroupDestroyed)),
+        "accept_pair must fail typed while Destroying, got {result:?}"
+    );
+    {
+        let m = session.manifest.lock().unwrap();
+        let m = m.as_ref().expect("manifest survives");
+        assert_eq!(m.version, 1, "no admission manifest was issued");
+        assert_eq!(m.members.len(), 2, "membership unchanged");
+    }
+    {
+        let log = session.op_log.lock().unwrap();
+        let entries = log.undelivered_entries();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the queued Revoke — no manifest was queued"
+        );
+        assert_eq!(
+            entries[0].blob,
+            Message::Revoke.encode(),
+            "the one queued entry is the Revoke"
+        );
+    }
 }

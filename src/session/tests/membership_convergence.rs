@@ -145,11 +145,11 @@ fn concurrent_admissions_converge_on_every_member() {
     session_b.set_manifest(v1.clone());
 
     // A admits C; B admits D — concurrently (neither has seen the other).
-    session_a.pairing_token();
+    let _ = session_a.pairing_token().expect("pairing window opens");
     assert!(session_a
         .accept_pair(c.public_key(), c.signing_public_key())
         .expect("A admits C"));
-    session_b.pairing_token();
+    let _ = session_b.pairing_token().expect("pairing window opens");
     assert!(session_b
         .accept_pair(d.public_key(), d.signing_public_key())
         .expect("B admits D"));
@@ -257,7 +257,7 @@ fn concurrent_admit_and_remove_converge_on_every_member() {
     session_b.set_manifest(v1.clone());
 
     // A admits C; B removes D — concurrently at version 2.
-    session_a.pairing_token();
+    let _ = session_a.pairing_token().expect("pairing window opens");
     assert!(session_a
         .accept_pair(c.public_key(), c.signing_public_key())
         .expect("A admits C"));
@@ -375,7 +375,7 @@ fn overwritten_change_reapplied_after_issuer_restart() {
             (s, relay, ())
         };
         session_a.set_manifest(v1.clone());
-        session_a.pairing_token();
+        let _ = session_a.pairing_token().expect("pairing window opens");
         assert!(session_a
             .accept_pair(c.public_key(), c.signing_public_key())
             .expect("A admits C"));
@@ -479,7 +479,7 @@ fn deliberate_later_removal_is_not_undone() {
     session_a.set_manifest(v1.clone());
 
     // A admits C — the Pending Membership Change.
-    session_a.pairing_token();
+    let _ = session_a.pairing_token().expect("pairing window opens");
     assert!(session_a
         .accept_pair(c.public_key(), c.signing_public_key())
         .expect("A admits C"));
@@ -702,7 +702,7 @@ fn falsely_removed_device_cannot_issue_membership_changes() {
     );
     session_d.set_manifest(view);
 
-    session_d.pairing_token();
+    let _ = session_d.pairing_token().expect("pairing window opens");
     let joiner = DeviceKeypair::generate();
     assert!(
         matches!(
@@ -769,7 +769,7 @@ fn removal_built_on_intermediate_manifest_is_deliberate() {
         &SigningKey::from_bytes(&a.signing.to_bytes()),
     );
     session_a.set_manifest(v1.clone());
-    session_a.pairing_token();
+    let _ = session_a.pairing_token().expect("pairing window opens");
     assert!(session_a
         .accept_pair(e.public_key(), e.signing_public_key())
         .expect("A admits E"));
@@ -1139,7 +1139,7 @@ fn thirty_third_admission_refused_with_group_full() {
     );
     session_a.set_manifest(full);
 
-    session_a.pairing_token();
+    let _ = session_a.pairing_token().expect("pairing window opens");
     let joiner = DeviceKeypair::generate();
     let result = session_a.accept_pair(joiner.public_key(), joiner.signing_public_key());
     assert!(
@@ -1183,7 +1183,7 @@ fn reapplied_admission_over_group_size_drops_with_typed_event() {
 
     // A admits D — the 32nd member — with a Pending Membership Change.
     let d = DeviceKeypair::generate();
-    session_a.pairing_token();
+    let _ = session_a.pairing_token().expect("pairing window opens");
     assert!(session_a
         .accept_pair(d.public_key(), d.signing_public_key())
         .expect("32nd admission fits"));

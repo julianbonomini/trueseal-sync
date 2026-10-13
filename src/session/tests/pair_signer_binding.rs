@@ -52,7 +52,7 @@ fn pair_signing_pub_must_match_envelope_signer() {
     let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let r = requests.clone();
     session_a.set_on_member_request(move |token, _| r.lock().unwrap().push(token));
-    let token = session_a.pairing_token();
+    let token = session_a.pairing_token().expect("pairing window opens");
 
     session_m
         .push_message(
@@ -114,7 +114,7 @@ fn replayed_pair_payload_under_different_signer_is_dropped() {
     let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let r = requests.clone();
     session_a.set_on_member_request(move |token, _| r.lock().unwrap().push(token));
-    let token = session_a.pairing_token();
+    let token = session_a.pairing_token().expect("pairing window opens");
 
     // M replays B's Pair payload inside an Envelope signed by M.
     session_m
@@ -168,7 +168,7 @@ fn matched_pair_still_raises_join_request_and_admits() {
     let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let r = requests.clone();
     session_a.set_on_member_request(move |token, _| r.lock().unwrap().push(token));
-    let token = session_a.pairing_token();
+    let token = session_a.pairing_token().expect("pairing window opens");
 
     session_m
         .push_message(

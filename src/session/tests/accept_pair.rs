@@ -51,7 +51,7 @@ fn accept_pair_creates_genesis_manifest() {
     .expect("session B");
 
     // A opens a pairing window then accepts B.
-    let _token = session_a.pairing_token();
+    let _token = session_a.pairing_token().expect("pairing window opens");
     let admitted = session_a.accept_pair(b_noise, b_signing).expect("accept");
     assert!(admitted, "accept_pair must return true when window is open");
 

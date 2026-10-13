@@ -1109,7 +1109,7 @@ fn accept_pair_offline_queues_manifest_and_delivers_on_reconnect() {
     .expect("A session");
 
     // Offline admission: window opens, accept_pair persists + queues.
-    let _token = session_a.pairing_token();
+    let _token = session_a.pairing_token().expect("pairing window opens");
     assert!(session_a.accept_pair(b_noise, b_signing).expect("accept"));
     {
         let entries = session_a

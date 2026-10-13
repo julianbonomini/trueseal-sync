@@ -482,7 +482,7 @@ pub(super) fn run_pairing_ceremony<T, U>(
     let req: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let r = req.clone();
     admitter.set_on_member_request(move |token, _| *r.lock().unwrap() = Some(token));
-    let token = admitter.pairing_token();
+    let token = admitter.pairing_token().expect("pairing window opens");
     joiner
         .join_group(&token)
         .expect("join_group durably queues the Pair");

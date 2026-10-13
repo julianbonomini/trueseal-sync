@@ -590,7 +590,7 @@ fn member_request_arriving_before_registration_flushes_on_registration() {
         || Err("push factory unused".into()),
     )
     .expect("session");
-    let token = session.pairing_token(); // open the window
+    let token = session.pairing_token().expect("pairing window opens"); // open the window
     let (_, _, secret, _) = crate::message::decode_pairing_token(&token).expect("token decodes");
 
     // The Pair arrives BEFORE any member-request handler is registered.

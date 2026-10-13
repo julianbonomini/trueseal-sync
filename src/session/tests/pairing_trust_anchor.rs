@@ -97,7 +97,7 @@ fn joiner_accepts_only_initiator_manifest() {
     session_b.subscribe_delivery_issues(b_issue_cb);
 
     // B asks to join A. The attacker races A's manifest with a forgery.
-    let token = session_a.pairing_token();
+    let token = session_a.pairing_token().expect("pairing window opens");
     session_b.join_group(&token).expect("join");
     assert_eq!(session_b.group_status(), GroupStatus::PendingJoin);
 
@@ -388,7 +388,7 @@ fn relay_injected_pair_is_rejected() {
     session.set_on_member_request(move |_, _| {
         rq.fetch_add(1, Ordering::SeqCst);
     });
-    let _token = session.pairing_token(); // window open
+    let _token = session.pairing_token().expect("pairing window opens"); // window open
     let device_pub = session.noise_pub();
 
     relay.deliver(
@@ -438,7 +438,7 @@ fn pair_with_wrong_secret_is_rejected() {
     session.set_on_member_request(move |_, _| {
         rq.fetch_add(1, Ordering::SeqCst);
     });
-    let token = session.pairing_token();
+    let token = session.pairing_token().expect("pairing window opens");
     let device_pub = session.noise_pub();
     let (_, _, mut secret, _) = crate::message::decode_pairing_token(&token).expect("token");
     secret[0] ^= 0xFF; // corrupted in transit
@@ -498,7 +498,7 @@ fn pair_replaying_spent_secret_is_rejected() {
     let device_pub = session.noise_pub();
 
     // B proves the secret and is admitted — the single-use window is spent.
-    let token = session.pairing_token();
+    let token = session.pairing_token().expect("pairing window opens");
     let (_, _, secret, _) = crate::message::decode_pairing_token(&token).expect("token");
     relay.deliver(
         1,
@@ -572,7 +572,7 @@ fn repeat_pair_from_same_joiner_dedupes_into_one_request() {
     session.set_on_member_request(move |_, _| {
         rq.fetch_add(1, Ordering::SeqCst);
     });
-    let token = session.pairing_token();
+    let token = session.pairing_token().expect("pairing window opens");
     let device_pub = session.noise_pub();
     let (_, _, secret, _) = crate::message::decode_pairing_token(&token).expect("token");
 
@@ -1182,7 +1182,7 @@ fn admitter_restart_spends_the_secret() {
     session1.set_on_member_request(move |_, _| {
         r1.fetch_add(1, Ordering::SeqCst);
     });
-    let token = session1.pairing_token();
+    let token = session1.pairing_token().expect("pairing window opens");
     let pub1 = session1.noise_pub();
     let (_, _, secret, _) = crate::message::decode_pairing_token(&token).expect("token");
     relay1.deliver(
@@ -1275,7 +1275,7 @@ fn admitter_restart_keeps_the_queued_admission_manifest() {
             || Err("push path down".into()),
         )
         .expect("session");
-        let _token = session.pairing_token();
+        let _token = session.pairing_token().expect("pairing window opens");
         assert!(
             session
                 .accept_pair(joiner.public_key(), joiner.signing_public_key())
@@ -1339,9 +1339,9 @@ fn new_window_spends_the_old_secret() {
     });
     let pubk = session.noise_pub();
 
-    let token1 = session.pairing_token();
+    let token1 = session.pairing_token().expect("pairing window opens");
     let (_, _, secret1, _) = crate::message::decode_pairing_token(&token1).expect("t1");
-    let token2 = session.pairing_token(); // reopen — new secret
+    let token2 = session.pairing_token().expect("pairing window opens"); // reopen — new secret
     let (_, _, secret2, _) = crate::message::decode_pairing_token(&token2).expect("t2");
     assert_ne!(secret1, secret2, "each window gets a fresh secret");
 
@@ -1385,7 +1385,7 @@ fn two_concurrent_accepts_exactly_one_succeeds() {
         )
         .expect("session"),
     );
-    let _token = session.pairing_token(); // window open
+    let _token = session.pairing_token().expect("pairing window opens"); // window open
 
     let joiner_a = SigningKeypair::generate();
     let joiner_b = SigningKeypair::generate();
@@ -1533,7 +1533,7 @@ fn join_group_store_failure_is_a_typed_error_without_pending_state() {
 
     // A well-formed token (the session's own is fine — the store fails
     // before any network step matters).
-    let token = session.pairing_token();
+    let token = session.pairing_token().expect("pairing window opens");
 
     let err = session
         .join_group(&token)

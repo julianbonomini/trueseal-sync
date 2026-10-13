@@ -53,7 +53,7 @@ fn on_member_joined_fires_on_admitting_device() {
         *ts.lock().unwrap() = Some(token);
     });
 
-    let pairing_token = session_a.pairing_token();
+    let pairing_token = session_a.pairing_token().expect("pairing window opens");
 
     let _session_b = TruesealSession::connect_full(
         pipe_b_client,
