@@ -188,6 +188,20 @@
       }
     },
     {
+      "layer": "frame",
+      "case": "unknownFrameType",
+      "input": {
+        "frameHex": "7f00000000"
+      },
+      "expect": {
+        "kind": "deliveryIssue",
+        "name": "unreadable",
+        "reason": "malformed",
+        "acked": false,
+        "detail": "an unknown MsgType does not parse; with no blob id there is nothing to ack (ADR-0034 §3)"
+      }
+    },
+    {
       "layer": "envelope",
       "case": "badSignature",
       "input": {
@@ -271,6 +285,21 @@
         "name": "unreadable",
         "reason": "malformed",
         "acked": true
+      }
+    },
+    {
+      "layer": "message",
+      "case": "pairMissingSecret",
+      "input": {
+        "messageHex": "013a553d74792d727efa9b9a4cde3da1ad93f1a2d0c09cb639b1a3c0fda14cbe24e7f162a10bec559afea195e4dce84b69568d5d2cb0963eb446c0685e2b17f2f0",
+        "detail": "the pre-SYNC-3 65-byte Pair body (tag || noise_pub || signing_pub, no Pairing Secret) — the clean break of ADR-0022 makes the unversioned pairing format unreadable (ADR-0023)"
+      },
+      "expect": {
+        "kind": "deliveryIssue",
+        "name": "unreadable",
+        "reason": "malformed",
+        "acked": true,
+        "reachesHandler": false
       }
     }
   ]

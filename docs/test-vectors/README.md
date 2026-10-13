@@ -23,7 +23,7 @@ and none of the key material is valid on any live network.
 | `messages` | All four message types (Pair carries the ADR-0023 Pairing Secret; a 65-byte pre-SYNC-3 Pair must NOT decode) |
 | `sealedEnvelope` | A complete sealed Envelope: inputs, sealed prefix, payload, protobuf bytes, hash |
 | `frames` | All six relay frame types (`[type:u8][len:u32 BE][body]`), including a full Push blob built by the production assembly |
-| `rejections` | One rejection per layer — transport (×2), envelope signature, size, End-to-End Version (newer held / older dropped), replay expiry, unknown message tag — each naming the expected typed error or Delivery Issue from the canonical taxonomy (`docs/shared-facts.json`) |
+| `rejections` | One rejection per layer — transport (×2), unknown frame type, envelope signature, size, End-to-End Version (newer held / older dropped), replay expiry, unknown message tag, a pre-SYNC-3 Pair without its secret — each naming the expected typed error or Delivery Issue from the canonical taxonomy (`docs/shared-facts.json`) |
 
 ## Consuming the vectors
 
@@ -35,10 +35,11 @@ and none of the key material is valid on any live network.
   `addressedEncryption`, `messageId`, `messages` and `sealedEnvelope`
   sections from the same `keys` inputs, and classify the `rejections` as
   named.
-- **Conventions:** hex is lowercase; multi-byte integers in layouts say
-  their endianness (LE = little-endian, BE = big-endian); JSON numbers are
-  unsigned 64-bit; strings with `\n` are byte-exact. `blob_id` is 8 opaque
-  relay-assigned bytes — a client echoes it verbatim in DeliverAck.
+- **Conventions:** hex is lowercase; base64url is UNPADDED; multi-byte
+  integers in layouts say their endianness (LE = little-endian, BE =
+  big-endian); JSON numbers are unsigned 64-bit; strings with `\n` are
+  byte-exact. `blob_id` is 8 opaque relay-assigned bytes — a client echoes
+  it verbatim in DeliverAck.
 
 ## Regenerating (deliberate changes only)
 
