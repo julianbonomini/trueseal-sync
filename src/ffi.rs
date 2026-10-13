@@ -789,6 +789,8 @@ impl TrueSeal {
 
     /// Register an event listener (ADR-0028). Any number; events raised
     /// before the first listener registers are buffered and flushed to it.
+    /// Listeners fire under the bus lock (same rule as the core's sinks):
+    /// they must not call back into this object synchronously.
     pub fn on_event(
         &self,
         listener: Box<dyn TrueSealEventListener>,
@@ -804,7 +806,9 @@ impl TrueSeal {
         }))
     }
 
-    /// Register a delivery-issue listener (ADR-0026). Optional.
+    /// Register a delivery-issue listener (ADR-0026). Optional. Listeners
+    /// fire under the bus lock and must not call back into this object
+    /// synchronously.
     pub fn on_delivery_issue(
         &self,
         listener: Box<dyn TrueSealIssueListener>,
