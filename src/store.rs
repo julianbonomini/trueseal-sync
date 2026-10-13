@@ -87,6 +87,15 @@ impl Store {
                  key   TEXT PRIMARY KEY,
                  value INTEGER NOT NULL
              );
+             -- The Pending Join (ADR-0023): the joiner's durable record that
+             -- it asked to join via a specific Pairing Token. Singleton row;
+             -- the opaque record encodes initiator keys and the Pairing
+             -- Secret. Survives restarts; cleared on admission, cancelJoin
+             -- and wipe.
+             CREATE TABLE IF NOT EXISTS pending_join (
+                 id      INTEGER PRIMARY KEY CHECK (id = 1),
+                 data    BLOB NOT NULL
+             );
              COMMIT;",
         )?;
 
@@ -130,6 +139,7 @@ impl Store {
              DELETE FROM outbox;
              DELETE FROM handled_messages;
              DELETE FROM meta;
+             DELETE FROM pending_join;
              COMMIT;",
         )?;
         Ok(())
@@ -442,6 +452,57 @@ impl OperationLog for PersistentLog {
             rusqlite::params![cutoff as i64],
         ) {
             warn!("[trueseal-sync] dedup prune failed: {e}");
+        }
+    }
+
+    fn begin_pending_join(
+        &mut self,
+        pending: &[u8],
+        recipient: &[u8; 32],
+        sequence: u64,
+        encoded_pair: Vec<u8>,
+    ) {
+        // ADR-0023: the Pending Join record and the queued Pair commit in
+        // ONE transaction. A crash leaves either the whole prior state
+        // (NotJoined — the caller retries joinGroup) or the whole new state
+        // (PendingJoin with its Pair queued).
+        let result = (|| -> Result<(), rusqlite::Error> {
+            let tx = self.store.conn.transaction()?;
+            tx.execute(
+                "INSERT INTO pending_join (id, data) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                rusqlite::params![pending],
+            )?;
+            tx.execute(
+                "INSERT INTO outbox (object_id, sequence, blob, delivered, kind, created_at)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+                rusqlite::params![
+                    recipient.as_slice(),
+                    sequence as i64,
+                    encoded_pair,
+                    KIND_CONTROL,
+                    now_secs() as i64,
+                ],
+            )?;
+            tx.commit()
+        })();
+        if let Err(e) = result {
+            warn!("[trueseal-sync] begin_pending_join failed (seq={sequence}): {e}");
+        }
+    }
+
+    fn pending_join(&self) -> Option<Vec<u8>> {
+        self.store
+            .conn
+            .query_row("SELECT data FROM pending_join WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .ok()
+    }
+
+    fn clear_pending_join(&mut self) {
+        if let Err(e) = self.store.conn.execute("DELETE FROM pending_join", []) {
+            warn!("[trueseal-sync] clear_pending_join failed: {e}");
         }
     }
 }
@@ -864,6 +925,90 @@ mod tests {
         assert!(log.is_handled("tsm1_x"));
         log.record_sequence(5);
         assert_eq!(log.max_sequence(), Some(5));
+    }
+
+    /// ADR-0023 crash point: after begin_pending_join commits, a restart
+    /// sees the Pending Join AND its queued Pair — the joiner stays
+    /// PendingJoin and the outbox retries the Pair (Pair is not re-sent on
+    /// restart; retries follow the outbox).
+    #[test]
+    fn pending_join_and_pair_commit_together_and_survive_reopen() {
+        let dir = tmp_dir();
+        {
+            let s = Store::open(dir.path(), "ns").expect("open");
+            let mut log = PersistentLog::new(s);
+            assert!(log.pending_join().is_none(), "fresh store: no pending join");
+            log.begin_pending_join(b"pending-record", &oid(7), 3, b"\x01pair".to_vec());
+        }
+        let s2 = Store::open(dir.path(), "ns").expect("reopen");
+        let log2 = PersistentLog::new(s2);
+        assert_eq!(
+            log2.pending_join().as_deref(),
+            Some(b"pending-record".as_slice())
+        );
+        let undelivered = log2.undelivered_entries();
+        assert_eq!(undelivered.len(), 1);
+        assert_eq!(undelivered[0].kind, OutboxKind::Control);
+        assert_eq!(undelivered[0].sequence, 3);
+        assert_eq!(undelivered[0].object_id, oid(7));
+        assert_eq!(undelivered[0].blob, b"\x01pair");
+    }
+
+    /// A second joinGroup replaces the Pending Join (ADR-0023) and queues
+    /// the new Pair alongside any still-undelivered old one.
+    #[test]
+    fn second_begin_replaces_pending_join() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.begin_pending_join(b"old-anchor", &oid(7), 3, b"pair-old".to_vec());
+        log.begin_pending_join(b"new-anchor", &oid(8), 4, b"pair-new".to_vec());
+        assert_eq!(
+            log.pending_join().as_deref(),
+            Some(b"new-anchor".as_slice())
+        );
+        let undelivered = log.undelivered_entries();
+        assert_eq!(
+            undelivered.len(),
+            2,
+            "both Pairs remain queued in sequence order"
+        );
+        assert_eq!(undelivered[0].blob, b"pair-old");
+        assert_eq!(undelivered[1].blob, b"pair-new");
+    }
+
+    /// cancelJoin clears the record; a restart then shows NotJoined.
+    #[test]
+    fn clear_pending_join_survives_reopen() {
+        let dir = tmp_dir();
+        {
+            let s = Store::open(dir.path(), "ns").expect("open");
+            let mut log = PersistentLog::new(s);
+            log.begin_pending_join(b"pending", &oid(7), 3, b"pair".to_vec());
+            log.clear_pending_join();
+        }
+        let s2 = Store::open(dir.path(), "ns").expect("reopen");
+        let log2 = PersistentLog::new(s2);
+        assert!(log2.pending_join().is_none());
+        // The queued Pair is NOT removed by cancelJoin — the outbox owns it.
+        assert_eq!(log2.undelivered_entries().len(), 1);
+    }
+
+    /// wipe() clears the Pending Join — after Destroy Group the device
+    /// starts over, so no anchor from the destroyed group may survive.
+    #[test]
+    fn wipe_clears_pending_join() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.begin_pending_join(b"pending", &oid(7), 3, b"pair".to_vec());
+        assert!(log.pending_join().is_some());
+        drop(log);
+        let s2 = Store::open(dir.path(), "ns").expect("open2");
+        s2.wipe().expect("wipe");
+        let s3 = Store::open(dir.path(), "ns").expect("open3");
+        let log3 = PersistentLog::new(s3);
+        assert!(log3.pending_join().is_none());
     }
 
     /// wipe() clears the dedup table and high-water mark too — after Destroy

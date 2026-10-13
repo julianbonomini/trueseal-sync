@@ -114,6 +114,33 @@ pub trait OperationLog: Send {
     /// Record a handled Message ID, stamped `now` (Unix seconds), and prune
     /// records older than [`DEDUP_RETENTION_SECS`] relative to `now`.
     fn record_handled(&mut self, message_id: &str, now: u64);
+
+    /// Persist the Pending Join record AND queue its `Pair` control entry
+    /// as one unit (ADR-0023: "`joinGroup` persists the Pending Join in
+    /// Session State and queues `Pair` in the durable outbox, in one
+    /// transaction"). A second call replaces the record — a second
+    /// `joinGroup` replaces the Pending Join. The Pair from a replaced
+    /// Pending Join stays queued: if delivered, the old initiator's
+    /// manifest fails the new anchor's checks and is dropped.
+    ///
+    /// `pending` is the opaque serialised record (the session owns the
+    /// encoding). Implementations with transactions (SQLite) must make the
+    /// two writes atomic; a crash leaves either the whole prior state or
+    /// the whole new state.
+    fn begin_pending_join(
+        &mut self,
+        pending: &[u8],
+        recipient: &[u8; 32],
+        sequence: u64,
+        encoded_pair: Vec<u8>,
+    );
+    /// The persisted Pending Join record, if any. Loaded at session
+    /// construction so the anchor survives restarts (ADR-0023: a Pending
+    /// Join has no timer and survives restarts).
+    fn pending_join(&self) -> Option<Vec<u8>>;
+    /// Clear the Pending Join — on `cancelJoin()` and when the first
+    /// manifest is accepted (ADR-0023).
+    fn clear_pending_join(&mut self);
 }
 
 /// A single entry in the log.
@@ -132,6 +159,8 @@ pub struct MemLog {
     high_water: Option<u64>,
     /// Handled Message IDs → handling time (Unix seconds). The dedup table.
     handled: BTreeMap<String, u64>,
+    /// The Pending Join record (ADR-0023). In-memory like the rest of MemLog.
+    pending_join: Option<Vec<u8>>,
 }
 
 impl MemLog {
@@ -140,6 +169,7 @@ impl MemLog {
             inner: BTreeMap::new(),
             high_water: None,
             handled: BTreeMap::new(),
+            pending_join: None,
         }
     }
 }
@@ -242,6 +272,25 @@ impl OperationLog for MemLog {
         let cutoff = now.saturating_sub(DEDUP_RETENTION_SECS);
         self.handled.retain(|_, handled_at| *handled_at >= cutoff);
     }
+
+    fn begin_pending_join(
+        &mut self,
+        pending: &[u8],
+        recipient: &[u8; 32],
+        sequence: u64,
+        encoded_pair: Vec<u8>,
+    ) {
+        self.pending_join = Some(pending.to_vec());
+        self.append_control(recipient, sequence, encoded_pair);
+    }
+
+    fn pending_join(&self) -> Option<Vec<u8>> {
+        self.pending_join.clone()
+    }
+
+    fn clear_pending_join(&mut self) {
+        self.pending_join = None;
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +299,26 @@ mod tests {
 
     fn oid(b: u8) -> [u8; 32] {
         [b; 32]
+    }
+
+    /// MemLog honours the Pending Join contract: begin persists and queues,
+    /// a second begin replaces, clear removes (ADR-0023).
+    #[test]
+    fn memlog_pending_join_begin_replace_clear() {
+        let mut log = MemLog::new();
+        assert!(log.pending_join().is_none());
+        log.begin_pending_join(b"anchor-a", &oid(7), 0, b"pair-a".to_vec());
+        assert_eq!(log.pending_join().as_deref(), Some(b"anchor-a".as_slice()));
+        log.begin_pending_join(b"anchor-b", &oid(8), 1, b"pair-b".to_vec());
+        assert_eq!(log.pending_join().as_deref(), Some(b"anchor-b".as_slice()));
+        assert_eq!(log.undelivered_entries().len(), 2);
+        log.clear_pending_join();
+        assert!(log.pending_join().is_none());
+        assert_eq!(
+            log.undelivered_entries().len(),
+            2,
+            "cancel keeps queued Pairs"
+        );
     }
 
     /// Tracer bullet: append one entry and retrieve it via LogEntry fields.
