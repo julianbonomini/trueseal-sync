@@ -2940,6 +2940,13 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
     /// Fails typed with `GroupDestroyed` while Destroying (ADR-0029): a
     /// window opened mid-Destroy could only admit a joiner into a group
     /// every other device has already dropped.
+    ///
+    /// Fails typed with `NotInGroup` while a Pending Join is held
+    /// (ADR-0023; B13 review): the admitter state machine starts at
+    /// `Idle`, and a device mid-join is not Idle. A window opened now
+    /// could only admit a joiner into a genesis group created while the
+    /// anchor for the real join is still live — a state ADR-0023 does
+    /// not contemplate. Complete or cancel the join first.
     pub fn pairing_token(&self) -> Result<String, SessionError> {
         self.check_open()?;
         if self
@@ -2949,6 +2956,14 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
             .is_some()
         {
             return Err(SessionError::GroupDestroyed);
+        }
+        if self
+            .pending_join
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            return Err(SessionError::NotInGroup);
         }
         let secret: [u8; 32] = rand::random();
         {
@@ -3022,6 +3037,19 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
             .is_some()
         {
             return Err(SessionError::GroupDestroyed);
+        }
+        // A device holding a Pending Join admits no one (ADR-0023; B13
+        // review): it is mid-join, not Idle, so any admission it issued
+        // would be a genesis manifest competing with the join's anchor.
+        // Typed `NotInGroup` (the device is no group's member yet) — the
+        // FFI surfaces `notMember{pendingJoin}`.
+        if self
+            .pending_join
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            return Err(SessionError::NotInGroup);
         }
         // A Leaving device admits no one (ADR-0027).
         if self
@@ -3247,7 +3275,26 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
             .remove(token);
         match pending {
             None => Ok(false),
-            Some(pm) => self.accept_pair(pm.noise_pub, pm.signing_pub),
+            Some(pm) => {
+                let result = self.accept_pair(pm.noise_pub, pm.signing_pub);
+                if result.is_err() {
+                    // A typed refusal (GroupFull, NotInGroup while
+                    // PendingJoin, GroupDestroyed, ManifestVersionExhausted,
+                    // Store) is retryable per accept_pair's contract —
+                    // "the caller may remove a member and retry the
+                    // admission" — so the request must SURVIVE it.
+                    // Otherwise the first typed refusal would consume the
+                    // request and the documented retry would answer
+                    // Ok(false). Re-insert unless a repeat Pair already
+                    // re-raised the same request (B13b).
+                    let mut pending = self
+                        .pending_members
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    pending.entry(token.to_string()).or_insert(pm);
+                }
+                result
+            }
         }
     }
 

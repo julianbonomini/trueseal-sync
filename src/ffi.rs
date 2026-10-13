@@ -699,7 +699,8 @@ impl TrueSeal {
     /// Open a Pairing Window and return the Pairing Token (ADR-0023).
     /// Requests arrive as `joinRequest` events; the window closes on the
     /// first `accept()`, on `cancelPairing()`, or on process end. Fails
-    /// `notMember{destroying}` while Destroying (ADR-0029).
+    /// `notMember{destroying}` while Destroying (ADR-0029) and
+    /// `notMember{pendingJoin}` while a Pending Join is held (ADR-0023).
     pub fn start_pairing(&self) -> Result<String, TrueSealError> {
         self.check_open()?;
         self.inner
@@ -710,7 +711,7 @@ impl TrueSeal {
     /// Admit the device behind a `joinRequest` event (ADR-0023). Fails
     /// with `pairingClosed` (window closed or unknown request),
     /// `groupFull{max}` (ADR-0027), `notMember{status}` while Leaving /
-    /// Destroying, or `manifestVersionExhausted` (SYNC-10).
+    /// Destroying / PendingJoin, or `manifestVersionExhausted` (SYNC-10).
     pub fn accept(&self, request_id: String) -> Result<(), TrueSealError> {
         self.check_open()?;
         let result = self.inner.accept_member(&request_id);

@@ -647,6 +647,30 @@ fn typed_errors_match_the_canonical_taxonomy() {
         Err(TrueSealError::PairingClosed)
     ));
 
+    // notMember{pendingJoin} while a Pending Join is held (ADR-0023; B13
+    // review): a device mid-join is not Idle, so it can neither open a
+    // Pairing Window nor accept a member into a group it has not
+    // finished joining.
+    let initiator = crate::device::DeviceKeypair::generate();
+    let token = crate::message::pairing_token(
+        &initiator.public_key().0,
+        &initiator.signing_public_key().0,
+        &[9u8; 32],
+    );
+    session.join(token).expect("well-formed token joins");
+    assert!(matches!(
+        session.start_pairing(),
+        Err(TrueSealError::NotMember {
+            status: GroupStatus::PendingJoin
+        })
+    ));
+    // accept() while PendingJoin reaches the same gate for a LIVE request
+    // id — but no live request can exist here (a window cannot open in
+    // this state, and this device opened none before joining), so an
+    // unknown id is honestly `pairingClosed`. The accept-side gate is
+    // pinned at the core level by
+    // session::tests::pairing_trust_anchor::pending_join_device_cannot_open_window_or_accept.
+
     // close(): every call fails typed; close() itself is idempotent.
     session.close();
     session.close();
