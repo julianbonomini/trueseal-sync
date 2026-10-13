@@ -314,9 +314,11 @@ mod tests {
     fn memlog_pending_join_begin_replace_clear() {
         let mut log = MemLog::new();
         assert!(log.pending_join().is_none());
-        log.begin_pending_join(b"anchor-a", &oid(7), 0, b"pair-a".to_vec()).unwrap();
+        log.begin_pending_join(b"anchor-a", &oid(7), 0, b"pair-a".to_vec())
+            .unwrap();
         assert_eq!(log.pending_join().as_deref(), Some(b"anchor-a".as_slice()));
-        log.begin_pending_join(b"anchor-b", &oid(8), 1, b"pair-b".to_vec()).unwrap();
+        log.begin_pending_join(b"anchor-b", &oid(8), 1, b"pair-b".to_vec())
+            .unwrap();
         assert_eq!(log.pending_join().as_deref(), Some(b"anchor-b".as_slice()));
         assert_eq!(log.undelivered_entries().len(), 2);
         log.clear_pending_join();

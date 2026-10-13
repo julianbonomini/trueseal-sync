@@ -533,7 +533,10 @@ fn pair_replaying_spent_secret_is_rejected() {
     // Deterministic negative assertion (B8 review F4): wait until the
     // replayed Pair was delivered AND acked — i.e. the handler ran — then
     // assert it raised nothing.
-    wait_for(|| relay.deliver_acks() == vec![1, 2], Duration::from_secs(3));
+    wait_for(
+        || relay.deliver_acks() == vec![1, 2],
+        Duration::from_secs(3),
+    );
     assert_eq!(
         requests.load(Ordering::SeqCst),
         1,
@@ -1390,7 +1393,9 @@ fn two_concurrent_accepts_exactly_one_succeeds() {
         let session = session.clone();
         let noise = NoisePublicKey(rand::random());
         let signing = SigningPublicKey(joiner.public_key_bytes());
-        handles.push(std::thread::spawn(move || session.accept_pair(noise, signing)));
+        handles.push(std::thread::spawn(move || {
+            session.accept_pair(noise, signing)
+        }));
     }
     let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
@@ -1437,7 +1442,11 @@ impl OperationLog for FailingJoinLog {
     fn undelivered_entries(&self) -> Vec<crate::operation_log::LogEntry> {
         self.inner.undelivered_entries()
     }
-    fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<crate::operation_log::LogEntry> {
+    fn entries_from(
+        &self,
+        object_id: &[u8; 32],
+        sequence: u64,
+    ) -> Vec<crate::operation_log::LogEntry> {
         self.inner.entries_from(object_id, sequence)
     }
     fn max_sequence(&self) -> Option<u64> {

@@ -938,7 +938,8 @@ mod tests {
             let s = Store::open(dir.path(), "ns").expect("open");
             let mut log = PersistentLog::new(s);
             assert!(log.pending_join().is_none(), "fresh store: no pending join");
-            log.begin_pending_join(b"pending-record", &oid(7), 3, b"\x01pair".to_vec()).unwrap();
+            log.begin_pending_join(b"pending-record", &oid(7), 3, b"\x01pair".to_vec())
+                .unwrap();
         }
         let s2 = Store::open(dir.path(), "ns").expect("reopen");
         let log2 = PersistentLog::new(s2);
@@ -961,8 +962,10 @@ mod tests {
         let dir = tmp_dir();
         let s = Store::open(dir.path(), "ns").expect("open");
         let mut log = PersistentLog::new(s);
-        log.begin_pending_join(b"old-anchor", &oid(7), 3, b"pair-old".to_vec()).unwrap();
-        log.begin_pending_join(b"new-anchor", &oid(8), 4, b"pair-new".to_vec()).unwrap();
+        log.begin_pending_join(b"old-anchor", &oid(7), 3, b"pair-old".to_vec())
+            .unwrap();
+        log.begin_pending_join(b"new-anchor", &oid(8), 4, b"pair-new".to_vec())
+            .unwrap();
         assert_eq!(
             log.pending_join().as_deref(),
             Some(b"new-anchor".as_slice())
@@ -984,7 +987,8 @@ mod tests {
         {
             let s = Store::open(dir.path(), "ns").expect("open");
             let mut log = PersistentLog::new(s);
-            log.begin_pending_join(b"pending", &oid(7), 3, b"pair".to_vec()).unwrap();
+            log.begin_pending_join(b"pending", &oid(7), 3, b"pair".to_vec())
+                .unwrap();
             log.clear_pending_join();
         }
         let s2 = Store::open(dir.path(), "ns").expect("reopen");
@@ -1001,7 +1005,8 @@ mod tests {
         let dir = tmp_dir();
         let s = Store::open(dir.path(), "ns").expect("open");
         let mut log = PersistentLog::new(s);
-        log.begin_pending_join(b"pending", &oid(7), 3, b"pair".to_vec()).unwrap();
+        log.begin_pending_join(b"pending", &oid(7), 3, b"pair".to_vec())
+            .unwrap();
         assert!(log.pending_join().is_some());
         drop(log);
         let s2 = Store::open(dir.path(), "ns").expect("open2");
