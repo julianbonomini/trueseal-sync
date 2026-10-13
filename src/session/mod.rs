@@ -632,12 +632,17 @@ fn drop_oversize_outbox_entries(
 ) {
     let oversized: Vec<(u64, [u8; 32])> = {
         let mut log = op_log.lock().unwrap_or_else(|e| e.into_inner());
-        let oversized: Vec<(u64, [u8; 32])> = log
-            .undelivered_entries()
-            .into_iter()
-            .filter(|entry| entry.blob.len() > PROTOCOL_SIZE_LIMIT)
-            .map(|entry| (entry.sequence, entry.object_id))
-            .collect();
+        // A failing store query here is not a panic (SYNC-19): skip the
+        // sweep — the next session open retries, and a persistently broken
+        // store surfaces typed `storage` errors through open/send paths.
+        let oversized: Vec<(u64, [u8; 32])> = match log.undelivered_entries() {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|entry| entry.blob.len() > PROTOCOL_SIZE_LIMIT)
+                .map(|entry| (entry.sequence, entry.object_id))
+                .collect(),
+            Err(_) => return,
+        };
         for (sequence, object_id) in &oversized {
             log.remove(object_id, *sequence);
         }
@@ -809,11 +814,17 @@ pub(super) fn refs_drained(
     refs: &[([u8; 32], u64)],
 ) -> bool {
     let log = op_log.lock().unwrap_or_else(|e| e.into_inner());
-    let undelivered: std::collections::HashSet<([u8; 32], u64)> = log
-        .undelivered_entries()
-        .into_iter()
-        .map(|e| (e.object_id, e.sequence))
-        .collect();
+    // A failing store query reads as "not drained" (SYNC-19): the
+    // Leave/Destroy completion never fires on unknown state — the record
+    // stays and the next pump pass retries.
+    let undelivered: std::collections::HashSet<([u8; 32], u64)> = match log.undelivered_entries()
+    {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|e| (e.object_id, e.sequence))
+            .collect(),
+        Err(_) => return false,
+    };
     refs.iter().all(|r| !undelivered.contains(r))
 }
 

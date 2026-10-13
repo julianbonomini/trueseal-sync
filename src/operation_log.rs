@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::store::StoreError;
+
 /// How long a handled Message ID is kept for dedup: 60 days (ADR-0026).
 /// A message can wait up to 30 days in the sender's outbox and then up to
 /// 30 days on the Relay, so a copy always arrives within 60 days of
@@ -139,8 +141,14 @@ pub trait OperationLog: Send {
     /// (WAL truncate, SYNC-14 #106). In-memory backends have nothing to do.
     fn checkpoint_wal(&self) {}
     /// Returns undelivered entries sorted by global sequence ascending.
-    fn undelivered_entries(&self) -> Vec<LogEntry>;
-    fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<LogEntry>;
+    /// Fallible: a failing store query surfaces as `storage` instead of
+    /// panicking the host app (SYNC-19).
+    fn undelivered_entries(&self) -> Result<Vec<LogEntry>, StoreError>;
+    fn entries_from(
+        &self,
+        object_id: &[u8; 32],
+        sequence: u64,
+    ) -> Result<Vec<LogEntry>, StoreError>;
     /// Returns the highest sequence number ever consumed across all
     /// objects, or `None` if the log is empty. Used to restore the sequence
     /// counter after a process restart so it never re-uses a sequence
@@ -345,7 +353,7 @@ impl OperationLog for MemLog {
         }
     }
 
-    fn undelivered_entries(&self) -> Vec<LogEntry> {
+    fn undelivered_entries(&self) -> Result<Vec<LogEntry>, StoreError> {
         // Collect all undelivered entries, then sort by global sequence ascending
         // so the session replays the outbox in the original send order.
         let mut out: Vec<LogEntry> = self
@@ -364,11 +372,15 @@ impl OperationLog for MemLog {
             })
             .collect();
         out.sort_by_key(|e| e.sequence);
-        out
+        Ok(out)
     }
 
-    fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<LogEntry> {
-        match self.inner.get(object_id) {
+    fn entries_from(
+        &self,
+        object_id: &[u8; 32],
+        sequence: u64,
+    ) -> Result<Vec<LogEntry>, StoreError> {
+        Ok(match self.inner.get(object_id) {
             None => vec![],
             Some(map) => map
                 .range(sequence..)
@@ -380,7 +392,7 @@ impl OperationLog for MemLog {
                     blob: entry.blob.clone(),
                 })
                 .collect(),
-        }
+        })
     }
 
     fn max_sequence(&self) -> Option<u64> {
@@ -542,11 +554,11 @@ mod tests {
         log.begin_pending_join(b"anchor-b", &oid(8), 1, b"pair-b".to_vec())
             .unwrap();
         assert_eq!(log.pending_join().as_deref(), Some(b"anchor-b".as_slice()));
-        assert_eq!(log.undelivered_entries().len(), 2);
+        assert_eq!(log.undelivered_entries().unwrap().len(), 2);
         log.clear_pending_join();
         assert!(log.pending_join().is_none());
         assert_eq!(
-            log.undelivered_entries().len(),
+            log.undelivered_entries().unwrap().len(),
             2,
             "cancel keeps queued Pairs"
         );
@@ -557,7 +569,7 @@ mod tests {
     fn append_and_retrieve_single_entry() {
         let mut log = MemLog::new();
         log.append(&oid(1), 0, b"hello".to_vec());
-        let entries = log.entries_from(&oid(1), 0);
+        let entries = log.entries_from(&oid(1), 0).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sequence, 0);
         assert_eq!(entries[0].blob, b"hello");
@@ -572,7 +584,7 @@ mod tests {
         log.append(&oid(1), 1, b"second".to_vec());
         log.append(&oid(1), 2, b"third".to_vec());
 
-        let entries = log.entries_from(&oid(1), 1);
+        let entries = log.entries_from(&oid(1), 1).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].sequence, 1);
         assert_eq!(entries[0].blob, b"second");
@@ -584,7 +596,7 @@ mod tests {
     #[test]
     fn unknown_object_id_returns_empty() {
         let log = MemLog::new();
-        let entries = log.entries_from(&oid(99), 0);
+        let entries = log.entries_from(&oid(99), 0).unwrap();
         assert!(entries.is_empty());
     }
 
@@ -595,8 +607,8 @@ mod tests {
         log.append(&oid(1), 0, b"obj1".to_vec());
         log.append(&oid(2), 0, b"obj2".to_vec());
 
-        let e1 = log.entries_from(&oid(1), 0);
-        let e2 = log.entries_from(&oid(2), 0);
+        let e1 = log.entries_from(&oid(1), 0).unwrap();
+        let e2 = log.entries_from(&oid(2), 0).unwrap();
         assert_eq!(e1.len(), 1);
         assert_eq!(e1[0].blob, b"obj1");
         assert_eq!(e2.len(), 1);
@@ -611,7 +623,7 @@ mod tests {
         log.append(&oid(1), 5, b"original".to_vec());
         log.append(&oid(1), 5, b"overwrite attempt".to_vec());
 
-        let entries = log.entries_from(&oid(1), 5);
+        let entries = log.entries_from(&oid(1), 5).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].blob, b"original");
     }
@@ -624,7 +636,7 @@ mod tests {
         log.append(&oid(1), 1, b"a".to_vec());
         log.append(&oid(1), 2, b"b".to_vec());
 
-        let entries = log.entries_from(&oid(1), 0);
+        let entries = log.entries_from(&oid(1), 0).unwrap();
         let seqs: Vec<u64> = entries.iter().map(|e| e.sequence).collect();
         assert_eq!(seqs, vec![1, 2, 3]);
     }
@@ -635,7 +647,7 @@ mod tests {
         let mut log = MemLog::new();
         log.append(&oid(1), 0, b"hello".to_vec());
 
-        let undelivered = log.undelivered_entries();
+        let undelivered = log.undelivered_entries().unwrap();
         assert_eq!(undelivered.len(), 1);
         assert_eq!(undelivered[0].object_id, oid(1));
         assert_eq!(undelivered[0].sequence, 0);
@@ -649,7 +661,7 @@ mod tests {
         log.append(&oid(1), 0, b"hello".to_vec());
         mark_delivered_raw(&mut log, &oid(1), 0);
 
-        assert!(log.undelivered_entries().is_empty());
+        assert!(log.undelivered_entries().unwrap().is_empty());
     }
 
     /// The delivered flag does not affect entries_from — delivery status is orthogonal.
@@ -659,7 +671,7 @@ mod tests {
         log.append(&oid(1), 0, b"hello".to_vec());
         mark_delivered_raw(&mut log, &oid(1), 0);
 
-        let entries = log.entries_from(&oid(1), 0);
+        let entries = log.entries_from(&oid(1), 0).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].blob, b"hello");
     }
@@ -673,7 +685,7 @@ mod tests {
         log.append(&oid(1), 1, b"c".to_vec());
         mark_delivered_raw(&mut log, &oid(1), 0);
 
-        let undelivered = log.undelivered_entries();
+        let undelivered = log.undelivered_entries().unwrap();
         assert_eq!(undelivered.len(), 2);
         let keys: Vec<([u8; 32], u64)> = undelivered
             .iter()
@@ -694,7 +706,7 @@ mod tests {
         log.append(&oid(1), 2, b"obj1-second".to_vec());
         log.append(&oid(2), 3, b"obj2-second".to_vec());
 
-        let undelivered = log.undelivered_entries();
+        let undelivered = log.undelivered_entries().unwrap();
         let seqs: Vec<u64> = undelivered.iter().map(|e| e.sequence).collect();
         assert_eq!(seqs, vec![0, 1, 2, 3], "must be sorted by global sequence");
     }
@@ -710,7 +722,7 @@ mod tests {
         log.record_sequence(0);
         log.remove(&oid(1), 0); // delivered rows are deleted, not kept
         assert_eq!(log.max_sequence(), Some(0));
-        assert!(log.undelivered_entries().is_empty());
+        assert!(log.undelivered_entries().unwrap().is_empty());
     }
 
     /// record_sequence only ever moves the high-water mark up.
@@ -730,7 +742,7 @@ mod tests {
         let before = now_secs();
         log.append_control(&oid(1), 0, b"\x04manifest".to_vec());
         log.append(&oid(1), 1, b"raw body".to_vec());
-        let entries = log.entries_from(&oid(1), 0);
+        let entries = log.entries_from(&oid(1), 0).unwrap();
         assert_eq!(entries[0].kind, OutboxKind::Control);
         assert_eq!(entries[0].blob, b"\x04manifest");
         assert!(entries[0].created_at >= before);
@@ -749,7 +761,7 @@ mod tests {
             created_at: 1_000_000,
             blob: b"old".to_vec(),
         });
-        let entries = log.undelivered_entries();
+        let entries = log.undelivered_entries().unwrap();
         assert_eq!(entries[0].created_at, 1_000_000);
     }
 

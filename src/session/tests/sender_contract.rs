@@ -397,7 +397,7 @@ fn permanent_refusal_raises_send_failed_and_is_never_retried() {
             .op_log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .undelivered_entries()
+            .undelivered_entries().unwrap()
             .is_empty(),
         "the failed entry is deleted"
     );
@@ -451,7 +451,7 @@ fn temporary_failure_retries_while_connected() {
                 .op_log
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .undelivered_entries()
+                .undelivered_entries().unwrap()
                 .is_empty()
         },
         Duration::from_secs(5),
@@ -521,7 +521,7 @@ fn temporary_refusal_backs_off_and_retries() {
                 .op_log
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .undelivered_entries()
+                .undelivered_entries().unwrap()
                 .is_empty()
         },
         Duration::from_secs(5),
@@ -737,7 +737,7 @@ fn head_of_line_per_recipient_with_isolation() {
                 .op_log
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .undelivered_entries()
+                .undelivered_entries().unwrap()
                 .is_empty()
         },
         Duration::from_secs(20),
@@ -835,7 +835,7 @@ fn sync_entry_expires_after_30_days() {
             .op_log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .undelivered_entries()
+            .undelivered_entries().unwrap()
             .is_empty(),
         "the expired entry is deleted"
     );
@@ -888,7 +888,7 @@ fn control_entry_never_expires() {
                 .op_log
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .undelivered_entries()
+                .undelivered_entries().unwrap()
                 .is_empty()
         },
         Duration::from_secs(3),
@@ -1017,7 +1017,7 @@ fn delivered_rows_are_deleted_and_sequence_survives_restart() {
                     .op_log
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .undelivered_entries()
+                    .undelivered_entries().unwrap()
                     .is_empty()
             },
             Duration::from_secs(3),
@@ -1029,6 +1029,7 @@ fn delivered_rows_are_deleted_and_sequence_survives_restart() {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .entries_from(&r_noise.0, 0)
+                .unwrap()
                 .is_empty(),
             "delivered rows are deleted, not kept"
         );
@@ -1187,7 +1188,7 @@ fn lost_ack_replays_and_recipient_dedups_end_to_end() {
                 .op_log
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .undelivered_entries()
+                .undelivered_entries().unwrap()
                 .is_empty()
         },
         Duration::from_secs(6),
@@ -1275,7 +1276,7 @@ fn accept_pair_offline_queues_manifest_and_delivers_on_reconnect() {
             .op_log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .undelivered_entries();
+            .undelivered_entries().unwrap();
         assert_eq!(entries.len(), 1, "the manifest is queued before connect");
         assert_eq!(entries[0].kind, OutboxKind::Control);
         assert_eq!(entries[0].object_id, b_noise.0);
@@ -1289,7 +1290,7 @@ fn accept_pair_offline_queues_manifest_and_delivers_on_reconnect() {
                 .op_log
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .undelivered_entries()
+                .undelivered_entries().unwrap()
                 .is_empty()
         },
         Duration::from_secs(6),

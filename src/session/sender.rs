@@ -229,10 +229,20 @@ fn sender_loop<T: crate::relay::Severable>(
             continue;
         }
 
-        let entries = op_log
+        // A failing store query is not a panic (SYNC-19): skip this pass
+        // and retry on the next poll — a persistently broken store surfaces
+        // typed `storage` errors through the send/open paths.
+        let entries = match op_log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .undelivered_entries();
+            .undelivered_entries()
+        {
+            Ok(entries) => entries,
+            Err(_) => {
+                kick.wait(config.poll);
+                continue;
+            }
+        };
 
         if entries.is_empty() {
             kick.wait(config.poll);
