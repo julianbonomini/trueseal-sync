@@ -1633,6 +1633,7 @@ dependencies = [
  "trueseal-noise",
  "uniffi",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

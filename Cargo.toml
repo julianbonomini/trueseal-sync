@@ -18,6 +18,7 @@ rand = "0.8"
 thiserror = "1"
 log = "0.4"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+zeroize = { version = "1", features = ["zeroize_derive"] }
 base64 = "0.22"
 prost = "0.13"
 tokio = { version = "1", features = [

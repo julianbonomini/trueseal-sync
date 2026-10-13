@@ -409,17 +409,23 @@ fn load_destroying(op_log: &Arc<Mutex<Box<dyn OperationLog>>>) -> Option<Destroy
 
 /// All mutable key material — replaced atomically on key rotation.
 ///
-/// TODO(P4): `noise_priv` and `signing_priv` are plain byte arrays and are NOT
-/// zeroized on drop. An attacker with process-memory read access could extract
-/// the private keys from heap. Fix: derive `zeroize::ZeroizeOnDrop` on this
-/// struct (add `zeroize` crate feature `zeroize_derive`, wrap fields in
-/// `Zeroizing<[u8;32]>`). Low urgency on current platforms (iOS/macOS sandbox
-/// provides OS-level memory protection), but expected by any security audit.
+/// Private material zeroizes on drop (SYNC-19): `noise_priv` and
+/// `signing_priv` are overwritten when a `KeyState` is dropped — every key
+/// rotation, removal wipe and Destroy Group replaces this struct, so the old
+/// private keys do not linger on the heap. The public-key fields are skipped
+/// (not secret). `DeviceKeypair` itself is covered by its fields: the noise
+/// `Keypair` derives `ZeroizeOnDrop` in trueseal-noise and ed25519-dalek's
+/// `SigningKey` zeroizes on drop. Data at rest stays OS-sandbox-only
+/// (documented preview limitation).
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub(super) struct KeyState {
     pub noise_priv: [u8; 32],
+    #[zeroize(skip)]
     pub noise_pub_key: [u8; 32],
     pub signing_priv: [u8; 32],
+    #[zeroize(skip)]
     pub noise_pub: NoisePublicKey,
+    #[zeroize(skip)]
     pub signing_pub: SigningPublicKey,
 }
 
