@@ -180,10 +180,6 @@ fn main() {
             print!("> ");
             io::stdout().flush().ok();
         },
-        // on_identity_rotated (ADR-0027): the CLI keeps no persistent
-        // identity of its own — the rotation is already reflected in the
-        // session; nothing to persist here.
-        |_| {},
         // transport_factory — opens the XX receive session.
         // Non-blocking mode is required: with a blocking TcpStream the conn
         // Mutex would be held for the entire duration of each read() syscall,

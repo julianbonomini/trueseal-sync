@@ -316,7 +316,7 @@ fn on_removed_from_group_fires_when_excluded_from_manifest() {
     let b_sk = SigningKey::from_bytes(&device_b.signing.to_bytes());
 
     let v1 = make_two_member_manifest(a_noise, a_signing, &a_sk, b_noise, b_signing);
-    let group_id = v1.group_id;
+    let _group_id = v1.group_id;
 
     let removed_fired: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let rf = removed_fired.clone();
@@ -718,7 +718,7 @@ fn concurrent_manifest_conflict_last_version_wins() {
         "the lower-hash manifest wins the equal-version tie"
     );
     assert!(
-        final_fires >= 1 && final_fires <= 2,
+        (1..=2).contains(&final_fires),
         "one fire if the winner arrived first, two if it unseated the loser — got {final_fires}"
     );
 }
