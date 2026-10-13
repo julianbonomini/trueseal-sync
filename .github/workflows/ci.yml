@@ -32,10 +32,6 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      - name: Authenticate private deps
-        run: |
-          git config --global url."https://x-access-token:${{ secrets.TRUESEAL_READ_TOKEN }}@github.com/".insteadOf "https://github.com/"
-
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
@@ -44,6 +40,9 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-features
+
+      - name: no unwrap() in production code (SYNC-18; script predates its wiring)
+        run: bash scripts/check-no-unwrap.sh
 
       - name: connection-factory guard (SYNC-17)
         run: bash scripts/check-connection-factory.sh
