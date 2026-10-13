@@ -1105,10 +1105,7 @@ fn pairing_is_refused_while_destroying() {
 
     // Opening a window fails typed — no token, no window.
     assert!(
-        matches!(
-            session.pairing_token(),
-            Err(SessionError::GroupDestroyed)
-        ),
+        matches!(session.pairing_token(), Err(SessionError::GroupDestroyed)),
         "pairing_token must fail typed while Destroying"
     );
 
@@ -1197,8 +1194,7 @@ fn destroy_partially_drained_restart_resumes_and_completes_once() {
         std::thread::spawn(move || {
             // Hold the XX session open (B12 harness note): dropping it
             // EOFs the client's receive loop.
-            let Ok(_sess) =
-                crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2)
+            let Ok(_sess) = crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2)
             else {
                 return;
             };
