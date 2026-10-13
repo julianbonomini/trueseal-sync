@@ -149,12 +149,10 @@ fn build() -> Vectors {
     let member2_signing_pub = member2_signing.verifying_key().to_bytes();
 
     let recipient_noise_secret = seq32(RECIPIENT_NOISE_SEED);
-    let recipient_noise_pub = NoisePublicKey(
-        *PublicKey::from(&StaticSecret::from(recipient_noise_secret)).as_bytes(),
-    );
-    let member2_noise_pub = NoisePublicKey(
-        *PublicKey::from(&StaticSecret::from(seq32(MEMBER2_NOISE_SEED))).as_bytes(),
-    );
+    let recipient_noise_pub =
+        NoisePublicKey(*PublicKey::from(&StaticSecret::from(recipient_noise_secret)).as_bytes());
+    let member2_noise_pub =
+        NoisePublicKey(*PublicKey::from(&StaticSecret::from(seq32(MEMBER2_NOISE_SEED))).as_bytes());
 
     let eph_seal = StaticSecret::from(seq32(EPH_SEAL_SEED));
     let eph_seal_pub = *PublicKey::from(&eph_seal).as_bytes();
@@ -180,9 +178,7 @@ fn build() -> Vectors {
     // Manifests: genesis (no parent) and an update naming genesis as parent
     // (ADR-0027 — the parent field + hash the vectors must cover).
     let alpha = ManifestMember {
-        noise_pub: NoisePublicKey(
-            *PublicKey::from(&StaticSecret::from(seq32(0x81))).as_bytes(),
-        ),
+        noise_pub: NoisePublicKey(*PublicKey::from(&StaticSecret::from(seq32(0x81))).as_bytes()),
         signing_pub: SigningPublicKey(author_signing_pub),
         name: "VectorAlpha".into(),
     };
@@ -540,32 +536,30 @@ fn to_json(v: &Vectors) -> String {
         ("formatVersion", J::N(1)),
         (
             "description",
-            s("Sync JSON test vectors (ADR-0022, gate G5). Generated from the trueseal-sync \
+            s(
+                "Sync JSON test vectors (ADR-0022, gate G5). Generated from the trueseal-sync \
                code paths with fixed test-only inputs — never hand-written. Consumers verify \
-               they reproduce or accept exactly these bytes. See README.md in this directory."),
+               they reproduce or accept exactly these bytes. See README.md in this directory.",
+            ),
         ),
         (
             "regenerate",
-            s("cargo test --lib vectors -- --ignored   (rewrites this file; do so only on a \
-               deliberate protocol change — the drift test fails CI otherwise)"),
+            s(
+                "cargo test --lib vectors -- --ignored   (rewrites this file; do so only on a \
+               deliberate protocol change — the drift test fails CI otherwise)",
+            ),
         ),
         (
             "protocol",
             J::O(vec![
                 ("transportVersion", J::N(version::TRANSPORT_VERSION as u64)),
-                (
-                    "endToEndVersion",
-                    J::N(version::END_TO_END_VERSION as u64),
-                ),
+                ("endToEndVersion", J::N(version::END_TO_END_VERSION as u64)),
                 ("storeVersion", J::N(version::STORE_VERSION as u64)),
                 (
                     "protocolSizeLimit",
                     J::N(limits::PROTOCOL_SIZE_LIMIT as u64),
                 ),
-                (
-                    "maxEnvelopeBytes",
-                    J::N(limits::MAX_ENVELOPE_BYTES as u64),
-                ),
+                ("maxEnvelopeBytes", J::N(limits::MAX_ENVELOPE_BYTES as u64)),
                 (
                     "noiseFramePlaintextMax",
                     J::N(limits::NOISE_FRAME_PLAINTEXT_MAX as u64),
@@ -584,19 +578,15 @@ fn to_json(v: &Vectors) -> String {
             J::O(vec![
                 (
                     "note",
-                    s("test-only fixed inputs; none of this key material is valid on any live \
-                       network. Seeds are 32-byte ramps (seed, seed+1, …, seed+31)."),
+                    s(
+                        "test-only fixed inputs; none of this key material is valid on any live \
+                       network. Seeds are 32-byte ramps (seed, seed+1, …, seed+31).",
+                    ),
                 ),
-                (
-                    "authorSigningSecret",
-                    s(hex(v.author_signing.as_bytes())),
-                ),
+                ("authorSigningSecret", s(hex(v.author_signing.as_bytes()))),
                 ("authorSigningPub", s(hex(&v.author_signing_pub))),
                 ("member2SigningPub", s(hex(&v.member2_signing_pub))),
-                (
-                    "recipientNoiseSecret",
-                    s(hex(&v.recipient_noise_secret)),
-                ),
+                ("recipientNoiseSecret", s(hex(&v.recipient_noise_secret))),
                 ("recipientNoisePub", s(hex(&v.recipient_noise_pub.0))),
                 ("member2NoisePub", s(hex(&v.member2_noise_pub.0))),
                 ("ephemeralSealPub", s(hex(&v.eph_seal_pub))),
@@ -610,8 +600,7 @@ fn to_json(v: &Vectors) -> String {
             J::O(vec![
                 (
                     "hkdfInfo",
-                    s(String::from_utf8(version::addressed_encryption_hkdf_info())
-                        .expect("utf8")),
+                    s(String::from_utf8(version::addressed_encryption_hkdf_info()).expect("utf8")),
                 ),
                 (
                     "aeadAad",
@@ -641,9 +630,11 @@ fn to_json(v: &Vectors) -> String {
             J::O(vec![
                 (
                     "layout",
-                    s("client→relay: \"TSP\" || version:u16 BE (5 bytes, plaintext); \
+                    s(
+                        "client→relay: \"TSP\" || version:u16 BE (5 bytes, plaintext); \
                        relay→client: 0x01 (supported — the 5 prefix bytes become the Noise \
-                       prologue) | \"unsupported <min>..<max>\\n\" (refused — then close)"),
+                       prologue) | \"unsupported <min>..<max>\\n\" (refused — then close)",
+                    ),
                 ),
                 ("clientPrefixHex", s(hex(&version::transport_prefix()))),
                 ("acceptReplyHex", s("01")),
@@ -658,9 +649,11 @@ fn to_json(v: &Vectors) -> String {
                 ),
                 (
                     "preVersionRelay",
-                    s("a relay speaking the pre-version format never replies; the exchange \
+                    s(
+                        "a relay speaking the pre-version format never replies; the exchange \
                        times out (10 s deadline) and surfaces as a connection failure — that \
-                       format is refused by design (ADR-0022)"),
+                       format is refused by design (ADR-0022)",
+                    ),
                 ),
             ]),
         ),
@@ -672,13 +665,12 @@ fn to_json(v: &Vectors) -> String {
                     J::O(vec![
                         (
                             "layout",
-                            s("envelopeSigningDomain || version(4 LE) || recipient_pub(32) || \
-                               ephemeral_pub(32) || sealedPrefix  (ADR-0031)"),
+                            s(
+                                "envelopeSigningDomain || version(4 LE) || recipient_pub(32) || \
+                               ephemeral_pub(32) || sealedPrefix  (ADR-0031)",
+                            ),
                         ),
-                        (
-                            "signingMessageHex",
-                            s(hex(&v.envelope_signing_message)),
-                        ),
+                        ("signingMessageHex", s(hex(&v.envelope_signing_message))),
                         ("signatureHex", s(hex(&v.envelope_signature))),
                         ("signerPub", s(hex(&v.author_signing_pub))),
                     ]),
@@ -710,8 +702,10 @@ fn to_json(v: &Vectors) -> String {
                     J::O(vec![
                         (
                             "layout",
-                            s("as genesis, but parentFlag 0x01 || parentHash(32) — the parent \
-                               is covered by the signature (ADR-0027)"),
+                            s(
+                                "as genesis, but parentFlag 0x01 || parentHash(32) — the parent \
+                               is covered by the signature (ADR-0027)",
+                            ),
                         ),
                         (
                             "signingMessageHex",
@@ -737,9 +731,11 @@ fn to_json(v: &Vectors) -> String {
             J::O(vec![
                 (
                     "layout",
-                    s("ephemeral_pub(32) || nonce(12, all zero) || ciphertext+tag — \
+                    s(
+                        "ephemeral_pub(32) || nonce(12, all zero) || ciphertext+tag — \
                        X25519 DH → HKDF-SHA256 (no salt) → ChaCha20-Poly1305 with the \
-                       versioned info/AAD above (ADR-0031)"),
+                       versioned info/AAD above (ADR-0031)",
+                    ),
                 ),
                 ("plaintextHex", s(hex(&v.enc_plaintext))),
                 ("blobHex", s(hex(&v.enc_blob))),
@@ -752,8 +748,10 @@ fn to_json(v: &Vectors) -> String {
             J::O(vec![
                 (
                     "derivation",
-                    s("tsm1_ || base64url(SHA-256(\"trueseal-message-id-v1\\0\" || \
-                       author_signing_pub(32) || sequence:u64 BE))"),
+                    s(
+                        "tsm1_ || base64url(SHA-256(\"trueseal-message-id-v1\\0\" || \
+                       author_signing_pub(32) || sequence:u64 BE))",
+                    ),
                 ),
                 ("authorSigningPub", s(hex(&v.author_signing_pub))),
                 ("sequence", J::N(7)),
@@ -765,9 +763,11 @@ fn to_json(v: &Vectors) -> String {
             J::O(vec![
                 (
                     "layout",
-                    s("1-byte type tag + body; the tag lives inside the addressed encryption, \
+                    s(
+                        "1-byte type tag + body; the tag lives inside the addressed encryption, \
                        the relay never sees it. Pair body = noise_pub(32) || signing_pub(32) \
-                       || secret(32) — exactly 97 bytes total (ADR-0023)"),
+                       || secret(32) — exactly 97 bytes total (ADR-0023)",
+                    ),
                 ),
                 (
                     "pair",
@@ -783,7 +783,10 @@ fn to_json(v: &Vectors) -> String {
                 ),
                 (
                     "revoke",
-                    J::O(vec![("tag", J::N(0x03)), ("bytesHex", s(hex(&v.msg_revoke)))]),
+                    J::O(vec![
+                        ("tag", J::N(0x03)),
+                        ("bytesHex", s(hex(&v.msg_revoke))),
+                    ]),
                 ),
                 (
                     "groupManifest",
@@ -799,8 +802,10 @@ fn to_json(v: &Vectors) -> String {
             J::O(vec![
                 (
                     "sealedContentLayout",
-                    s("author_pub(32) || sequence(8 LE) || parents_len(2 LE) || parents(32*n) \
-                       || sender_timestamp_ms(8 LE) || message || signature(64)  (ADR-0031)"),
+                    s(
+                        "author_pub(32) || sequence(8 LE) || parents_len(2 LE) || parents(32*n) \
+                       || sender_timestamp_ms(8 LE) || message || signature(64)  (ADR-0031)",
+                    ),
                 ),
                 (
                     "envelopeProtoLayout",
@@ -823,10 +828,7 @@ fn to_json(v: &Vectors) -> String {
                 ("sealedPrefixHex", s(hex(&v.sealed_prefix))),
                 ("payloadHex", s(hex(&v.envelope.payload))),
                 ("envelopeProtoHex", s(hex(&v.envelope_proto))),
-                (
-                    "envelopeHashHex",
-                    s(hex(&v.envelope.hash())),
-                ),
+                ("envelopeHashHex", s(hex(&v.envelope.hash()))),
                 (
                     "hashNote",
                     s("SHA-256 over envelopeProto — the parents[] entries of later envelopes"),
@@ -906,10 +908,7 @@ fn to_json(v: &Vectors) -> String {
                 J::O(vec![
                     ("layer", s("transport")),
                     ("case", s("unsupportedTransportVersion")),
-                    (
-                        "input",
-                        J::O(vec![("replyLine", s("unsupported 2..4\n"))]),
-                    ),
+                    ("input", J::O(vec![("replyLine", s("unsupported 2..4\n"))])),
                     (
                         "expect",
                         J::O(vec![
@@ -960,10 +959,7 @@ fn to_json(v: &Vectors) -> String {
                                     t.encode()
                                 })),
                             ),
-                            (
-                                "recipientNoiseSecret",
-                                s(hex(&v.recipient_noise_secret)),
-                            ),
+                            ("recipientNoiseSecret", s(hex(&v.recipient_noise_secret))),
                         ]),
                     ),
                     (
@@ -1021,10 +1017,7 @@ fn to_json(v: &Vectors) -> String {
                         J::O(vec![
                             ("kind", s("deliveryIssue")),
                             ("name", s("heldForUpgrade")),
-                            (
-                                "version",
-                                J::N(version::END_TO_END_VERSION as u64 + 1),
-                            ),
+                            ("version", J::N(version::END_TO_END_VERSION as u64 + 1)),
                             ("acked", J::B(false)),
                             (
                                 "detail",
@@ -1057,10 +1050,7 @@ fn to_json(v: &Vectors) -> String {
                             ("reason", s("senderOutdated")),
                             ("acked", J::B(true)),
                             ("reachesHandler", J::B(false)),
-                            (
-                                "detail",
-                                s("version 0 is the reserved pre-version format"),
-                            ),
+                            ("detail", s("version 0 is the reserved pre-version format")),
                         ]),
                     ),
                 ]),
@@ -1133,8 +1123,7 @@ mod tests {
             panic!("read {path}: {e} — regenerate with `cargo test --lib vectors -- --ignored`")
         });
         assert_eq!(
-            generated,
-            checked_in,
+            generated, checked_in,
             "test vectors drifted from the code — if this change is a deliberate protocol \
              change, regenerate with `cargo test --lib vectors -- --ignored` and review the \
              diff; anything else is a bug"
