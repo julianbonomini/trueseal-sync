@@ -41,8 +41,10 @@ enum Verdict {
 /// pushes from a script (falling back to a default verdict once the script
 /// is exhausted), recording every push it receives.
 struct ScriptedPushRelay {
-    /// (recipient_pub, envelope sequence) per received push, in order.
-    pushes: Arc<Mutex<Vec<([u8; 32], u64)>>>,
+    /// (recipient_pub, sealed envelope) per received push, in order. The
+    /// sequence is inside the seal (ADR-0031) — assertions open it with
+    /// `open_seq` and the recipient key they own.
+    pushes: Arc<Mutex<Vec<([u8; 32], Envelope)>>>,
 }
 
 impl ScriptedPushRelay {
@@ -53,7 +55,9 @@ impl ScriptedPushRelay {
         script: Vec<Verdict>,
         default: Verdict,
     ) -> Self {
-        let pushes: Arc<Mutex<Vec<([u8; 32], u64)>>> = Arc::new(Mutex::new(Vec::new()));
+        // The sequence is sealed (ADR-0031): the relay records the raw
+        // envelope; assertions open it with the recipient key they own.
+        let pushes: Arc<Mutex<Vec<([u8; 32], Envelope)>>> = Arc::new(Mutex::new(Vec::new()));
         let pushes_clone = pushes.clone();
         let verdicts: Arc<Mutex<VecDeque<Verdict>>> =
             Arc::new(Mutex::new(script.into_iter().collect()));
@@ -83,10 +87,9 @@ impl ScriptedPushRelay {
                         if body.len() >= 32 {
                             let recipient: [u8; 32] =
                                 body[0..32].try_into().expect("32-byte recipient");
-                            let seq = Envelope::decode(&body[32..])
-                                .map(|e| e.sequence)
-                                .unwrap_or(u64::MAX);
-                            pushes.lock().unwrap().push((recipient, seq));
+                            if let Ok(env) = Envelope::decode(&body[32..]) {
+                                pushes.lock().unwrap().push((recipient, env));
+                            }
                         }
                     }
                     let verdict = verdicts.lock().unwrap().pop_front().unwrap_or(default);
@@ -107,9 +110,19 @@ impl ScriptedPushRelay {
         ScriptedPushRelay { pushes }
     }
 
-    fn pushes(&self) -> Vec<([u8; 32], u64)> {
+    fn pushes(&self) -> Vec<([u8; 32], Envelope)> {
         self.pushes.lock().unwrap().clone()
     }
+}
+
+/// Open a sealed push envelope as its recipient and return the sequence
+/// (ADR-0031: the sequence is inside the seal — the relay stubs in this
+/// file record raw envelopes and the TEST, which owns the recipient keys,
+/// opens them).
+fn open_seq(env: &Envelope, recipient: &DeviceKeypair) -> u64 {
+    env.open_sealed(recipient.noise.private())
+        .expect("sealed to the test recipient")
+        .sequence
 }
 
 fn member_of(device: &DeviceKeypair) -> ManifestMember {
@@ -181,8 +194,9 @@ fn reconnect_clears_backoff_and_retries_immediately() {
     let (nk_rx, nk) = nk_push_channel();
 
     // NK relay: the FIRST push is dropped without an ack (temporary
-    // failure), the rest acked. Records (sequence, receive time) per push.
-    let pushes: Arc<Mutex<Vec<(u64, Instant)>>> = Arc::new(Mutex::new(Vec::new()));
+    // failure), the rest acked. Records (envelope, receive time) per push —
+    // the sequence is sealed (ADR-0031) and opened at assert time.
+    let pushes: Arc<Mutex<Vec<(Envelope, Instant)>>> = Arc::new(Mutex::new(Vec::new()));
     {
         let pushes = pushes.clone();
         let relay_priv = relay_kp.private();
@@ -204,10 +218,9 @@ fn reconnect_clears_backoff_and_retries_immediately() {
                     };
                     if let Some((MsgType::Push, body)) = parse(&raw) {
                         if body.len() >= 32 {
-                            let seq = Envelope::decode(&body[32..])
-                                .map(|e| e.sequence)
-                                .unwrap_or(u64::MAX);
-                            pushes.lock().unwrap().push((seq, Instant::now()));
+                            if let Ok(env) = Envelope::decode(&body[32..]) {
+                                pushes.lock().unwrap().push((env, Instant::now()));
+                            }
                         }
                     }
                     if first.swap(false, Ordering::SeqCst) {
@@ -302,7 +315,8 @@ fn reconnect_clears_backoff_and_retries_immediately() {
         "the retry after reconnect must not wait out the 5 s backoff — gap was {gap:?}"
     );
     assert_eq!(
-        pushes[0].0, pushes[1].0,
+        open_seq(&pushes[0].0, &recipient),
+        open_seq(&pushes[1].0, &recipient),
         "the same entry is retried (same sequence)"
     );
 }
@@ -439,7 +453,8 @@ fn temporary_failure_retries_while_connected() {
         "the same entry was pushed twice: lost ack, then retry"
     );
     assert_eq!(
-        pushes[0].1, pushes[1].1,
+        open_seq(&pushes[0].1, &recipient),
+        open_seq(&pushes[1].1, &recipient),
         "both pushes carry the same sequence — one message, two attempts"
     );
 }
@@ -460,7 +475,12 @@ fn head_of_line_per_recipient_with_isolation() {
     let c_noise = c.public_key().0;
 
     // Custom relay: B's FIRST push is dropped (temporary); everything else
-    // acks. Records (recipient, sequence) per ACKED push, in order.
+    // acks. Records (recipient, sequence) per ACKED push, in order. The
+    // sequence is sealed (ADR-0031), so the relay opens each envelope with
+    // the recipient key the test hands it (a colluding-relay vantage is NOT
+    // needed — the test owns every key).
+    let b_priv = b.noise.private();
+    let c_priv = c.noise.private();
     let acked: Arc<Mutex<Vec<([u8; 32], u64)>>> = Arc::new(Mutex::new(vec![]));
     {
         let acked = acked.clone();
@@ -492,8 +512,17 @@ fn head_of_line_per_recipient_with_isolation() {
                         return;
                     }
                     let recipient: [u8; 32] = body[0..32].try_into().expect("32-byte recipient");
+                    let priv_key = if recipient == b_noise {
+                        b_priv
+                    } else if recipient == c_noise {
+                        c_priv
+                    } else {
+                        return;
+                    };
                     let seq = Envelope::decode(&body[32..])
-                        .map(|e| e.sequence)
+                        .ok()
+                        .and_then(|e| e.open_sealed(priv_key).ok())
+                        .map(|sc| sc.sequence)
                         .unwrap_or(u64::MAX);
                     // B's first-ever push is lost (no ack).
                     if recipient == b_noise
@@ -765,7 +794,7 @@ fn delivered_rows_are_deleted_and_sequence_survives_restart() {
             "delivered rows are deleted, not kept"
         );
         assert_eq!(relay.pushes().len(), 1);
-        first_max_seq = relay.pushes()[0].1;
+        first_max_seq = open_seq(&relay.pushes()[0].1, &recipient);
         // Stop this session's pump cleanly: destroy_group sets `destroyed`
         // and queues nothing (no peers besides the recipient... it queues
         // one Revoke — which the pump drains before exiting).
@@ -803,7 +832,7 @@ fn delivered_rows_are_deleted_and_sequence_survives_restart() {
     ));
     session2.push_sync(b"second".to_vec()).expect("queued");
     wait_for(|| !relay2.pushes().is_empty(), Duration::from_secs(3));
-    let second_seq = relay2.pushes()[0].1;
+    let second_seq = open_seq(&relay2.pushes()[0].1, &recipient);
     assert!(
         second_seq > first_max_seq,
         "sequence must never be re-used after restart: first process used {first_max_seq}, second sent {second_seq}"

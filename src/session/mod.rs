@@ -755,8 +755,14 @@ pub(super) fn build_subscribe_handler(
     on_identity_rotated: Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static>,
     rotation_pending: Arc<AtomicBool>,
     on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
-) -> impl Fn(Message, [u8; 32], u64) + Send + 'static {
-    move |msg, author_signing_pub, sequence| {
+) -> impl Fn(Message, [u8; 32], u64, u64) + Send + 'static {
+    move |msg, author_signing_pub, sequence, sender_timestamp_ms| {
+        // The dedup record outlives the message (ADR-0034 §2): it is kept
+        // until 60 days after the LATER of the handling time and the Sender
+        // Timestamp. The store prunes on the recorded time, so record the
+        // later of the two — a future-dated message can never be replayed
+        // after its record expired.
+        let dedup_recorded_at = now_secs().max(sender_timestamp_ms / 1000);
         // ── Pair (handled before manifest filter — joiner is not yet a member) ──
         if let Message::Pair {
             noise_pub,
@@ -1358,7 +1364,7 @@ pub(super) fn build_subscribe_handler(
             op_log
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .record_handled(&mid, now_secs());
+                .record_handled(&mid, dedup_recorded_at);
             return;
         }
 
@@ -1384,7 +1390,7 @@ pub(super) fn build_subscribe_handler(
                     op_log
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .record_handled(&mid, now_secs());
+                        .record_handled(&mid, dedup_recorded_at);
                     return;
                 }
                 Err(payload) => {

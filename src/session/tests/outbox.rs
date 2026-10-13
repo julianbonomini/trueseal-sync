@@ -173,8 +173,18 @@ fn undelivered_entries_replayed_after_reconnect() {
 
     let envs = received_envs.lock().unwrap();
     assert_eq!(envs.len(), 3, "all 3 blobs replayed");
-    assert!(envs[0].sequence < envs[1].sequence);
-    assert!(envs[1].sequence < envs[2].sequence);
+    // The sequence is sealed (ADR-0031) — open each envelope as the
+    // recipient to assert replay order.
+    let seqs: Vec<u64> = envs
+        .iter()
+        .map(|e| {
+            e.open_sealed(recipient.noise.private())
+                .expect("sealed to the test recipient")
+                .sequence
+        })
+        .collect();
+    assert!(seqs[0] < seqs[1], "replay order preserved (0 < 1)");
+    assert!(seqs[1] < seqs[2], "replay order preserved (1 < 2)");
 }
 
 /// push_sync while disconnected returns Ok(()) and queues the entry in the outbox.

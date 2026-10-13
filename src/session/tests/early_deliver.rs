@@ -53,13 +53,17 @@ fn deliver_body(
     device: &DeviceKeypair,
     sender: &SigningKeypair,
 ) -> Vec<u8> {
-    let plaintext = Message::Sync {
-        body: body.to_vec(),
-    }
-    .encode();
-    let payload =
-        crate::crypto::encrypt(device.public_key(), sender.public_key_bytes(), &plaintext);
-    let env = Envelope::build(1, vec![], device.public_key(), sender, payload);
+    let env = Envelope::build_sealed(
+        1,
+        vec![],
+        device.public_key(),
+        sender,
+        crate::operation_log::now_secs() * 1000,
+        &Message::Sync {
+            body: body.to_vec(),
+        }
+        .encode(),
+    );
     let mut framed = blob_id.to_be_bytes().to_vec();
     framed.extend_from_slice(&env.encode());
     framed

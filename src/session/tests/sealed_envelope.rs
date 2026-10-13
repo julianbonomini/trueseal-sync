@@ -120,6 +120,7 @@ fn outer_envelope_carries_only_version_recipient_and_payload() {
         7,
         vec![],
         &sender,
+        1_000,
     )
     .expect("build_push_blob");
     let env_bytes = envelope_bytes_from_push(&framed);
@@ -148,18 +149,22 @@ fn two_sends_share_no_relay_readable_sender_pseudonym() {
         body: b"pseudonym check".to_vec(),
     };
     // The fan-out case: the SAME sequence goes to every recipient.
-    let fa = crate::relay::build_push_blob(&msg, recip_a, 42, vec![], &sender).expect("blob a");
-    let fb = crate::relay::build_push_blob(&msg, recip_b, 42, vec![], &sender).expect("blob b");
+    let fa =
+        crate::relay::build_push_blob(&msg, recip_a, 42, vec![], &sender, 1_000).expect("blob a");
+    let fb =
+        crate::relay::build_push_blob(&msg, recip_b, 42, vec![], &sender, 1_000).expect("blob b");
     let ea = envelope_bytes_from_push(&fa);
     let eb = envelope_bytes_from_push(&fb);
 
-    // Field-by-field: nothing but the version (7) may match across recipients.
+    // Field-by-field: nothing but the version (7) may match across
+    // recipients. An absent field satisfies the property; a SHARED
+    // cleartext value (the pre-SYNC-12 sequence pseudonym) fails it.
     for field in [1u64, 2, 3, 5] {
-        let va = raw_field(&ea, field);
-        let vb = raw_field(&eb, field);
-        assert_ne!(
-            va, vb,
-            "field {field} must not carry a shared cleartext value across recipients"
-        );
+        if let (Some(va), Some(vb)) = (raw_field(&ea, field), raw_field(&eb, field)) {
+            assert_ne!(
+                va, vb,
+                "field {field} must not carry a shared cleartext value across recipients"
+            );
+        }
     }
 }

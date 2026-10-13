@@ -487,8 +487,9 @@ impl ScriptedRelay {
         }
     }
 
-    /// Deliver an envelope built from `msg`, addressed to `recipient` and
-    /// signed by `sender` with Envelope sequence `seq`.
+    /// Deliver an envelope sealed from `msg`, addressed to `recipient` and
+    /// signed by `sender` with Envelope sequence `seq` and a fresh Sender
+    /// Timestamp (ADR-0031).
     pub(super) fn deliver(
         &self,
         blob_id: u64,
@@ -497,9 +498,35 @@ impl ScriptedRelay {
         sender: &crate::envelope::SigningKeypair,
         seq: u64,
     ) {
-        let plaintext = msg.encode();
-        let payload = crate::crypto::encrypt(recipient, sender.public_key_bytes(), &plaintext);
-        let env = crate::envelope::Envelope::build(seq, vec![], recipient, sender, payload);
+        self.deliver_at(
+            blob_id,
+            msg,
+            recipient,
+            sender,
+            seq,
+            crate::operation_log::now_secs() * 1000,
+        );
+    }
+
+    /// Like `deliver`, but the sealed Sender Timestamp is chosen by the
+    /// test — Replay Window cases stamp messages days in the past or future.
+    pub(super) fn deliver_at(
+        &self,
+        blob_id: u64,
+        msg: &crate::message::Message,
+        recipient: NoisePublicKey,
+        sender: &crate::envelope::SigningKeypair,
+        seq: u64,
+        sender_timestamp_ms: u64,
+    ) {
+        let env = crate::envelope::Envelope::build_sealed(
+            seq,
+            vec![],
+            recipient,
+            sender,
+            sender_timestamp_ms,
+            &msg.encode(),
+        );
         self.deliver_raw(blob_id, env.encode());
     }
 

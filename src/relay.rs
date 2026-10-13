@@ -10,7 +10,6 @@ use trueseal_noise::{
     session_xx::{dial, Session},
 };
 
-use crate::crypto;
 use crate::delivery_issue::{DeliveryIssue, UnreadableReason};
 use crate::envelope::Envelope;
 use crate::keys::NoisePublicKey;
@@ -127,7 +126,7 @@ pub struct RelayClient<T: Read + Write + Send + 'static> {
     /// Channel for sending pre-encoded push frames to the run thread.
     push_tx: mpsc::SyncSender<PushBytes>,
     /// Callbacks receive the decoded Message and the sender's signing public key ([u8;32]).
-    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64) + Send + 'static>>>>,
+    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64, u64) + Send + 'static>>>>,
     /// Callbacks receive typed Delivery Issues (ADR-0034). Never sent to the
     /// relay or the sender.
     issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>>,
@@ -178,7 +177,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         transport: T,
         relay_pub: NoisePublicKey,
         my_keypair: NoiseKeypair,
-        on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
+        on_message: impl Fn(Message, [u8; 32], u64, u64) + Send + 'static,
         on_issue: Option<Box<dyn Fn(DeliveryIssue) + Send + 'static>>,
     ) -> Result<Self, RelayError> {
         Self::connect_inner(
@@ -194,7 +193,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         transport: T,
         relay_pub: NoisePublicKey,
         my_keypair: NoiseKeypair,
-        first_callback: Option<Box<dyn Fn(Message, [u8; 32], u64) + Send + 'static>>,
+        first_callback: Option<Box<dyn Fn(Message, [u8; 32], u64, u64) + Send + 'static>>,
         first_issue_callback: Option<Box<dyn Fn(DeliveryIssue) + Send + 'static>>,
     ) -> Result<Self, RelayError> {
         let my_noise_priv = my_keypair.private();
@@ -214,7 +213,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
 
         // The first callback is registered before the run thread spawns, so
         // no Deliver can be processed before a handler exists (SYNC-6).
-        let callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64) + Send + 'static>>>> =
+        let callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64, u64) + Send + 'static>>>> =
             Arc::new(Mutex::new(first_callback.into_iter().collect()));
         let callbacks_clone = callbacks.clone();
 
@@ -248,7 +247,9 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         })
     }
 
-    /// Encrypt a Message for `recipient_pub` and push the resulting Envelope to the relay.
+    /// Seal a Message for `recipient_pub` and push the resulting Envelope to
+    /// the relay. `sender_timestamp_ms` follows the ADR-0034 §2 rule (see
+    /// [`build_push_blob`]).
     pub fn push(
         &self,
         message: &Message,
@@ -256,8 +257,16 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         sequence: u64,
         parents: Vec<[u8; 32]>,
         author_signing: &crate::envelope::SigningKeypair,
+        sender_timestamp_ms: u64,
     ) -> Result<(), RelayError> {
-        let framed = build_push_blob(message, recipient_pub, sequence, parents, author_signing)?;
+        let framed = build_push_blob(
+            message,
+            recipient_pub,
+            sequence,
+            parents,
+            author_signing,
+            sender_timestamp_ms,
+        )?;
         self.push_tx
             .send(framed)
             .map_err(|_| RelayError::PushFailed("relay run loop exited".into()))
@@ -266,7 +275,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
     /// Register a callback invoked when the relay delivers a Message to this device.
     /// Decryption and type parsing happen inside — callers receive a clean `Message`
     /// and the sender's signing public key (`author_pub` from the Envelope).
-    pub fn subscribe(&self, callback: impl Fn(Message, [u8; 32], u64) + Send + 'static) {
+    pub fn subscribe(&self, callback: impl Fn(Message, [u8; 32], u64, u64) + Send + 'static) {
         self.callbacks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -309,8 +318,14 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
 
 /// Build and frame a Push blob without sending it.
 ///
-/// Encrypts `message` to `recipient_pub`, wraps it in a signed Envelope, and
-/// returns the wire-framed bytes ready to hand to `push_send` (ADR-0018).
+/// Seals `message` to `recipient_pub` — the signature, sequence, parents and
+/// Sender Timestamp all move inside the Addressed Encryption (ADR-0031) —
+/// and returns the wire-framed bytes ready to hand to `push_send` (ADR-0018).
+///
+/// `sender_timestamp_ms` is the sealed Sender Timestamp in unix millis
+/// (ADR-0034 §2): a `Sync` message passes its `send()` time (kept through
+/// every re-seal); a control message passes the seal time.
+///
 /// Returns `Err(RelayError::EnvelopeTooLarge)` if the serialised envelope
 /// exceeds `limits::MAX_ENVELOPE_BYTES` (the one-frame ceiling, ADR-0025) —
 /// checked after serialisation, before framing. `Sync` bodies are refused
@@ -321,11 +336,16 @@ pub fn build_push_blob(
     sequence: u64,
     parents: Vec<[u8; 32]>,
     author_signing: &crate::envelope::SigningKeypair,
+    sender_timestamp_ms: u64,
 ) -> Result<Vec<u8>, RelayError> {
-    let plaintext = message.encode();
-    let author_pub = author_signing.public_key_bytes();
-    let payload = crypto::encrypt(recipient_pub, author_pub, &plaintext);
-    let envelope = Envelope::build(sequence, parents, recipient_pub, author_signing, payload);
+    let envelope = Envelope::build_sealed(
+        sequence,
+        parents,
+        recipient_pub,
+        author_signing,
+        sender_timestamp_ms,
+        &message.encode(),
+    );
     let envelope_bytes = envelope.encode();
     if envelope_bytes.len() > MAX_ENVELOPE_BYTES {
         return Err(RelayError::EnvelopeTooLarge);
@@ -358,7 +378,7 @@ impl Drop for DisconnectGuard {
 fn run_loop<T: Read + Write + Send + 'static>(
     session: Session<T>,
     push_rx: mpsc::Receiver<PushBytes>,
-    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64) + Send + 'static>>>>,
+    callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64, u64) + Send + 'static>>>>,
     issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>>,
     my_noise_priv: [u8; 32],
     is_connected: Arc<AtomicBool>,
@@ -501,20 +521,36 @@ fn run_loop<T: Read + Write + Send + 'static>(
                         continue;
                     }
 
-                    // Supported version. Decrypt, verify and decode first.
-                    let decoded = crypto::decrypt(my_noise_priv, &env.payload).and_then(
-                        |(author_pub, plaintext)| {
-                            if env.verify_with(author_pub).is_ok() {
-                                Message::decode(&plaintext)
-                                    .map(|msg| (author_pub, msg))
-                                    .map_err(|_| crate::crypto::CryptoError::DecryptionFailed)
-                            } else {
-                                Err(crate::crypto::CryptoError::DecryptionFailed)
+                    // Supported version. Open the seal: decrypt, parse the
+                    // sealed content and verify the author's signature over
+                    // the full binding (version, recipient, ephemeral key,
+                    // every sealed field) in one step (ADR-0031). Every
+                    // failure is malformed.
+                    let opened = env.open_sealed(my_noise_priv).and_then(|sc| {
+                        Message::decode(&sc.message)
+                            .map(|msg| (sc, msg))
+                            .map_err(|_| crate::envelope::EnvelopeError::OpenFailed)
+                    });
+                    match opened {
+                        Ok((sealed, msg)) => {
+                            // The Replay Window (ADR-0031): a message whose
+                            // signed Sender Timestamp is more than 60 days
+                            // behind this device's clock is acked and dropped
+                            // as `unreadable(expired)` (ADR-0034 §3) — it
+                            // never reaches a handler. Future stamps are
+                            // accepted; the dedup record clamps forward
+                            // (ADR-0034 §2). Control messages are stamped at
+                            // each seal, so an honest control is always fresh.
+                            let now_ms = crate::operation_log::now_secs() * 1000;
+                            if crate::envelope::is_expired(sealed.sender_timestamp_ms, now_ms) {
+                                let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
+                                fire_issue(
+                                    &issue_callbacks,
+                                    DeliveryIssue::Unreadable(UnreadableReason::Expired),
+                                );
+                                continue;
                             }
-                        },
-                    );
-                    match decoded {
-                        Ok((author_pub, msg)) => {
+
                             // ADR-0026 (superseding ADR-0020's ack-on-receipt):
                             // the DeliverAck leaves this device only after
                             // every handler has FINISHED with the Blob. The
@@ -527,7 +563,12 @@ fn run_loop<T: Read + Write + Send + 'static>(
                             // cost is documented in ADR-0026.
                             let cbs = callbacks.lock().unwrap_or_else(|e| e.into_inner());
                             for cb in cbs.iter() {
-                                cb(msg.clone(), author_pub, env.sequence);
+                                cb(
+                                    msg.clone(),
+                                    sealed.author_pub,
+                                    sealed.sequence,
+                                    sealed.sender_timestamp_ms,
+                                );
                             }
                             drop(cbs);
                             let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
@@ -774,6 +815,7 @@ mod tests {
                 1,
                 vec![],
                 &sender.signing_keypair(),
+                crate::operation_log::now_secs() * 1000,
             )
             .expect("push should succeed");
 
@@ -808,6 +850,7 @@ mod tests {
             1,
             vec![],
             &sender.signing_keypair(),
+            1_000,
         );
         assert!(
             matches!(result, Err(RelayError::EnvelopeTooLarge)),
@@ -847,6 +890,7 @@ mod tests {
             1,
             vec![],
             &sender.signing_keypair(),
+            1_000,
         )
         .expect("build_push_blob should succeed");
 
@@ -902,13 +946,14 @@ mod tests {
         // Fake relay: deliver one envelope to the client after handshake
         {
             let recipient_pub = recipient.public_key();
-            let plaintext = msg_to_deliver.encode();
-            let payload = crate::crypto::encrypt(
+            let env = Envelope::build_sealed(
+                1,
+                vec![],
                 recipient_pub,
-                sender_signing.public_key_bytes(),
-                &plaintext,
+                &sender_signing,
+                crate::operation_log::now_secs() * 1000,
+                &msg_to_deliver.encode(),
             );
-            let env = Envelope::build(1, vec![], recipient_pub, &sender_signing, payload);
             let env_bytes = env.encode();
 
             std::thread::spawn(move || {
@@ -926,7 +971,7 @@ mod tests {
 
         // Connect and subscribe — run loop starts automatically in connect()
         let client = connect_device(&recipient, relay_pub, client_pipe);
-        client.subscribe(move |msg, _author_pub, _seq| {
+        client.subscribe(move |msg, _author_pub, _seq, _ts| {
             delivered_clone.lock().unwrap().push(msg);
         });
 
@@ -1000,7 +1045,7 @@ mod tests {
         let client_a = connect_device(&device_a, relay_pub, pipe_a_client);
         let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
         let received_clone = received.clone();
-        client_a.subscribe(move |msg, _author_pub, _seq| {
+        client_a.subscribe(move |msg, _author_pub, _seq, _ts| {
             received_clone.lock().unwrap().push(msg);
         });
         // run loop starts automatically in connect()
@@ -1019,6 +1064,7 @@ mod tests {
                 1,
                 vec![],
                 &device_b.signing_keypair(),
+                crate::operation_log::now_secs() * 1000,
             )
             .expect("push should succeed");
 
@@ -1066,12 +1112,13 @@ mod tests {
     fn envelope_bytes_with_version(version: u32) -> Vec<u8> {
         let author = SigningKeypair::generate();
         let recipient = DeviceKeypair::generate();
-        let mut env = Envelope::build(
+        let mut env = Envelope::build_sealed(
             1,
             vec![],
             recipient.public_key(),
             &author,
-            b"irrelevant".to_vec(),
+            crate::operation_log::now_secs() * 1000,
+            b"irrelevant",
         );
         env.version = version;
         env.encode()
@@ -1175,7 +1222,7 @@ mod tests {
         });
         let delivered: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
         let delivered_cb = delivered.clone();
-        client.subscribe(move |msg, _author, _seq| {
+        client.subscribe(move |msg, _author, _seq, _ts| {
             delivered_cb.lock().unwrap().push(msg);
         });
         (client, issues, delivered)
@@ -1202,22 +1249,23 @@ mod tests {
             Keypair::new(device.noise.private(), device.noise.public_key),
         )
         .expect("connect");
-        client.subscribe(move |_msg, _author, _seq| {
+        client.subscribe(move |_msg, _author, _seq, _ts| {
             // The handler blocks until the test releases it.
             release_rx.recv().ok();
         });
 
         let sender_signing = SigningKeypair::generate();
-        let plaintext = Message::Sync {
-            body: b"hi".to_vec(),
-        }
-        .encode();
-        let payload = crypto::encrypt(
+        let env = Envelope::build_sealed(
+            1,
+            vec![],
             device.public_key(),
-            sender_signing.public_key_bytes(),
-            &plaintext,
+            &sender_signing,
+            crate::operation_log::now_secs() * 1000,
+            &Message::Sync {
+                body: b"hi".to_vec(),
+            }
+            .encode(),
         );
-        let env = Envelope::build(1, vec![], device.public_key(), &sender_signing, payload);
         relay.deliver(7, env.encode());
 
         // While the handler is blocked the relay must see NO DeliverAck —
@@ -1736,13 +1784,14 @@ mod tests {
         let client_frames: Arc<Mutex<Vec<(u8, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
         {
             let recipient_pub = recipient.public_key();
-            let plaintext = msg_to_deliver.encode();
-            let payload = crate::crypto::encrypt(
+            let env = Envelope::build_sealed(
+                1,
+                vec![],
                 recipient_pub,
-                sender_signing.public_key_bytes(),
-                &plaintext,
+                &sender_signing,
+                crate::operation_log::now_secs() * 1000,
+                &msg_to_deliver.encode(),
             );
-            let env = Envelope::build(1, vec![], recipient_pub, &sender_signing, payload);
             let env_bytes = env.encode();
             let frames_clone = client_frames.clone();
             std::thread::spawn(move || {
@@ -1766,7 +1815,7 @@ mod tests {
             client_pipe,
             relay_pub,
             Keypair::new(recipient.noise.private(), recipient.noise.public_key),
-            move |msg, _author, _seq| {
+            move |msg, _author, _seq, _ts| {
                 delivered_cb.lock().unwrap().push(msg);
             },
             None,

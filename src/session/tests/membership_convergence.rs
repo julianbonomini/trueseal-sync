@@ -1109,6 +1109,7 @@ fn thirty_two_member_manifest_fits_one_frame() {
         0,
         vec![],
         &issuer.signing_keypair(),
+        crate::operation_log::now_secs() * 1000,
     )
     .expect("a 32-member manifest fits one frame");
     assert!(
