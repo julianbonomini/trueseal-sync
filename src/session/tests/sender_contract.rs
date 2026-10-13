@@ -194,8 +194,7 @@ fn reconnect_clears_backoff_and_retries_immediately() {
                 let pushes = pushes.clone();
                 let first = first.clone();
                 std::thread::spawn(move || {
-                    let sess = match crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp)
-                    {
+                    let sess = match crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp) {
                         Ok(s) => s,
                         Err(_) => return,
                     };
@@ -265,12 +264,16 @@ fn reconnect_clears_backoff_and_retries_immediately() {
 
     // Queue one entry and kick the pump: the first attempt fails (no ack)
     // and a 5 s backoff starts.
-    op_log
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .append(&recipient.public_key().0, 0, b"retry on reconnect".to_vec());
+    op_log.lock().unwrap_or_else(|e| e.into_inner()).append(
+        &recipient.public_key().0,
+        0,
+        b"retry on reconnect".to_vec(),
+    );
     kick.kick();
-    wait_for(|| !pushes.lock().unwrap().is_empty(), Duration::from_secs(3));
+    wait_for(
+        || !pushes.lock().unwrap().is_empty(),
+        Duration::from_secs(3),
+    );
     let t1 = pushes.lock().unwrap()[0].1;
 
     // Simulate the disconnect first — the slot reports not-connected for a

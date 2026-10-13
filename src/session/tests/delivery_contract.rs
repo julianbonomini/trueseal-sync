@@ -435,7 +435,11 @@ fn crash_before_dedup_commit_rehandles_on_redelivery() {
         .expect("session");
         relay.deliver(1, &msg, device_pub, &sender, 11);
         wait_for(|| relay.deliver_acks() == vec![1], Duration::from_secs(3));
-        assert_eq!(handled.load(Ordering::SeqCst), 1, "handler ran before the crash");
+        assert_eq!(
+            handled.load(Ordering::SeqCst),
+            1,
+            "handler ran before the crash"
+        );
         // Session AND its log drop here — the "crash" before the dedup
         // record committed.
     }

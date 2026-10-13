@@ -304,10 +304,7 @@ fn sender_loop<T: Read + Write + Send + 'static>(
                                     .remove(&entry.object_id, entry.sequence);
                                 issue_sink.lock().unwrap_or_else(|e| e.into_inner()).fire(
                                     DeliveryIssue::SendFailed {
-                                        message_id: message_id(
-                                            &local_signing_pub,
-                                            entry.sequence,
-                                        ),
+                                        message_id: message_id(&local_signing_pub, entry.sequence),
                                         reason,
                                     },
                                 );

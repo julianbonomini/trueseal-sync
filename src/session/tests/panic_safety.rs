@@ -32,16 +32,11 @@ struct TwoConnRelay {
 }
 
 impl TwoConnRelay {
-    fn spawn(
-        pipe1: MemPipe,
-        pipe2: MemPipe,
-        relay_kp: &trueseal_noise::keypair::Keypair,
-    ) -> Self {
+    fn spawn(pipe1: MemPipe, pipe2: MemPipe, relay_kp: &trueseal_noise::keypair::Keypair) -> Self {
         let client_frames = Arc::new(Mutex::new(Vec::<(u8, Vec<u8>)>::new()));
         let (deliver_tx, deliver_rx) = mpsc::channel::<(u64, Vec<u8>)>();
-        let current: Arc<
-            Mutex<Option<Arc<trueseal_noise::session_xx::Session<MemPipe>>>>,
-        > = Arc::new(Mutex::new(None));
+        let current: Arc<Mutex<Option<Arc<trueseal_noise::session_xx::Session<MemPipe>>>>> =
+            Arc::new(Mutex::new(None));
         let generation = Arc::new(AtomicUsize::new(0));
 
         // Delivery forwarder: sends on whatever session is active NOW.
@@ -61,10 +56,7 @@ impl TwoConnRelay {
         // One acceptor thread per connection; the pipe2 acceptor waits for
         // the client's reconnect dial.
         for pipe in [pipe1, pipe2] {
-            let kp = trueseal_noise::keypair::Keypair::new(
-                relay_kp.private(),
-                relay_kp.public_key,
-            );
+            let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
             let current = current.clone();
             let generation = generation.clone();
             let frames = client_frames.clone();
@@ -140,11 +132,8 @@ fn manifest_callback_panic_reconnects_and_delivery_recovers() {
     let device = DeviceKeypair::generate();
     let issuer_bytes: [u8; 32] = rand::random();
     let issuer_sk = SigningKey::from_bytes(&issuer_bytes);
-    let issuer_signing_pub =
-        SigningPublicKey(issuer_sk.verifying_key().to_bytes());
-    let issuer_kp = || {
-        SigningKeypair::from_signing_key(SigningKey::from_bytes(&issuer_bytes))
-    };
+    let issuer_signing_pub = SigningPublicKey(issuer_sk.verifying_key().to_bytes());
+    let issuer_kp = || SigningKeypair::from_signing_key(SigningKey::from_bytes(&issuer_bytes));
     let group_id = new_group_id();
     let members = || {
         vec![
@@ -239,10 +228,7 @@ fn manifest_callback_panic_reconnects_and_delivery_recovers() {
         11,
     );
     wait_for(|| calls.load(Ordering::SeqCst) >= 2, Duration::from_secs(3));
-    wait_for(
-        || relay.deliver_acks().contains(&3),
-        Duration::from_secs(3),
-    );
+    wait_for(|| relay.deliver_acks().contains(&3), Duration::from_secs(3));
 
     assert_eq!(
         session
