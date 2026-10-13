@@ -1016,7 +1016,8 @@ fn pending_join_survives_restart_with_pair_queued() {
             .op_log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .undelivered_entries().unwrap();
+            .undelivered_entries()
+            .unwrap();
         assert!(
             undelivered.iter().any(|e| matches!(
                 crate::message::Message::decode(&e.blob),

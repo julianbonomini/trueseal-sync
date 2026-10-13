@@ -533,6 +533,7 @@ fn deliberate_later_removal_is_not_undone() {
             .lock()
             .unwrap()
             .undelivered_entries()
+            .unwrap()
             .is_empty(),
         "no re-application push queued"
     );
@@ -941,7 +942,7 @@ fn leave_resumes_after_crash_and_completes() {
         let log = PersistentLog::new(store);
         assert!(log.leaving().is_some(), "Leaving record persisted");
         assert!(
-            !log.undelivered_entries().is_empty(),
+            !log.undelivered_entries().unwrap().is_empty(),
             "Leave manifest pushes queued"
         );
         // CRASH: session drops mid-Leave.
@@ -1018,7 +1019,7 @@ fn leave_resumes_after_crash_and_completes() {
     let store = Store::open(dir.path(), "ns").expect("check store");
     let log = PersistentLog::new(store);
     assert!(log.leaving().is_none());
-    assert!(log.undelivered_entries().is_empty());
+    assert!(log.undelivered_entries().unwrap().is_empty());
     assert!(log.pending_membership_changes().is_none());
 }
 

@@ -123,7 +123,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         emit_upgrade_fixture(dir.path(), "fixture", FixtureState::MemberWithOutbox).expect("emit");
         let s = Store::open(dir.path(), "fixture").expect("open");
-        let entries = PersistentLog::new(s).undelivered_entries();
+        let entries = PersistentLog::new(s).undelivered_entries().unwrap();
         assert_eq!(entries.len(), 3, "two Sync + one manifest control entry");
     }
 }

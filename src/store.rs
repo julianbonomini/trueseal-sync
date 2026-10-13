@@ -909,9 +909,7 @@ impl OperationLog for PersistentLog {
         // dropping it would stall the outbox forever with no signal.
         rows.map(|r| {
             let (oid, sequence, blob, kind, created_at) = r?;
-            let object_id: [u8; 32] = oid
-                .try_into()
-                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let object_id: [u8; 32] = oid.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?;
             Ok(LogEntry {
                 object_id,
                 sequence,
@@ -1395,8 +1393,8 @@ mod tests {
         let log = PersistentLog::new(s);
         // Break the query underneath the store: drop the outbox table via a
         // second connection to the same file.
-        let raw = rusqlite::Connection::open(dir.path().join("trueseal_ns.db"))
-            .expect("raw connection");
+        let raw =
+            rusqlite::Connection::open(dir.path().join("trueseal_ns.db")).expect("raw connection");
         raw.execute_batch("DROP TABLE outbox;").expect("drop table");
         drop(raw);
         let result = log.undelivered_entries();
@@ -1508,7 +1506,8 @@ mod tests {
         log.append(&oid(2), 1, b"a".to_vec());
         log.append(&oid(1), 2, b"b".to_vec());
         let seqs: Vec<u64> = log
-            .undelivered_entries().unwrap()
+            .undelivered_entries()
+            .unwrap()
             .iter()
             .map(|e| e.sequence)
             .collect();
@@ -2250,7 +2249,11 @@ mod tests {
             let s = Store::open(dir.path(), "ns").expect("open");
             let mut log = PersistentLog::new(s);
             log.append(&oid(7), 1, marker.clone());
-            assert_eq!(log.undelivered_entries().unwrap()[0].blob, marker, "body stored");
+            assert_eq!(
+                log.undelivered_entries().unwrap()[0].blob,
+                marker,
+                "body stored"
+            );
             // Relay acceptance, exactly what the pump does on Ok.
             log.remove(&oid(7), 1);
             assert!(log.undelivered_entries().unwrap().is_empty());

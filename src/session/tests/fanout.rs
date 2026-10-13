@@ -241,7 +241,12 @@ fn push_sync_consumes_one_sequence_per_call() {
     session.push_sync(b"first".to_vec()).ok();
     session.push_sync(b"second".to_vec()).ok();
 
-    let undelivered = session.op_log.lock().unwrap().undelivered_entries();
+    let undelivered = session
+        .op_log
+        .lock()
+        .unwrap()
+        .undelivered_entries()
+        .unwrap();
     // 1 peer × 2 calls = 2 outbox entries, sequence numbers 0 and 1
     assert_eq!(undelivered.len(), 2, "expected 2 outbox entries");
     assert!(

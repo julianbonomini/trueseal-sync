@@ -265,7 +265,11 @@ fn destroy_group_persists_destroying_and_queues_revokes() {
         "a crash after the commit resumes Destroying"
     );
     let log = session2.op_log.lock().unwrap();
-    assert_eq!(log.undelivered_entries().unwrap().len(), 2, "Revokes still queued");
+    assert_eq!(
+        log.undelivered_entries().unwrap().len(),
+        2,
+        "Revokes still queued"
+    );
 }
 
 /// Crash before the commit: a store failure on the Destroying commit is a
@@ -392,7 +396,10 @@ fn destroy_group_commit_failure_changes_nothing() {
     );
     let log = session.op_log.lock().unwrap();
     assert!(log.destroying().is_none());
-    assert!(log.undelivered_entries().unwrap().is_empty(), "no Revoke queued");
+    assert!(
+        log.undelivered_entries().unwrap().is_empty(),
+        "no Revoke queued"
+    );
 }
 
 /// Crash mid-wipe / completion at construction: a Destroying record whose
@@ -578,7 +585,8 @@ fn revoke_from_past_member_is_honoured_after_their_removal() {
             .op_log
             .lock()
             .unwrap()
-            .undelivered_entries().unwrap()
+            .undelivered_entries()
+            .unwrap()
             .is_empty(),
         "a stranger's Revoke queues nothing"
     );
@@ -748,7 +756,13 @@ fn revoke_ignored_in_not_joined_and_pending_join() {
     let token = session_a.pairing_token().expect("pairing window opens");
     session_b.join_group(&token).expect("join");
     assert_eq!(session_b.group_status(), GroupStatus::PendingJoin);
-    let control_before = session_b.op_log.lock().unwrap().undelivered_entries().unwrap().len();
+    let control_before = session_b
+        .op_log
+        .lock()
+        .unwrap()
+        .undelivered_entries()
+        .unwrap()
+        .len();
     deliver_revoke(&relay_b, 2, &a, &b, 901);
     wait_for(
         || relay_b.deliver_acks().contains(&2),
@@ -761,7 +775,13 @@ fn revoke_ignored_in_not_joined_and_pending_join() {
     );
     assert_eq!(*destroyed_b.lock().unwrap(), 0);
     assert_eq!(
-        session_b.op_log.lock().unwrap().undelivered_entries().unwrap().len(),
+        session_b
+            .op_log
+            .lock()
+            .unwrap()
+            .undelivered_entries()
+            .unwrap()
+            .len(),
         control_before,
         "nothing queued"
     );
@@ -790,7 +810,15 @@ fn replayed_revoke_forwards_at_most_once() {
         || session_c.group_status() == GroupStatus::Destroying,
         Duration::from_secs(20),
     );
-    let forwards = || session_c.op_log.lock().unwrap().undelivered_entries().unwrap().len();
+    let forwards = || {
+        session_c
+            .op_log
+            .lock()
+            .unwrap()
+            .undelivered_entries()
+            .unwrap()
+            .len()
+    };
     assert_eq!(forwards(), 1, "one forward queued (to D)");
 
     // The same Envelope re-delivered (new blob id), and a DIFFERENT held
@@ -831,7 +859,13 @@ fn group_of_32_forwards_one_round_per_device() {
     session_a.set_manifest(v1.clone());
     session_a.destroy_group().expect("destroy");
     assert_eq!(
-        session_a.op_log.lock().unwrap().undelivered_entries().unwrap().len(),
+        session_a
+            .op_log
+            .lock()
+            .unwrap()
+            .undelivered_entries()
+            .unwrap()
+            .len(),
         31,
         "initiator queues one Revoke per other member"
     );
@@ -845,7 +879,15 @@ fn group_of_32_forwards_one_round_per_device() {
         || session_c.group_status() == GroupStatus::Destroying,
         Duration::from_secs(20),
     );
-    let forwards = || session_c.op_log.lock().unwrap().undelivered_entries().unwrap().len();
+    let forwards = || {
+        session_c
+            .op_log
+            .lock()
+            .unwrap()
+            .undelivered_entries()
+            .unwrap()
+            .len()
+    };
     assert_eq!(forwards(), 30, "one forward round to the receiver's view");
     deliver_revoke(&relay_c, 2, a, c, 900);
     wait_for(
@@ -1288,7 +1330,10 @@ fn destroy_partially_drained_restart_resumes_and_completes_once() {
         let store = Store::open(dir.path(), "ns").expect("check store");
         let log = PersistentLog::new(store);
         assert!(log.destroying().is_none(), "Destroying record cleared");
-        assert!(log.undelivered_entries().unwrap().is_empty(), "outbox empty");
+        assert!(
+            log.undelivered_entries().unwrap().is_empty(),
+            "outbox empty"
+        );
         assert!(
             !log.is_held_signer(&me.signing_public_key().0),
             "held signer history wiped"

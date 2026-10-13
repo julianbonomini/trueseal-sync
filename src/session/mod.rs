@@ -823,8 +823,7 @@ pub(super) fn refs_drained(
     // A failing store query reads as "not drained" (SYNC-19): the
     // Leave/Destroy completion never fires on unknown state — the record
     // stays and the next pump pass retries.
-    let undelivered: std::collections::HashSet<([u8; 32], u64)> = match log.undelivered_entries()
-    {
+    let undelivered: std::collections::HashSet<([u8; 32], u64)> = match log.undelivered_entries() {
         Ok(entries) => entries
             .into_iter()
             .map(|e| (e.object_id, e.sequence))
