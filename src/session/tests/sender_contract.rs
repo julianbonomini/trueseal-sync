@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
 use trueseal_noise::keypair::Keypair;
@@ -118,6 +118,187 @@ fn member_of(device: &DeviceKeypair) -> ManifestMember {
         signing_pub: device.signing_public_key(),
         name: member_name(&device.signing_public_key()),
     }
+}
+
+/// Backoff progression (ADR-0026): 1 s base, doubling per consecutive
+/// failure, capped at 5 minutes — and saturating at extreme failure counts
+/// (no overflow panic). Pure-function coverage for the delay the pump
+/// applies between retries.
+#[test]
+fn backoff_progression_doubles_and_caps_at_five_minutes() {
+    use crate::session::sender::{backoff_delay, SenderConfig};
+
+    let config = SenderConfig::default();
+    let delay = |failures| backoff_delay(&config, failures);
+    assert_eq!(delay(1), Duration::from_secs(1), "base on first failure");
+    assert_eq!(delay(2), Duration::from_secs(2));
+    assert_eq!(delay(3), Duration::from_secs(4));
+    assert_eq!(delay(4), Duration::from_secs(8));
+    assert_eq!(delay(9), Duration::from_secs(256));
+    assert_eq!(
+        delay(10),
+        Duration::from_secs(300),
+        "512 s would exceed the cap: clamped at 5 min"
+    );
+    assert_eq!(delay(20), Duration::from_secs(300));
+    assert_eq!(
+        delay(u32::MAX),
+        Duration::from_secs(300),
+        "saturating arithmetic — no overflow panic at extreme counts"
+    );
+
+    // A custom base/cap are honoured (operators and tests can retune).
+    let custom = SenderConfig {
+        retry_base: Duration::from_millis(100),
+        retry_cap: Duration::from_millis(450),
+        ..SenderConfig::default()
+    };
+    let d = |failures| backoff_delay(&custom, failures);
+    assert_eq!(d(1), Duration::from_millis(100));
+    assert_eq!(d(2), Duration::from_millis(200));
+    assert_eq!(d(3), Duration::from_millis(400));
+    assert_eq!(d(4), Duration::from_millis(450), "custom cap clamps");
+}
+
+/// Reconnect clears per-recipient backoffs (ADR-0026: "retried while
+/// connected ... and immediately on reconnect"). After a temporary failure
+/// sets a backoff, swapping in a reconnected client makes the pump retry AT
+/// ONCE — not after the backoff deadline.
+///
+/// The pump is driven directly with a slow 5 s base so the instant-retry
+/// path is unambiguous: through `connect_background` the reconnect loop's
+/// own ~1 s redial backoff lands at almost exactly the default 1 s retry
+/// base, and the two paths cannot be told apart.
+#[test]
+fn reconnect_clears_backoff_and_retries_immediately() {
+    use crate::operation_log::OperationLog;
+    use crate::relay::RelayClient;
+    use crate::session::sender::{spawn_sender, Kick, SenderConfig};
+    use crate::session::{IssueSink, KeyState};
+
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let (nk_rx, nk) = nk_push_channel();
+
+    // NK relay: the FIRST push is dropped without an ack (temporary
+    // failure), the rest acked. Records (sequence, receive time) per push.
+    let pushes: Arc<Mutex<Vec<(u64, Instant)>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let pushes = pushes.clone();
+        let relay_priv = relay_kp.private();
+        let relay_pub_key = relay_kp.public_key;
+        let first = Arc::new(AtomicBool::new(true));
+        std::thread::spawn(move || {
+            while let Ok(nk_pipe) = nk_rx.recv() {
+                let kp = Keypair::new(relay_priv, relay_pub_key);
+                let pushes = pushes.clone();
+                let first = first.clone();
+                std::thread::spawn(move || {
+                    let sess = match crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp)
+                    {
+                        Ok(s) => s,
+                        Err(_) => return,
+                    };
+                    let raw = match sess.receive() {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                    if let Some((MsgType::Push, body)) = parse(&raw) {
+                        if body.len() >= 32 {
+                            let seq = Envelope::decode(&body[32..])
+                                .map(|e| e.sequence)
+                                .unwrap_or(u64::MAX);
+                            pushes.lock().unwrap().push((seq, Instant::now()));
+                        }
+                    }
+                    if first.swap(false, Ordering::SeqCst) {
+                        // Drop without a word: the ack never arrives.
+                    } else {
+                        let _ = sess.send(&frame(MsgType::Ack, &[]));
+                    }
+                });
+            }
+        });
+    }
+
+    // A relay that holds one XX Receive Session open and drains it.
+    let hold_xx = |pipe: MemPipe| {
+        let kp = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        std::thread::spawn(move || {
+            if let Ok(sess) = crate::version::testutil::xx_accept_after_prefix(pipe, kp) {
+                while sess.receive().is_ok() {}
+            }
+        });
+    };
+
+    let device = DeviceKeypair::generate();
+    let recipient = DeviceKeypair::generate();
+    let noise_kp = || Keypair::new(device.noise.private(), device.public_key().0);
+
+    // Start the pump against a connected client.
+    let (pipe1_client, pipe1_relay) = mem_pipe_pair();
+    hold_xx(pipe1_relay);
+    let client1 = RelayClient::connect(pipe1_client, relay_pub, noise_kp()).expect("connect 1");
+    let client_slot: Arc<Mutex<RelayClient<MemPipe>>> = Arc::new(Mutex::new(client1));
+
+    let keys = Arc::new(Mutex::new(KeyState::from_keypair(&device)));
+    let op_log: Arc<Mutex<Box<dyn OperationLog>>> = Arc::new(Mutex::new(Box::new(MemLog::new())));
+    let issue_sink = Arc::new(Mutex::new(IssueSink::new()));
+    let destroyed = Arc::new(AtomicBool::new(false));
+    let kick = Arc::new(Kick::new());
+    spawn_sender(
+        client_slot.clone(),
+        op_log.clone(),
+        keys,
+        relay_pub.0,
+        Arc::new(nk.factory()),
+        issue_sink,
+        destroyed,
+        kick.clone(),
+        SenderConfig {
+            retry_base: Duration::from_secs(5),
+            retry_cap: Duration::from_secs(10),
+            poll: Duration::from_millis(20),
+            ..SenderConfig::default()
+        },
+    );
+
+    // Queue one entry and kick the pump: the first attempt fails (no ack)
+    // and a 5 s backoff starts.
+    op_log
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .append(&recipient.public_key().0, 0, b"retry on reconnect".to_vec());
+    kick.kick();
+    wait_for(|| !pushes.lock().unwrap().is_empty(), Duration::from_secs(3));
+    let t1 = pushes.lock().unwrap()[0].1;
+
+    // Simulate the disconnect first — the slot reports not-connected for a
+    // few pump polls (this is what the dead client reports while the
+    // reconnect loop is still dialling).
+    *client_slot.lock().unwrap_or_else(|e| e.into_inner()) = RelayClient::disconnected();
+    std::thread::sleep(Duration::from_millis(150));
+
+    // Then the reconnect: swap in a fresh connected client — exactly what
+    // the reconnect loop does.
+    let (pipe2_client, pipe2_relay) = mem_pipe_pair();
+    hold_xx(pipe2_relay);
+    let client2 = RelayClient::connect(pipe2_client, relay_pub, noise_kp()).expect("connect 2");
+    *client_slot.lock().unwrap_or_else(|e| e.into_inner()) = client2;
+
+    // The pump notices the transition within one poll and retries AT ONCE —
+    // long before the 5 s backoff deadline.
+    wait_for(|| pushes.lock().unwrap().len() == 2, Duration::from_secs(3));
+    let pushes = pushes.lock().unwrap();
+    let gap = pushes[1].1 - t1;
+    assert!(
+        gap < Duration::from_secs(2),
+        "the retry after reconnect must not wait out the 5 s backoff — gap was {gap:?}"
+    );
+    assert_eq!(
+        pushes[0].0, pushes[1].0,
+        "the same entry is retried (same sequence)"
+    );
 }
 
 /// A permanent refusal raises `sendFailed` and is never retried (issue
