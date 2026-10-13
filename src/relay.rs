@@ -157,10 +157,10 @@ pub struct RelayClient<T: Severable> {
     /// True while the background run loop is alive; set to false when relay disconnects.
     is_connected: Arc<AtomicBool>,
     /// Handle to the receive-side Noise Session, so `close()` (and Drop) can
-    /// interrupt a receive blocked in WouldBlock retry (noise#38: the closed
-    /// flag is checked inside the retry loop). `None` for the disconnected
-    /// stub. Without this, a dropped client left its receive thread parked
-    /// on the socket forever (SYNC-15, B7b review note).
+    /// fail NEW sends/receives fast. The closed flag is only checked at
+    /// send/receive ENTRY — interrupting a receive parked in WouldBlock
+    /// retry is the sever handle's job (below). `None` for the
+    /// disconnected stub.
     session: Option<Arc<Session<T>>>,
     /// Severs the transport under a receive parked in WouldBlock retry
     /// (SYNC-15): the noise closed flag alone is only checked at
@@ -172,10 +172,11 @@ pub struct RelayClient<T: Severable> {
 }
 
 impl<T: Severable> Drop for RelayClient<T> {
-    /// Dropping the client severs the receive side: the session's closed
-    /// flag unblocks its receive thread, and dropping `push_tx` ends the
-    /// send thread. This is also what finally reaps the OLD client after an
-    /// identity rotation swaps in the disconnected stub.
+    /// Dropping the client severs the receive side: the transport EOF
+    /// unblocks its receive thread (the noise closed flag is only checked
+    /// at receive entry), and dropping `push_tx` ends the send thread.
+    /// This is also what finally reaps the OLD client after an identity
+    /// rotation swaps in the disconnected stub.
     fn drop(&mut self) {
         self.close();
     }

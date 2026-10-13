@@ -1,5 +1,5 @@
 {
-  "description": "The canonical TrueSeal FFI surface (ADR-0028, amended by ADR-0032 and ADR-0034). Generated from src/ffi.rs and kept in lockstep by ffi::tests::the_error_enum_is_exactly_the_canonical_14. The G12 parity check compares errors/events/issues across the three SDKs against this file; SYNC-21 (Shared Facts) will generate it from the core. HandlerError (the message handler's own failure type) is deliberately NOT part of this surface: it is thrown BY the app into the library, never raised BY the library.",
+  "description": "The canonical TrueSeal FFI surface (ADR-0028, amended by ADR-0032 and ADR-0034). Generated from src/ffi.rs and kept in lockstep by ffi::tests::the_ffi_surface_matches_api_surface_json. The G12 parity check compares errors/events/issues across the three SDKs against this file; SYNC-21 (Shared Facts) will generate it from the core. HandlerError (the message handler's own failure type) is deliberately NOT part of this surface: it is thrown BY the app into the library, never raised BY the library.",
   "errors": [
     "invalidRelayAddress",
     "invalidNamespace",

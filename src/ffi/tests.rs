@@ -1317,3 +1317,87 @@ fn removal_reports_not_joined_and_the_same_object_pairs_again() {
     assert!(!session.start_pairing().expect("window opens").is_empty());
     session.close();
 }
+
+/// A Leaving device applies inbound manifests without a spurious
+/// `statusChanged(member, joined)` (SYNC-15 gate): the member event fires
+/// only on an ENTRY into membership (from notJoined or pendingJoin).
+#[test]
+fn leaving_device_applies_manifests_without_a_spurious_joined_event() {
+    let relay = TcpRelay::spawn();
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let first = open_test_session(&dir, &relay.address(), "app");
+    first.close();
+    let relay = TcpRelay::spawn();
+
+    let device = load_identity(&dir, "app");
+    let b_signing_bytes: [u8; 32] = rand::random();
+    let b_signing = ed25519_dalek::SigningKey::from_bytes(&b_signing_bytes);
+    let sender = crate::envelope::SigningKeypair::from_signing_key(
+        ed25519_dalek::SigningKey::from_bytes(&b_signing_bytes),
+    );
+    let v1 = persist_membership(&dir, "app", &device, &sender);
+
+    let session = open_test_session(&dir, &relay.address(), "app");
+    let events = Arc::new(Mutex::new(Vec::<TrueSealEvent>::new()));
+    session
+        .on_event(Box::new(EventLog(events.clone())))
+        .expect("on_event");
+    assert_eq!(session.status().unwrap(), GroupStatus::Member);
+
+    // Leave: the Leave manifest rides the outbox, but the relay stub never
+    // completes NK pushes — the device stays Leaving, which is exactly the
+    // state under test.
+    session.leave().expect("leave");
+    assert_eq!(session.status().unwrap(), GroupStatus::Leaving);
+    events.lock().unwrap().clear();
+
+    // B issues a routine update while this device's Leave is in flight.
+    // leave() installed the Leave manifest as the local v2, so a same-
+    // version inbound would be a (version, hash) coin flip (ADR-0027) —
+    // B steps to v3, which always wins the order. Members unchanged; the
+    // device is still included, so this is the routine-update path, not a
+    // removal. A Leaving device still applies it.
+    let v2_b = crate::manifest::GroupManifest::update(&v1, v1.members.clone(), &b_signing)
+        .expect("v2 issues");
+    let v3_b = crate::manifest::GroupManifest::update(&v2_b, v1.members.clone(), &b_signing)
+        .expect("v3 issues");
+    let msg = crate::message::Message::GroupManifest { manifest: v3_b };
+    let env = crate::envelope::Envelope::build_sealed(
+        42,
+        vec![],
+        device.public_key(),
+        &sender,
+        crate::operation_log::now_secs() * 1000,
+        &msg.encode(),
+    );
+    relay
+        .deliver_tx
+        .send((11, env.encode()))
+        .expect("relay alive");
+
+    // membersChanged proves the hook ran and applied the manifest; the
+    // statusChanged decision happens in the same hook, before it — so once
+    // membersChanged is observed, a spurious joined would already be in
+    // the log (no timing window needed for the negative).
+    wait_for(
+        || {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, TrueSealEvent::MembersChanged { .. }))
+        },
+        Duration::from_secs(10),
+        "manifest applied while leaving",
+    );
+    let log = events.lock().unwrap();
+    assert!(
+        !log.iter()
+            .any(|e| matches!(e, TrueSealEvent::StatusChanged { .. })),
+        "no statusChanged while leaving: {log:?}"
+    );
+    drop(log);
+    assert_eq!(session.status().unwrap(), GroupStatus::Leaving);
+    session.close();
+}

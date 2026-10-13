@@ -842,14 +842,18 @@ impl TrueSeal {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        // Release a handler wait parked on "no handler registered" first,
-        // then stop the core: loops exit, the receive link is severed.
+        // ORDER MATTERS (SYNC-15 gate, F2's happens-before): the core's
+        // shutdown flag FIRST — it never blocks on the receive thread —
+        // then release a handler wait parked on "no handler registered".
+        // In the reverse order a woken waiter could reach the dispatch's
+        // shutdown guard before the flag was set, and the dedup record
+        // would commit for a delivery whose handler never ran.
+        self.inner.close();
         {
             let (lock, cvar) = &*self.handler_slot;
             lock.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
             cvar.notify_all();
         }
-        self.inner.close();
     }
 }
 
@@ -983,8 +987,14 @@ impl TrueSeal {
                         name: member_name(&mm.signing_pub),
                     })
                     .collect();
+                // A member-status event only makes sense on an ENTRY into
+                // membership — from NotJoined (a local genesis: Created) or
+                // PendingJoin (an admission: Joined). A Leaving or
+                // Destroying device still applies inbound manifests (its
+                // view must stay current until the wipe), but it is not
+                // joining anything (SYNC-15 gate): no spurious `joined`.
                 let mut last = last_status.lock().unwrap_or_else(|e| e.into_inner());
-                if *last != GroupStatus::Member {
+                if matches!(*last, GroupStatus::NotJoined | GroupStatus::PendingJoin) {
                     let reason = if m.issued_by == self_signing_pub.0 {
                         StatusReason::Created
                     } else {
