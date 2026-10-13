@@ -2486,12 +2486,22 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         {
             return Ok(false);
         }
-        // The Maximum Group Size check runs BEFORE the window is consumed
-        // (ADR-0027: "refused locally with a typed error") — the caller may
-        // remove a member and retry the admission.
+        // The Maximum Group Size and self-membership checks run BEFORE the
+        // window is consumed (ADR-0027: "refused locally with a typed
+        // error") — the caller may remove a member and retry the admission.
+        // A device whose current VIEW excludes it (a false removal) admits
+        // no one: a non-member's changes carry no authority (ADR-0027).
         {
+            let self_sp = self
+                .keys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .signing_pub;
             let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(m) = guard.as_ref() {
+                if !m.contains_signing_pub(&self_sp.0) {
+                    return Ok(false);
+                }
                 if m.members.len() >= MAX_GROUP_SIZE {
                     return Err(SessionError::GroupFull {
                         max: MAX_GROUP_SIZE as u32,
@@ -2706,14 +2716,23 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     pub fn remove_member(&self, target: SigningPublicKey) -> Result<(), SessionError> {
         // Lock discipline: keys copied out and released before the manifest
         // lock (the handler locks manifest → keys).
-        let (self_noise, signing_key) = {
+        let (self_noise, self_signing, signing_key) = {
             let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-            (ks.noise_pub, SigningKey::from_bytes(&ks.signing_priv))
+            (
+                ks.noise_pub,
+                ks.signing_pub,
+                SigningKey::from_bytes(&ks.signing_priv),
+            )
         };
         // Find the target member (need their noise_pub to push the manifest to them).
         let (new_manifest, notify, target_noise) = {
             let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
             let current = guard.as_ref().ok_or(SessionError::NotInGroup)?;
+            // A device whose current view excludes it (false removal) has
+            // no membership authority (ADR-0027).
+            if !current.contains_signing_pub(&self_signing.0) {
+                return Err(SessionError::NotInGroup);
+            }
 
             let target_member = current
                 .members
@@ -2825,6 +2844,11 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let (leave_manifest, refs) = {
             let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
             let current = guard.as_ref().ok_or(SessionError::NotInGroup)?;
+            // A device whose current view excludes it (false removal) is
+            // already out of the group it sees — nothing to leave.
+            if !current.contains_signing_pub(&self_signing.0) {
+                return Err(SessionError::NotInGroup);
+            }
 
             let remaining: Vec<ManifestMember> = current
                 .members

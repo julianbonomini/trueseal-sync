@@ -575,6 +575,49 @@ fn exclusion_with_unknown_parent_is_not_a_removal() {
     );
 }
 
+/// A device whose current VIEW excludes it (a false removal) has no
+/// membership authority: it cannot admit, remove or leave — it waits for
+/// its admitter's re-apply (ADR-0027).
+#[test]
+fn falsely_removed_device_cannot_issue_membership_changes() {
+    let a = DeviceKeypair::generate();
+    let d = DeviceKeypair::generate();
+    let (session_d, _relay, _i) = scripted_session(&d);
+
+    // D's view: a manifest that excludes D (seeded directly — the false
+    // removal itself is covered by losing_joiner_does_not_wipe_itself).
+    let view = GroupManifest::new(
+        new_group_id(),
+        3,
+        vec![member_of(&a)],
+        &SigningKey::from_bytes(&a.signing.to_bytes()),
+    );
+    session_d.set_manifest(view);
+
+    session_d.pairing_token();
+    let joiner = DeviceKeypair::generate();
+    assert!(
+        matches!(
+            session_d.accept_pair(joiner.public_key(), joiner.signing_public_key()),
+            Ok(false)
+        ),
+        "a non-member admits no one"
+    );
+    assert!(matches!(
+        session_d.remove_member(a.signing_public_key()),
+        Err(SessionError::NotInGroup)
+    ));
+    assert!(matches!(
+        session_d.leave_group(),
+        Err(SessionError::NotInGroup)
+    ));
+    assert_eq!(
+        session_d.group_status(),
+        GroupStatus::Member,
+        "still waiting for the admitter's re-apply"
+    );
+}
+
 // ── Leave ───────────────────────────────────────────────────────────────────
 
 /// ADR-0027: Leave enters the persisted Leaving state (no Sync sends),
