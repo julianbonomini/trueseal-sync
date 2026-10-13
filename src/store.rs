@@ -97,6 +97,8 @@ const WIPE_DATA_SQL: &str = "
     DELETE FROM pending_changes;
     DELETE FROM held_manifests;
     DELETE FROM leaving;
+    DELETE FROM destroying;
+    DELETE FROM held_signers;
     DELETE FROM meta WHERE key NOT IN ('store_version', 'e2e_version');";
 
 /// Drops every table. The Store Reset uses this — a dev-build store can
@@ -111,7 +113,9 @@ const DROP_ALL_SQL: &str = "
     DROP TABLE IF EXISTS pending_join;
     DROP TABLE IF EXISTS pending_changes;
     DROP TABLE IF EXISTS held_manifests;
-    DROP TABLE IF EXISTS leaving;";
+    DROP TABLE IF EXISTS leaving;
+    DROP TABLE IF EXISTS destroying;
+    DROP TABLE IF EXISTS held_signers;";
 
 /// The schema, created if absent. Plain batch: every statement is
 /// idempotent (`IF NOT EXISTS`), so a crash anywhere leaves a consistent
@@ -182,6 +186,20 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
          CREATE TABLE IF NOT EXISTS leaving (
              id      INTEGER PRIMARY KEY CHECK (id = 1),
              data    BLOB NOT NULL
+         );
+         -- The Destroying record (ADR-0029): the outbox refs the Destroy
+         -- waits on before the wipe. Survives restarts — a crash in
+         -- Destroying resumes Destroying.
+         CREATE TABLE IF NOT EXISTS destroying (
+             id      INTEGER PRIMARY KEY CHECK (id = 1),
+             data    BLOB NOT NULL
+         );
+         -- Destroy authority (ADR-0029): the signing key of every member
+         -- of every manifest this device has held for the group. A Revoke
+         -- is honoured from any past or present member, so a thief who
+         -- removed the owner first cannot block Destroy.
+         CREATE TABLE IF NOT EXISTS held_signers (
+             signing_pub BLOB PRIMARY KEY
          );",
     )
 }
@@ -1003,6 +1021,8 @@ impl OperationLog for PersistentLog {
             held,
             pending_changes,
             leaving,
+            destroying,
+            drop_sync_outbox,
             outbox,
         } = commit;
         let result = (|| -> Result<(), rusqlite::Error> {
@@ -1033,6 +1053,30 @@ impl OperationLog for PersistentLog {
                     "INSERT INTO leaving (id, data) VALUES (1, ?1)
                      ON CONFLICT(id) DO UPDATE SET data=excluded.data",
                     rusqlite::params![record],
+                )?;
+            }
+            if let Some(record) = destroying {
+                tx.execute(
+                    "INSERT INTO destroying (id, data) VALUES (1, ?1)
+                     ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                    rusqlite::params![record],
+                )?;
+            }
+            // ADR-0029: the signing keys of every held manifest's members
+            // are Destroy authority. Derived from the installed manifest so
+            // no call site can forget them.
+            for signer in crate::operation_log::manifest_signers(&manifest) {
+                tx.execute(
+                    "INSERT OR IGNORE INTO held_signers (signing_pub) VALUES (?1)",
+                    rusqlite::params![signer.as_slice()],
+                )?;
+            }
+            if drop_sync_outbox {
+                // ADR-0029: entering Destroying drops pending Sync sends
+                // (undelivered Sync-kind rows) without reporting them.
+                tx.execute(
+                    "DELETE FROM outbox WHERE delivered = 0 AND kind = ?1",
+                    rusqlite::params![KIND_SYNC],
                 )?;
             }
             for (object_id, sequence, blob) in outbox {
@@ -1083,6 +1127,27 @@ impl OperationLog for PersistentLog {
             .ok()
     }
 
+    fn destroying(&self) -> Option<Vec<u8>> {
+        self.store
+            .conn
+            .query_row("SELECT data FROM destroying WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .ok()
+    }
+
+    fn is_held_signer(&self, signing_pub: &[u8; 32]) -> bool {
+        self.store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM held_signers WHERE signing_pub = ?1",
+                rusqlite::params![signing_pub.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n > 0)
+            .unwrap_or(false)
+    }
+
     fn wipe_group_state(&mut self) {
         // Everything the log owns; identity and manifest rows are wiped by
         // the caller (the FFI's Store handle) as part of the same removal /
@@ -1096,6 +1161,8 @@ impl OperationLog for PersistentLog {
              DELETE FROM pending_changes;
              DELETE FROM held_manifests;
              DELETE FROM leaving;
+             DELETE FROM destroying;
+             DELETE FROM held_signers;
              COMMIT;",
         ) {
             warn!("[trueseal-sync] wipe_group_state failed: {e}");
@@ -1166,6 +1233,8 @@ mod tests {
             held: vec![([1u8; 32], true)],
             pending_changes: b"changes".to_vec(),
             leaving: Some(b"refs".to_vec()),
+            destroying: None,
+            drop_sync_outbox: false,
             outbox: vec![],
         })
         .expect("commit");
@@ -1706,6 +1775,8 @@ mod tests {
                 held: vec![([7u8; 32], true)],
                 pending_changes: b"change-set".to_vec(),
                 leaving: Some(b"leave-refs".to_vec()),
+                destroying: None,
+                drop_sync_outbox: false,
                 outbox: vec![(oid(9), 3, b"\x04m".to_vec())],
             })
             .expect("commit");
@@ -1742,6 +1813,8 @@ mod tests {
             held: vec![([1u8; 32], true)],
             pending_changes: b"changes".to_vec(),
             leaving: Some(b"refs".to_vec()),
+            destroying: None,
+            drop_sync_outbox: false,
             outbox: vec![],
         })
         .expect("commit 1");
@@ -1750,6 +1823,8 @@ mod tests {
             held: vec![([2u8; 32], false)],
             pending_changes: Vec::new(),
             leaving: None,
+            destroying: None,
+            drop_sync_outbox: false,
             outbox: vec![],
         })
         .expect("commit 2");
@@ -1761,6 +1836,196 @@ mod tests {
         );
         // A held record that excluded self is not "held including self".
         assert!(!log.is_held_including_self(&[2u8; 32]));
+    }
+
+    /// ADR-0029: the Destroying record commits atomically with the rest,
+    /// survives a reopen, and an empty record clears it. A commit without a
+    /// Destroying record leaves it untouched.
+    #[test]
+    fn destroying_record_commits_survives_reopen_and_clears() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        assert!(log.destroying().is_none());
+        log.commit_membership(MembershipCommit {
+            manifest: b"m1".to_vec(),
+            held: vec![([1u8; 32], true)],
+            pending_changes: Vec::new(),
+            leaving: None,
+            destroying: Some(b"destroy-refs".to_vec()),
+            drop_sync_outbox: false,
+            outbox: Vec::new(),
+        })
+        .expect("commit");
+        drop(log);
+        let s2 = Store::open(dir.path(), "ns").expect("open2");
+        let mut log2 = PersistentLog::new(s2);
+        assert_eq!(
+            log2.destroying().as_deref(),
+            Some(b"destroy-refs".as_slice())
+        );
+        // Untouched by a commit that does not mention it.
+        log2.commit_membership(MembershipCommit {
+            manifest: b"m2".to_vec(),
+            held: vec![([2u8; 32], true)],
+            pending_changes: Vec::new(),
+            leaving: None,
+            destroying: None,
+            drop_sync_outbox: false,
+            outbox: Vec::new(),
+        })
+        .expect("commit2");
+        assert_eq!(
+            log2.destroying().as_deref(),
+            Some(b"destroy-refs".as_slice())
+        );
+        // An empty record clears it (same convention as Leaving).
+        log2.commit_membership(MembershipCommit {
+            manifest: b"m3".to_vec(),
+            held: vec![([3u8; 32], true)],
+            pending_changes: Vec::new(),
+            leaving: None,
+            destroying: Some(Vec::new()),
+            drop_sync_outbox: false,
+            outbox: Vec::new(),
+        })
+        .expect("commit3");
+        assert_eq!(
+            log2.destroying().as_deref(),
+            Some(b"".as_slice()),
+            "clear is stored as an empty record; the session decodes empty as absent"
+        );
+    }
+
+    /// ADR-0029: every installed manifest's member signing keys enter the
+    /// Destroy authority set inside the commit — derived from the manifest,
+    /// never passed by the caller, and durable across reopens. A stranger's
+    /// key is not authority.
+    #[test]
+    fn held_signers_recorded_from_installed_manifest() {
+        use crate::manifest::{new_group_id, ManifestMember};
+        fn member_of(kp: &DeviceKeypair) -> ManifestMember {
+            ManifestMember {
+                noise_pub: kp.public_key(),
+                signing_pub: kp.signing_public_key(),
+                name: "m".to_string(),
+            }
+        }
+        let dir = tmp_dir();
+        let alice = DeviceKeypair::generate();
+        let bob = DeviceKeypair::generate();
+        let manifest = GroupManifest::new(
+            new_group_id(),
+            1,
+            vec![member_of(&alice), member_of(&bob)],
+            &alice.signing,
+        );
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.commit_membership(MembershipCommit {
+            manifest: manifest.encode(),
+            held: vec![(manifest.hash(), true)],
+            pending_changes: Vec::new(),
+            leaving: None,
+            destroying: None,
+            drop_sync_outbox: false,
+            outbox: Vec::new(),
+        })
+        .expect("commit");
+        drop(log);
+        let s2 = Store::open(dir.path(), "ns").expect("open2");
+        let log2 = PersistentLog::new(s2);
+        assert!(log2.is_held_signer(&alice.signing_public_key().0));
+        assert!(log2.is_held_signer(&bob.signing_public_key().0));
+        assert!(!log2.is_held_signer(&[9u8; 32]));
+        // Garbage manifest bytes record no signers (fail closed).
+        let s3 = Store::open(dir.path(), "other").expect("open3");
+        let mut log3 = PersistentLog::new(s3);
+        log3.commit_membership(MembershipCommit {
+            manifest: b"not-a-manifest".to_vec(),
+            held: vec![],
+            pending_changes: Vec::new(),
+            leaving: None,
+            destroying: None,
+            drop_sync_outbox: false,
+            outbox: Vec::new(),
+        })
+        .expect("commit garbage");
+        assert!(!log3.is_held_signer(&[1u8; 32]));
+    }
+
+    /// ADR-0029: entering Destroying drops pending (undelivered) Sync sends
+    /// inside the same transaction. Delivered rows and control entries
+    /// survive — the Revokes themselves are control entries.
+    #[test]
+    fn drop_sync_outbox_drops_only_undelivered_sync() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.append_entry(LogEntry {
+            object_id: oid(1),
+            sequence: 1,
+            kind: OutboxKind::Sync,
+            created_at: now_secs(),
+            blob: b"sync-pending".to_vec(),
+        });
+        log.append_entry(LogEntry {
+            object_id: oid(1),
+            sequence: 2,
+            kind: OutboxKind::Sync,
+            created_at: now_secs(),
+            blob: b"sync-delivered".to_vec(),
+        });
+        log.mark_delivered(&oid(1), 2);
+        log.commit_membership(MembershipCommit {
+            manifest: b"m1".to_vec(),
+            held: vec![([1u8; 32], true)],
+            pending_changes: Vec::new(),
+            leaving: None,
+            destroying: Some(b"refs".to_vec()),
+            drop_sync_outbox: true,
+            outbox: vec![(oid(2), 3, b"revoke".to_vec())],
+        })
+        .expect("commit");
+        let remaining = log.undelivered_entries();
+        assert_eq!(remaining.len(), 1, "only the queued Revoke survives");
+        assert_eq!(remaining[0].kind, OutboxKind::Control);
+        assert_eq!(remaining[0].object_id, oid(2));
+    }
+
+    /// wipe_group_state clears the ADR-0029 tables too — after a Destroy
+    /// Group nothing from the old group survives, including its authority
+    /// set (a wiped device must not honour a stale Revoke).
+    #[test]
+    fn wipe_group_state_clears_destroying_and_held_signers() {
+        let dir = tmp_dir();
+        use crate::manifest::{new_group_id, ManifestMember};
+        let alice = DeviceKeypair::generate();
+        let manifest = GroupManifest::new(
+            new_group_id(),
+            1,
+            vec![ManifestMember {
+                noise_pub: alice.public_key(),
+                signing_pub: alice.signing_public_key(),
+                name: "a".to_string(),
+            }],
+            &alice.signing,
+        );
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.commit_membership(MembershipCommit {
+            manifest: manifest.encode(),
+            held: vec![(manifest.hash(), true)],
+            pending_changes: Vec::new(),
+            leaving: None,
+            destroying: Some(b"refs".to_vec()),
+            drop_sync_outbox: false,
+            outbox: Vec::new(),
+        })
+        .expect("commit");
+        log.wipe_group_state();
+        assert!(log.destroying().is_none());
+        assert!(!log.is_held_signer(&alice.signing_public_key().0));
     }
 
     /// wipe_group_state clears everything the log owns — outbox, dedup,
@@ -1779,6 +2044,8 @@ mod tests {
             held: vec![([1u8; 32], true)],
             pending_changes: b"changes".to_vec(),
             leaving: Some(b"refs".to_vec()),
+            destroying: None,
+            drop_sync_outbox: false,
             outbox: vec![(oid(2), 4, b"ctrl".to_vec())],
         })
         .expect("commit");
@@ -2101,6 +2368,8 @@ mod versioning_tests {
             held: vec![(genesis.hash(), true), (child.hash(), true)],
             pending_changes: vec![],
             leaving: None,
+            destroying: None,
+            drop_sync_outbox: false,
             outbox: vec![],
         });
         (kp, genesis, child)

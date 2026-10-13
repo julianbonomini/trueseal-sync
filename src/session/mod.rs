@@ -895,6 +895,8 @@ pub(super) fn build_subscribe_handler(
                     held: vec![(incoming.hash(), true)],
                     pending_changes: Vec::new(),
                     leaving: None,
+                    destroying: None,
+                    drop_sync_outbox: false,
                     outbox: Vec::new(),
                 };
                 if op_log
@@ -1026,6 +1028,8 @@ pub(super) fn build_subscribe_handler(
                     held: vec![(incoming.hash(), false)],
                     pending_changes: Vec::new(),
                     leaving: None,
+                    destroying: None,
+                    drop_sync_outbox: false,
                     outbox: Vec::new(),
                 };
                 if op_log
@@ -1231,6 +1235,8 @@ pub(super) fn build_subscribe_handler(
                 },
                 pending_changes: PendingChange::encode_set(&new_changes),
                 leaving: leaving_update.clone(),
+                destroying: None,
+                drop_sync_outbox: false,
                 outbox: reapplied_outbox,
             };
             if op_log
@@ -2632,6 +2638,8 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 held: vec![(carrier, true)],
                 pending_changes: PendingChange::encode_set(&change_set),
                 leaving: None,
+                destroying: None,
+                drop_sync_outbox: false,
                 outbox,
             })
             .map_err(SessionError::Store)?;
@@ -2815,6 +2823,8 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 held: vec![(carrier, true)],
                 pending_changes: PendingChange::encode_set(&change_set),
                 leaving: None,
+                destroying: None,
+                drop_sync_outbox: false,
                 outbox,
             })
             .map_err(SessionError::Store)?;
@@ -2917,6 +2927,8 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 held: vec![(carrier, false)],
                 pending_changes: PendingChange::encode_set(&change_set),
                 leaving: Some(record.encode()),
+                destroying: None,
+                drop_sync_outbox: false,
                 outbox: refs,
             })
             .map_err(SessionError::Store)?;
@@ -2979,6 +2991,8 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 held: vec![(m.hash(), includes_self)],
                 pending_changes: pending,
                 leaving: None,
+                destroying: None,
+                drop_sync_outbox: false,
                 outbox: Vec::new(),
             });
         }

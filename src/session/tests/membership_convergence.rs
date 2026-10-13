@@ -1042,6 +1042,8 @@ fn leave_completes_at_construction_when_refs_drained_pre_crash() {
             held: vec![(leave_manifest.hash(), false)],
             pending_changes: Vec::new(),
             leaving: Some(record.encode()),
+            destroying: None,
+            drop_sync_outbox: false,
             outbox: Vec::new(),
         })
         .expect("stage leave");

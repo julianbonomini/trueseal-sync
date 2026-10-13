@@ -55,8 +55,18 @@ pub struct MembershipCommit {
     pub pending_changes: Vec<u8>,
     /// `Some(record)` sets/replaces the Leaving record (entering Leaving or
     /// updating its outbox refs on a re-applied Leave); `None` leaves it
-    /// untouched.
+    /// untouched. An empty record clears it (a deliberately superseded
+    /// Leave, or a Leave abandoned for Destroy Group).
     pub leaving: Option<Vec<u8>>,
+    /// `Some(record)` sets/replaces the Destroying record (entering
+    /// Destroying, on `destroyGroup()` or on receiving a valid Revoke);
+    /// `None` leaves it untouched. An empty record clears it — only the
+    /// wipe clears it in practice (ADR-0029).
+    pub destroying: Option<Vec<u8>>,
+    /// Drop every undelivered `Sync` outbox entry inside the transaction
+    /// (ADR-0029: entering Destroying drops pending `Sync` sends without
+    /// reporting them, as removal does).
+    pub drop_sync_outbox: bool,
     /// Control-plane outbox entries carrying the manifest to members:
     /// `(recipient noise_pub, sequence, encoded Message)`.
     pub outbox: Vec<([u8; 32], u64, Vec<u8>)>,
@@ -204,6 +214,14 @@ pub trait OperationLog: Send {
     /// Fallible like `begin_pending_join`: the caller must not update
     /// in-memory state on error.
     fn commit_membership(&mut self, commit: MembershipCommit) -> Result<(), String>;
+    /// The Destroy authority set (ADR-0029): every member signing key of
+    /// every manifest this device has installed. Derived inside
+    /// `commit_membership` from the installed manifest, so no call site can
+    /// forget it; a manifest that fails to decode records no signers.
+    ///
+    /// The Destroying record, drop-Sync rule and the Leaving record share
+    /// the commit's atomicity: entering Destroying, queueing the Revokes
+    /// and dropping pending `Sync` sends are one durable unit.
     /// The persisted Pending Membership Change set (opaque encoding), if
     /// any. Loaded at construction so pending changes survive restarts and
     /// an offline issuer re-applies after reconnecting.
@@ -216,6 +234,17 @@ pub trait OperationLog: Send {
     /// Leave waits on), if any. Loaded at construction so a crash during
     /// Leaving resumes Leaving (ADR-0027).
     fn leaving(&self) -> Option<Vec<u8>>;
+    /// The persisted Destroying record (opaque encoding of the outbox refs
+    /// the Destroy waits on), if any. Loaded at construction so a crash
+    /// during Destroying resumes Destroying (ADR-0029).
+    fn destroying(&self) -> Option<Vec<u8>>;
+    /// Did `signing_pub` appear in any Group Manifest this device has held
+    /// for the group, current or past? The Destroy authority rule
+    /// (ADR-0029): a Revoke is honoured from any past or present member, so
+    /// a thief who removed the owner first cannot block Destroy.
+    /// Implementations must record every installed manifest's members
+    /// inside `commit_membership`.
+    fn is_held_signer(&self, signing_pub: &[u8; 32]) -> bool;
     /// Wipe all group state this log owns: outbox, dedup table, sequence
     /// high-water mark, Pending Join, Pending Membership Changes,
     /// held-manifest history and the Leaving record. Identity and manifest
@@ -224,6 +253,16 @@ pub trait OperationLog: Send {
     /// (ADR-0027): the device starts over with a fresh identity, so nothing
     /// from the old group may carry over.
     fn wipe_group_state(&mut self);
+}
+
+/// The signing keys of an installed manifest's members (ADR-0029 Destroy
+/// authority). Empty when the bytes don't decode — callers always install
+/// valid manifests; a corrupt record simply records no signers.
+pub(crate) fn manifest_signers(manifest: &[u8]) -> Vec<[u8; 32]> {
+    match crate::manifest::GroupManifest::decode(manifest) {
+        Ok(m) => m.members.iter().map(|mm| mm.signing_pub.0).collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// A single entry in the log.
@@ -248,8 +287,12 @@ pub struct MemLog {
     pending_changes: Vec<u8>,
     /// Held-manifest history: hash → included_self (ADR-0027).
     held: BTreeMap<[u8; 32], bool>,
+    /// Signing keys of every member of every held manifest (ADR-0029).
+    held_signers: std::collections::HashSet<[u8; 32]>,
     /// The Leaving record (ADR-0027).
     leaving: Option<Vec<u8>>,
+    /// The Destroying record (ADR-0029).
+    destroying: Option<Vec<u8>>,
 }
 
 impl MemLog {
@@ -261,7 +304,9 @@ impl MemLog {
             pending_join: None,
             pending_changes: Vec::new(),
             held: BTreeMap::new(),
+            held_signers: std::collections::HashSet::new(),
             leaving: None,
+            destroying: None,
         }
     }
 }
@@ -395,10 +440,12 @@ impl OperationLog for MemLog {
 
     fn commit_membership(&mut self, commit: MembershipCommit) -> Result<(), String> {
         let MembershipCommit {
-            manifest: _,
+            manifest,
             held,
             pending_changes,
             leaving,
+            destroying,
+            drop_sync_outbox,
             outbox,
         } = commit;
         // MemLog owns no manifest row (persistence is the Store's job);
@@ -406,9 +453,23 @@ impl OperationLog for MemLog {
         for (hash, included_self) in held {
             self.held.insert(hash, included_self);
         }
+        for signer in manifest_signers(&manifest) {
+            self.held_signers.insert(signer);
+        }
         self.pending_changes = pending_changes;
         if let Some(record) = leaving {
             self.leaving = Some(record);
+        }
+        if let Some(record) = destroying {
+            self.destroying = Some(record);
+        }
+        if drop_sync_outbox {
+            // ADR-0029: entering Destroying drops pending Sync sends
+            // without reporting them, as removal does.
+            self.inner.retain(|_, per_oid| {
+                per_oid.retain(|_, e| e.delivered || e.kind != OutboxKind::Sync);
+                !per_oid.is_empty()
+            });
         }
         for (object_id, sequence, blob) in outbox {
             self.append_control(&object_id, sequence, blob);
@@ -432,6 +493,14 @@ impl OperationLog for MemLog {
         self.leaving.clone()
     }
 
+    fn destroying(&self) -> Option<Vec<u8>> {
+        self.destroying.clone()
+    }
+
+    fn is_held_signer(&self, signing_pub: &[u8; 32]) -> bool {
+        self.held_signers.contains(signing_pub)
+    }
+
     fn wipe_group_state(&mut self) {
         self.inner.clear();
         self.high_water = None;
@@ -439,7 +508,9 @@ impl OperationLog for MemLog {
         self.pending_join = None;
         self.pending_changes = Vec::new();
         self.held.clear();
+        self.held_signers.clear();
         self.leaving = None;
+        self.destroying = None;
     }
 }
 
