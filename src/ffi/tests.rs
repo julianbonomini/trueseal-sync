@@ -86,33 +86,67 @@ impl TcpRelay {
 
         let client_frames = Arc::new(Mutex::new(Vec::<(u8, Vec<u8>)>::new()));
         let accepts = Arc::new(AtomicUsize::new(0));
-        // Delivered-but-unacked envelopes, in delivery order. Re-sent on
-        // every new Receive Session; removed when a DeliverAck arrives.
-        let unacked: Arc<Mutex<Vec<(u64, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
-        let current: Arc<Mutex<Option<Arc<trueseal_noise::session_xx::Session<TcpStream>>>>> =
-            Arc::new(Mutex::new(None));
+        // All sends are driven by ONE writer thread over a shared state:
+        // every Blob is tracked as unacked until its DeliverAck, and the
+        // writer (re)sends unacked Blobs whenever a new Receive Session is
+        // accepted (a generation bump) or a new Blob arrives. The accept
+        // thread only publishes + signals, so no delivery can fall between
+        // "accepted" and "published" (the resend-before-publish race).
+        struct Shared {
+            current: Option<(u64, Arc<trueseal_noise::session_xx::Session<TcpStream>>)>,
+            generation: u64,
+            unacked: Vec<(u64, Vec<u8>)>,
+            sent_on: std::collections::HashMap<u64, u64>,
+        }
+        let shared = Arc::new(Mutex::new(Shared {
+            current: None,
+            generation: 0,
+            unacked: Vec::new(),
+            sent_on: std::collections::HashMap::new(),
+        }));
+        let changed = Arc::new(Condvar::new());
         let (deliver_tx, deliver_rx) = mpsc::channel::<(u64, Vec<u8>)>();
 
-        // Writer: new deliveries go to the current session (if any) and
-        // into the unacked list either way.
+        // Incoming deliveries queue as unacked and wake the writer.
         {
-            let current = current.clone();
-            let unacked = unacked.clone();
+            let shared = shared.clone();
+            let changed = changed.clone();
             std::thread::spawn(move || {
-                for (blob_id, env_bytes) in deliver_rx {
-                    unacked.lock().unwrap().push((blob_id, env_bytes.clone()));
-                    let sess = current.lock().unwrap().clone();
-                    if let Some(sess) = sess {
-                        let mut body = blob_id.to_be_bytes().to_vec();
-                        body.extend_from_slice(&env_bytes);
-                        let _ = sess.send(&frame(MsgType::Deliver, &body));
+                for delivery in deliver_rx {
+                    shared.lock().unwrap().unacked.push(delivery);
+                    changed.notify_all();
+                }
+            });
+        }
+        // Writer: the only sender.
+        {
+            let shared = shared.clone();
+            let changed = changed.clone();
+            std::thread::spawn(move || loop {
+                let st = shared.lock().unwrap();
+                let (mut st, _) = changed.wait_timeout(st, Duration::from_millis(50)).unwrap();
+                let Some((gen, sess)) = st.current.clone() else {
+                    continue;
+                };
+                let due: Vec<(u64, Vec<u8>)> = st
+                    .unacked
+                    .iter()
+                    .filter(|(id, _)| st.sent_on.get(id) != Some(&gen))
+                    .cloned()
+                    .collect();
+                for (blob_id, env_bytes) in due {
+                    let mut body = blob_id.to_be_bytes().to_vec();
+                    body.extend_from_slice(&env_bytes);
+                    if sess.send(&frame(MsgType::Deliver, &body)).is_ok() {
+                        st.sent_on.insert(blob_id, gen);
+                    } else {
+                        break; // session dying; the EOF handler clears it
                     }
                 }
             });
         }
 
-        // Accept loop: a fresh XX accept per connection; on each new
-        // session, re-deliver everything unacked (relay redelivery).
+        // Accept loop: publish the new session and signal the writer.
         {
             let relay_kp =
                 trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
@@ -136,22 +170,18 @@ impl TcpRelay {
                         Err(_) => continue,
                     };
                     let session = Arc::new(session);
-                    accepts.fetch_add(1, Ordering::SeqCst);
-                    // Re-deliver unacked blobs on the new session.
-                    let pending: Vec<(u64, Vec<u8>)> = unacked.lock().unwrap().clone();
-                    for (blob_id, env_bytes) in pending {
-                        let mut body = blob_id.to_be_bytes().to_vec();
-                        body.extend_from_slice(&env_bytes);
-                        if session.send(&frame(MsgType::Deliver, &body)).is_err() {
-                            break;
-                        }
+                    {
+                        let mut st = shared.lock().unwrap();
+                        st.generation += 1;
+                        st.current = Some((st.generation, session.clone()));
                     }
-                    *current.lock().unwrap() = Some(session.clone());
+                    accepts.fetch_add(1, Ordering::SeqCst);
+                    changed.notify_all();
                     // Read frames until the link dies; DeliverAcks retire
-                    // the blob.
+                    // the Blob.
                     let client_frames = client_frames.clone();
-                    let unacked = unacked.clone();
-                    let current = current.clone();
+                    let shared = shared.clone();
+                    let changed = changed.clone();
                     let session_for_read = session.clone();
                     std::thread::spawn(move || {
                         while let Ok(raw) = session_for_read.receive() {
@@ -159,19 +189,25 @@ impl TcpRelay {
                                 if t == MsgType::DeliverAck {
                                     if let Ok(id) = <[u8; 8]>::try_from(body) {
                                         let id = u64::from_be_bytes(id);
-                                        unacked.lock().unwrap().retain(|(bid, _)| *bid != id);
+                                        let mut st = shared.lock().unwrap();
+                                        st.unacked.retain(|(bid, _)| *bid != id);
                                     }
                                 }
                                 client_frames.lock().unwrap().push((t as u8, body.to_vec()));
                             }
                         }
-                        // The link died: stop pointing new deliveries at it.
-                        let mut cur = current.lock().unwrap();
-                        if let Some(c) = cur.as_ref() {
-                            if Arc::ptr_eq(c, &session) {
-                                *cur = None;
-                            }
+                        // The link died: stop pointing sends at it.
+                        let mut st = shared.lock().unwrap();
+                        let is_current = st
+                            .current
+                            .as_ref()
+                            .map(|(_, c)| Arc::ptr_eq(c, &session))
+                            .unwrap_or(false);
+                        if is_current {
+                            st.current = None;
                         }
+                        drop(st);
+                        changed.notify_all();
                     });
                 }
             });

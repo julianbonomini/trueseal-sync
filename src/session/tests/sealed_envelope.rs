@@ -509,15 +509,78 @@ fn replayed_revoke_after_destroy_does_nothing() {
         deliver_tx: std::sync::mpsc::Sender<(u64, Vec<u8>)>,
     }
     impl RebindRelay {
+        /// A rebind-capable relay whose sends are all driven by ONE writer
+        /// thread: every Blob is tracked as unacked until its DeliverAck,
+        /// and the writer (re)sends unacked Blobs whenever a new Receive
+        /// Session is accepted (a generation bump) or a new Blob arrives.
+        /// No delivery can fall between "accept" and "publish" — the
+        /// accept thread only publishes and signals; the writer sends.
         fn spawn(pipes: Vec<MemPipe>, relay_kp: &Keypair) -> Self {
+            struct Shared {
+                current: Option<(u64, Arc<trueseal_noise::session_xx::Session<MemPipe>>)>,
+                generation: u64,
+                unacked: Vec<(u64, Vec<u8>)>,
+                sent_on: std::collections::HashMap<u64, u64>,
+            }
+            let shared = Arc::new(Mutex::new(Shared {
+                current: None,
+                generation: 0,
+                unacked: Vec::new(),
+                sent_on: std::collections::HashMap::new(),
+            }));
+            let changed = Arc::new(std::sync::Condvar::new());
             let frames = Arc::new(Mutex::new(Vec::<(u8, Vec<u8>)>::new()));
             let accepts = Arc::new(AtomicUsize::new(0));
-            let current: Arc<Mutex<Option<Arc<trueseal_noise::session_xx::Session<MemPipe>>>>> =
-                Arc::new(Mutex::new(None));
             let (deliver_tx, deliver_rx) = std::sync::mpsc::channel::<(u64, Vec<u8>)>();
+
+            // Incoming deliveries queue as unacked and wake the writer.
             {
+                let shared = shared.clone();
+                let changed = changed.clone();
+                std::thread::spawn(move || {
+                    for delivery in deliver_rx {
+                        let mut st = shared.lock().unwrap();
+                        st.unacked.push(delivery);
+                        changed.notify_all();
+                    }
+                });
+            }
+            // Writer: the only sender.
+            {
+                let shared = shared.clone();
+                let changed = changed.clone();
+                std::thread::spawn(move || loop {
+                    let mut st = shared.lock().unwrap();
+                    let (guard, _) = changed
+                        .wait_timeout(st, std::time::Duration::from_millis(50))
+                        .unwrap();
+                    st = guard;
+                    let Some((gen, sess)) = st.current.clone() else {
+                        continue;
+                    };
+                    let due: Vec<(u64, Vec<u8>)> = st
+                        .unacked
+                        .iter()
+                        .filter(|(id, _)| st.sent_on.get(id) != Some(&gen))
+                        .cloned()
+                        .collect();
+                    for (blob_id, env_bytes) in due {
+                        let mut body = blob_id.to_be_bytes().to_vec();
+                        body.extend_from_slice(&env_bytes);
+                        if sess.send(&frame(MsgType::Deliver, &body)).is_ok() {
+                            st.sent_on.insert(blob_id, gen);
+                        } else {
+                            break; // session dying; the EOF handler clears it
+                        }
+                    }
+                });
+            }
+
+            // Accept loop: publish the new session and signal the writer.
+            {
+                let shared = shared.clone();
+                let changed = changed.clone();
                 let frames = frames.clone();
-                let current = current.clone();
                 let accepts = accepts.clone();
                 let relay_priv = relay_kp.private();
                 let relay_pub = relay_kp.public_key;
@@ -529,35 +592,49 @@ fn replayed_revoke_after_destroy_does_nothing() {
                             Err(_) => return,
                         };
                         let sess = Arc::new(sess);
-                        *current.lock().unwrap() = Some(sess.clone());
+                        {
+                            let mut st = shared.lock().unwrap();
+                            st.generation += 1;
+                            st.current = Some((st.generation, sess.clone()));
+                        }
                         accepts.fetch_add(1, Ordering::SeqCst);
-                        // Record the client's frames until this link dies —
-                        // close() severs it, and the accept loop then takes
-                        // the rebind.
+                        changed.notify_all();
+                        // Read frames until the link dies; DeliverAcks
+                        // retire the Blob.
                         let frames = frames.clone();
+                        let shared = shared.clone();
+                        let changed = changed.clone();
                         let recv = sess.clone();
                         std::thread::spawn(move || {
                             while let Ok(raw) = recv.receive() {
                                 if let Some((t, body)) = parse(&raw) {
+                                    if t == MsgType::DeliverAck {
+                                        if let Ok(id) = <[u8; 8]>::try_from(body) {
+                                            let id = u64::from_be_bytes(id);
+                                            let mut st = shared.lock().unwrap();
+                                            st.unacked.retain(|(bid, _)| *bid != id);
+                                        }
+                                    }
                                     frames.lock().unwrap().push((t as u8, body.to_vec()));
                                 }
                             }
+                            // The link died: stop pointing sends at it.
+                            let mut st = shared.lock().unwrap();
+                            if st
+                                .current
+                                .as_ref()
+                                .map(|(_, c)| Arc::ptr_eq(c, &sess))
+                                .unwrap_or(false)
+                            {
+                                st.current = None;
+                            }
+                            drop(st);
+                            changed.notify_all();
                         });
                     }
                 });
             }
-            {
-                let current = current.clone();
-                std::thread::spawn(move || {
-                    for (blob_id, env_bytes) in deliver_rx {
-                        let sess = current.lock().unwrap().clone();
-                        let Some(sess) = sess else { continue };
-                        let mut body = blob_id.to_be_bytes().to_vec();
-                        body.extend_from_slice(&env_bytes);
-                        let _ = sess.send(&frame(MsgType::Deliver, &body));
-                    }
-                });
-            }
+
             RebindRelay {
                 frames,
                 accepts,
