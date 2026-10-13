@@ -44,3 +44,6 @@ jobs:
 
       - name: cargo test
         run: cargo test --all-features
+
+      - name: connection-factory guard (SYNC-17)
+        run: bash scripts/check-connection-factory.sh

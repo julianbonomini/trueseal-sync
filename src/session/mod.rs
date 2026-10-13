@@ -3598,28 +3598,21 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
 // ── TCP convenience constructor ───────────────────────────────────────────────
 
 impl TruesealSession<TcpStream> {
+    /// Thin convenience over the connection factory (SYNC-17): both sockets
+    /// are opened by [`crate::connection::ConnectionFactory::open`], the only
+    /// socket-open in production code (non-blocking, so the Transport Version
+    /// exchange's deadline is effective and a blocking receive can't starve
+    /// concurrent sends).
     pub fn connect_tcp(
         addr: &str,
         relay_pub: NoisePublicKey,
         keypair: DeviceKeypair,
         on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
     ) -> Result<Self, SessionError> {
-        // Non-blocking on both the receive stream and every push stream, so
-        // the Transport Version exchange's deadline is effective (a silent
-        // pre-version relay surfaces as a typed timeout, not a hang) and a
-        // blocking receive can't starve concurrent sends. This matches the
-        // FFI and CLI factories.
-        let stream =
-            TcpStream::connect(addr).map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
-        stream
-            .set_nonblocking(true)
-            .map_err(|e| SessionError::ConnectionFailed(e.to_string()))?;
+        let stream = crate::connection::ConnectionFactory::open(addr)
+            .map_err(SessionError::ConnectionFailed)?;
         let addr = addr.to_string();
-        let push_factory = move || {
-            let s = TcpStream::connect(&addr).map_err(|e| e.to_string())?;
-            s.set_nonblocking(true).map_err(|e| e.to_string())?;
-            Ok(s)
-        };
+        let push_factory = move || crate::connection::ConnectionFactory::open(&addr);
         Self::connect(stream, relay_pub, keypair, on_message, push_factory)
     }
 }

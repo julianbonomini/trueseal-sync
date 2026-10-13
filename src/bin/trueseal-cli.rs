@@ -215,12 +215,15 @@ fn main() {
         // the lock is released, and send() can proceed.
         move || {
             eprintln!("[debug] receive: connecting to {}", recv_addr);
-            let s = TcpStream::connect(&recv_addr).map_err(|e| {
-                eprintln!("[debug] receive: tcp connect failed: {}", e);
-                e.to_string()
-            })?;
+            // SYNC-17: sockets open only through the connection factory; the
+            // CLI decorates the factory's stream with SlowStream (dev-only
+            // partial-read injection) without opening sockets of its own.
+            let s =
+                trueseal_sync::connection::ConnectionFactory::open(&recv_addr).map_err(|e| {
+                    eprintln!("[debug] receive: tcp connect failed: {}", e);
+                    e
+                })?;
             eprintln!("[debug] receive: tcp connected, starting XX handshake");
-            s.set_nonblocking(true).map_err(|e| e.to_string())?;
             let cap = slow_cap().unwrap_or(usize::MAX);
             if cap != usize::MAX {
                 eprintln!("[debug] receive: SLOW_READ cap={}", cap);
@@ -237,12 +240,12 @@ fn main() {
         // would also work here, but non-blocking is consistent and harmless.
         move || {
             eprintln!("[debug] push: connecting to {}", push_addr_cb);
-            let s = TcpStream::connect(&push_addr_cb).map_err(|e| {
-                eprintln!("[debug] push: tcp connect failed: {}", e);
-                e.to_string()
-            })?;
+            let s =
+                trueseal_sync::connection::ConnectionFactory::open(&push_addr_cb).map_err(|e| {
+                    eprintln!("[debug] push: tcp connect failed: {}", e);
+                    e
+                })?;
             eprintln!("[debug] push: tcp connected");
-            s.set_nonblocking(true).map_err(|e| e.to_string())?;
             let cap = slow_cap().unwrap_or(usize::MAX);
             Ok(SlowStream {
                 inner: s,

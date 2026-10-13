@@ -1065,21 +1065,11 @@ impl TrueSeal {
             }
         };
 
-        let receive_addr = address.receive_addr();
-        let push_addr = address.push_addr();
-        let receive_factory = {
-            let receive_addr = receive_addr.clone();
-            move || {
-                let s = TcpStream::connect(&receive_addr).map_err(|e| e.to_string())?;
-                s.set_nonblocking(true).map_err(|e| e.to_string())?;
-                Ok(s)
-            }
-        };
-        let push_factory = move || {
-            let s = TcpStream::connect(&push_addr).map_err(|e| e.to_string())?;
-            s.set_nonblocking(true).map_err(|e| e.to_string())?;
-            Ok(s)
-        };
+        // SYNC-17 (#109): sockets are opened only by the connection factory,
+        // so a future IP-hiding transport (roadmap#26) is one local change.
+        let (receive_factory, push_factory) =
+            crate::connection::ConnectionFactory::new(address.receive_addr(), address.push_addr())
+                .into_factories();
 
         let on_connection_changed = {
             let events = events.clone();
