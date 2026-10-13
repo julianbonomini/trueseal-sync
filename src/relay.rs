@@ -2386,16 +2386,15 @@ mod tests {
         let _client =
             connect_with_timeouts(client_pipe, relay_pub, &device, test_timeouts(40, 5_000));
 
-        let beat_count = |frames: &std::sync::Arc<
-            std::sync::Mutex<Vec<(MsgType, std::time::Instant)>>,
-        >| {
-            frames
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(t, _)| *t == MsgType::Heartbeat)
-                .count()
-        };
+        let beat_count =
+            |frames: &std::sync::Arc<std::sync::Mutex<Vec<(MsgType, std::time::Instant)>>>| {
+                frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(t, _)| *t == MsgType::Heartbeat)
+                    .count()
+            };
         // Lower bound WITHOUT a fixed sleep (SYNC-19 flake sweep): wait for
         // the first beats however long startup takes on a loaded runner.
         assert!(
