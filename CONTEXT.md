@@ -137,7 +137,7 @@ The subset of the Operation Log whose entries have not yet been confirmed delive
 _Avoid_: queue, buffer, pending messages
 
 **Delivery Issue**:
-A device-local, typed report that the library could not deliver or handle a message: an incoming Blob it could not read or authorise, a Blob held for a newer End-to-End Version, a handler that kept failing, or an outgoing message it gave up sending. A rejected incoming Blob is reported as `unreadable` with a reason: `malformed`, `senderOutdated`, `expired` or `droppedWhileHeld` (ADR-0034). Carries a Message ID where one exists. Never sent to the other Device or the Relay. Observing Delivery Issues is optional; the library already does the right thing.
+A device-local, typed report that the library could not deliver or handle a message: an incoming Blob it could not read or authorise, a Blob held for a newer End-to-End Version, a handler that kept failing, or an outgoing message it gave up sending. A rejected incoming Blob is reported as `unreadable` with a reason: `malformed`, `senderOutdated`, `expired` or `droppedWhileHeld` (ADR-0034). Carries a Message ID where one exists. Never sent to the other Device or the Relay. Observing Delivery Issues is optional; the library already does the right thing. Documented limitation: the Relay can mint arbitrary well-formed manifests (addressed encryption is sealable by anyone holding a Device's noise public key), so manifest-rejection reports are relay-floodable on manifestless and Pending Join devices — the reports are advisory and the manifest is still rejected (ADR-0023).
 _Avoid_: error, failure event, dead letter
 
 **Namespace**:
