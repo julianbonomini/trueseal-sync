@@ -1341,3 +1341,58 @@ fn new_window_spends_the_old_secret() {
     wait_for(|| relay.deliver_acks() == vec![1], Duration::from_secs(3));
     assert_eq!(requests.load(Ordering::SeqCst), 0);
 }
+
+/// Two concurrent accepts must not both succeed (B8 review F1): the window
+/// check and the consume happen under one lock, so exactly one caller
+/// observes the open window and the other gets `false` — no divergent
+/// genesis manifests.
+#[test]
+fn two_concurrent_accepts_exactly_one_succeeds() {
+    let relay_kp = make_relay_kp();
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let _relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+
+    let device = DeviceKeypair::generate();
+    let session = Arc::new(
+        TruesealSession::<MemPipe>::connect_full(
+            pipe_client,
+            relay_pub(&relay_kp),
+            device,
+            |_, _, _| {},
+            Box::new(MemLog::new()),
+            || {},
+            |_| {},
+            || {},
+            || Err("push factory unused".into()),
+        )
+        .expect("session"),
+    );
+    let _token = session.pairing_token(); // window open
+
+    let joiner_a = SigningKeypair::generate();
+    let joiner_b = SigningKeypair::generate();
+
+    let mut handles = Vec::new();
+    for joiner in [joiner_a, joiner_b] {
+        let session = session.clone();
+        let noise = NoisePublicKey(rand::random());
+        let signing = SigningPublicKey(joiner.public_key_bytes());
+        handles.push(std::thread::spawn(move || session.accept_pair(noise, signing)));
+    }
+    let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    assert_eq!(
+        results.iter().filter(|&&ok| ok).count(),
+        1,
+        "concurrent accepts must yield exactly one admission, got {results:?}"
+    );
+    // The winner issued a well-formed genesis (self + one member) — the
+    // loser did not interleave a second, divergent manifest.
+    let members = session.members();
+    assert_eq!(
+        members.len(),
+        1,
+        "exactly one remote member was admitted, got {}",
+        members.len()
+    );
+}
