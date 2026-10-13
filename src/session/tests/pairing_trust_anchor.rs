@@ -468,59 +468,72 @@ fn pair_with_wrong_secret_is_rejected() {
 #[test]
 fn pair_replaying_spent_secret_is_rejected() {
     let relay_kp = make_relay_kp();
-    let relay_pub = relay_pub(&relay_kp);
-    let (pa_c, pa_r) = mem_pipe_pair();
-    let (pb_c, pb_r) = mem_pipe_pair();
-    let (pm_c, pm_r) = mem_pipe_pair();
-    let (nk_rx, nk) = nk_push_channel();
-    spawn_tripartite_relay(&relay_kp, pa_r, pb_r, pm_r, nk_rx);
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
 
-    let device_a = DeviceKeypair::generate();
-    let device_b = DeviceKeypair::generate();
-    let device_m = DeviceKeypair::generate();
-    let m_noise = device_m.public_key();
-    let m_signing = device_m.signing_public_key();
+    let device = DeviceKeypair::generate();
+    let joiner_b = SigningKeypair::generate();
+    let attacker_m = SigningKeypair::generate();
 
-    let session_a =
-        TruesealSession::connect(pa_c, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("A");
-    let session_b =
-        TruesealSession::connect(pb_c, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("B");
-    let session_m =
-        TruesealSession::connect(pm_c, relay_pub, device_m, |_, _, _| {}, nk.factory()).expect("M");
-
+    let session = TruesealSession::<MemPipe>::connect_full(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        |_, _, _| {},
+        Box::new(MemLog::new()),
+        || {},
+        |_| {},
+        || {},
+        || Err("push factory unused".into()),
+    )
+    .expect("session");
     let requests = Arc::new(AtomicUsize::new(0));
     let rq = requests.clone();
     let first: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let f = first.clone();
-    session_a.set_on_member_request(move |t, _| {
+    session.set_on_member_request(move |t, _| {
         rq.fetch_add(1, Ordering::SeqCst);
         *f.lock().unwrap() = Some(t);
     });
+    let device_pub = session.noise_pub();
 
-    // B joins and is admitted — the secret is spent.
-    let token = session_a.pairing_token();
+    // B proves the secret and is admitted — the single-use window is spent.
+    let token = session.pairing_token();
     let (_, _, secret, _) = crate::message::decode_pairing_token(&token).expect("token");
-    session_b.join_group(&token).expect("join");
+    relay.deliver(
+        1,
+        &Message::Pair {
+            noise_pub: [0xB1; 32],
+            signing_pub: joiner_b.public_key_bytes(),
+            secret,
+        },
+        device_pub,
+        &joiner_b,
+        1,
+    );
     wait_for(|| first.lock().unwrap().is_some(), Duration::from_secs(5));
     let t = first.lock().unwrap().clone().unwrap();
-    assert!(session_a.accept_member(&t));
+    assert!(session.accept_member(&t));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 
     // M eavesdropped nothing — but suppose it somehow holds the spent
     // secret (e.g. a photographed token used too late). The replay dies.
-    session_m
-        .push_message(
-            &Message::Pair {
-                noise_pub: m_noise.0,
-                signing_pub: m_signing.0,
-                secret,
-            },
-            session_a.noise_pub(),
-        )
-        .expect("push queues");
+    relay.deliver(
+        2,
+        &Message::Pair {
+            noise_pub: [0x77; 32],
+            signing_pub: attacker_m.public_key_bytes(),
+            secret,
+        },
+        device_pub,
+        &attacker_m,
+        1,
+    );
 
-    // Let the pump deliver; then assert no second request.
-    std::thread::sleep(Duration::from_millis(800));
+    // Deterministic negative assertion (B8 review F4): wait until the
+    // replayed Pair was delivered AND acked — i.e. the handler ran — then
+    // assert it raised nothing.
+    wait_for(|| relay.deliver_acks() == vec![1, 2], Duration::from_secs(3));
     assert_eq!(
         requests.load(Ordering::SeqCst),
         1,
