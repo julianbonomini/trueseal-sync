@@ -52,18 +52,24 @@ jobs:
         run: bash scripts/check-changelog-entry.sh "${{ inputs.version }}"
 
       # Idempotent candidate rebuilds: a re-run replaces the draft for the
-      # same version. Only drafts are deleted — a published release is never
-      # touched here.
-      - name: Replace any existing draft for this version
+      # same version. A PUBLISHED release is never touched — staging a new
+      # candidate under a live version would mutate bytes users can install,
+      # so that is a hard failure (cut the next patch instead, ADR-0002).
+      - name: Replace any existing draft; refuse to touch a published release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="v${{ inputs.version }}"
-          if gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null | grep -q true; then
-            gh release delete "$TAG" --yes
-            echo "replaced existing draft $TAG"
+          if gh release view "$TAG" --json isDraft --jq .isDraft > /tmp/existing-draft 2>/dev/null; then
+            if grep -q true /tmp/existing-draft; then
+              gh release delete "$TAG" --yes
+              echo "replaced existing draft $TAG"
+            else
+              echo "FAIL: $TAG is already PUBLISHED — a candidate cannot replace live bytes; cut the next patch version" >&2
+              exit 1
+            fi
           else
-            echo "no existing draft for $TAG"
+            echo "no existing release for $TAG"
           fi
 
       - name: Create the empty draft release at the candidate commit
