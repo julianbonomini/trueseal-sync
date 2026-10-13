@@ -666,6 +666,7 @@ fn control_entry_never_expires() {
     let pair = Message::Pair {
         noise_pub: [1u8; 32],
         signing_pub: [2u8; 32],
+        secret: [3u8; 32],
     };
     session
         .op_log

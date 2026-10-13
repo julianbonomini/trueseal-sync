@@ -234,6 +234,7 @@ fn pair_outside_window_does_not_fire_callback() {
     let _fake_token = crate::message::pairing_token(
         &fake_initiator.public_key().0,
         &fake_initiator.signing_public_key().0,
+        &[7u8; 32],
     );
     // B tries to join using the fake token — the Pair goes to fake_initiator, not A.
     // This won't fire A's callback. Instead, construct a scenario where B sends to A

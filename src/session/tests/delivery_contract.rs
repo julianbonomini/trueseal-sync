@@ -665,7 +665,8 @@ fn member_request_arriving_before_registration_flushes_on_registration() {
         || Err("push factory unused".into()),
     )
     .expect("session");
-    let _token = session.pairing_token(); // open the window
+    let token = session.pairing_token(); // open the window
+    let (_, _, secret, _) = crate::message::decode_pairing_token(&token).expect("token decodes");
 
     // The Pair arrives BEFORE any member-request handler is registered.
     relay.deliver(
@@ -673,6 +674,7 @@ fn member_request_arriving_before_registration_flushes_on_registration() {
         &Message::Pair {
             noise_pub: joiner_noise,
             signing_pub: joiner_signing,
+            secret,
         },
         device_pub,
         &joiner_kp,

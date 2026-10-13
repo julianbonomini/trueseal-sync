@@ -27,10 +27,14 @@ const TAG_GROUP_MANIFEST: u8 = 0x04;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
     /// A Device requesting to join a Sync Group.
-    /// Body: the sender's noise public key + signing public key.
+    /// Body: the sender's noise public key + signing public key + the
+    /// Pairing Secret from the Pairing Token it was given out-of-band
+    /// (ADR-0023). The secret lives inside the addressed encryption, so
+    /// the Relay never sees it and cannot raise a Join Request of its own.
     Pair {
         noise_pub: [u8; 32],
         signing_pub: [u8; 32],
+        secret: [u8; 32],
     },
     /// An opaque application blob — clipboard entry, secret, or any caller data.
     /// trueseal-sync delivers the body verbatim; the caller interprets it.
@@ -48,10 +52,12 @@ impl Message {
             Message::Pair {
                 noise_pub,
                 signing_pub,
+                secret,
             } => {
                 let mut out = vec![TAG_PAIR];
                 out.extend_from_slice(noise_pub);
                 out.extend_from_slice(signing_pub);
+                out.extend_from_slice(secret);
                 out
             }
             Message::Sync { body } => {
@@ -75,18 +81,25 @@ impl Message {
         }
         match bytes[0] {
             TAG_PAIR => {
-                if bytes.len() < 1 + 32 + 32 {
+                // Exact length: tag + noise + signing + secret (ADR-0023).
+                // A pre-SYNC-3 Pair (65 bytes, no secret) fails here and is
+                // dropped as malformed — the clean break of ADR-0022.
+                if bytes.len() != 1 + 32 + 32 + 32 {
                     return Err(MessageError::InvalidPairingPayload);
                 }
                 let noise_pub = bytes[1..33]
                     .try_into()
-                    .expect("invariant: bytes.len() >= 65 checked above");
+                    .expect("invariant: bytes.len() == 97 checked above");
                 let signing_pub = bytes[33..65]
                     .try_into()
-                    .expect("invariant: bytes.len() >= 65 checked above");
+                    .expect("invariant: bytes.len() == 97 checked above");
+                let secret = bytes[65..97]
+                    .try_into()
+                    .expect("invariant: bytes.len() == 97 checked above");
                 Ok(Message::Pair {
                     noise_pub,
                     signing_pub,
+                    secret,
                 })
             }
             TAG_SYNC => Ok(Message::Sync {
@@ -153,33 +166,51 @@ pub fn device_name(signing_pub: &[u8; 32]) -> String {
     name
 }
 
+/// Pairing Token format version. The token is a local, out-of-band value
+/// (never on the wire), but a stale token must fail cleanly rather than
+/// decode into garbage, so the raw bytes carry a version byte (ADR-0023).
+/// Version 1 was `noise || signing || name` with no secret; it is refused.
+pub const PAIRING_TOKEN_VERSION: u8 = 2;
+
 /// Encode a pairing token as a base64url string.
-/// Format: `base64url(noise_pub[32] || signing_pub[32] || name_utf8_bytes)`
-pub fn pairing_token(noise_pub: &[u8; 32], signing_pub: &[u8; 32]) -> String {
+/// Format: `base64url(version[1]=2 || noise_pub[32] || signing_pub[32] || secret[32] || name_utf8_bytes)`
+///
+/// The `secret` is the single-use Pairing Secret (ADR-0023): only a party
+/// that saw this token out-of-band can produce a `Pair` the initiator
+/// accepts. The token dies when the Pairing Window closes.
+pub fn pairing_token(noise_pub: &[u8; 32], signing_pub: &[u8; 32], secret: &[u8; 32]) -> String {
     let name = device_name(signing_pub);
-    let mut raw = Vec::with_capacity(64 + name.len());
+    let mut raw = Vec::with_capacity(1 + 96 + name.len());
+    raw.push(PAIRING_TOKEN_VERSION);
     raw.extend_from_slice(noise_pub);
     raw.extend_from_slice(signing_pub);
+    raw.extend_from_slice(secret);
     raw.extend_from_slice(name.as_bytes());
     base64url_encode(&raw)
 }
 
 /// Decode a pairing token produced by `pairing_token`.
-/// Returns `(noise_pub, signing_pub, name)`.
-pub fn decode_pairing_token(token: &str) -> Result<([u8; 32], [u8; 32], String), MessageError> {
+/// Returns `(noise_pub, signing_pub, secret, name)`. A token in the
+/// pre-SYNC-3 format (no version byte, no secret) is refused.
+pub fn decode_pairing_token(
+    token: &str,
+) -> Result<([u8; 32], [u8; 32], [u8; 32], String), MessageError> {
     let raw = base64url_decode(token).ok_or(MessageError::InvalidPairingPayload)?;
-    if raw.len() < 64 {
+    if raw.len() < 1 + 96 || raw[0] != PAIRING_TOKEN_VERSION {
         return Err(MessageError::InvalidPairingPayload);
     }
-    let noise_pub: [u8; 32] = raw[0..32]
+    let noise_pub: [u8; 32] = raw[1..33]
         .try_into()
-        .expect("invariant: raw.len() >= 64 checked above");
-    let signing_pub: [u8; 32] = raw[32..64]
+        .expect("invariant: raw.len() >= 97 checked above");
+    let signing_pub: [u8; 32] = raw[33..65]
         .try_into()
-        .expect("invariant: raw.len() >= 64 checked above");
+        .expect("invariant: raw.len() >= 97 checked above");
+    let secret: [u8; 32] = raw[65..97]
+        .try_into()
+        .expect("invariant: raw.len() >= 97 checked above");
     let name =
-        String::from_utf8(raw[64..].to_vec()).map_err(|_| MessageError::InvalidPairingPayload)?;
-    Ok((noise_pub, signing_pub, name))
+        String::from_utf8(raw[97..].to_vec()).map_err(|_| MessageError::InvalidPairingPayload)?;
+    Ok((noise_pub, signing_pub, secret, name))
 }
 
 // ── base64url helpers (no external crate) ─────────────────────────────────────
@@ -276,15 +307,46 @@ mod tests {
         assert_eq!(decoded, msg);
     }
 
-    /// A Pair message round-trips with both public keys intact.
+    /// A Pair message round-trips with both public keys and the Pairing
+    /// Secret intact (ADR-0023).
     #[test]
     fn pair_message_round_trips() {
         let msg = Message::Pair {
             noise_pub: [1u8; 32],
             signing_pub: [2u8; 32],
+            secret: [9u8; 32],
         };
         let decoded = Message::decode(&msg.encode()).expect("should decode");
         assert_eq!(decoded, msg);
+    }
+
+    /// A pre-SYNC-3 Pair (no secret, 65 bytes) is refused — the clean break
+    /// of ADR-0022 makes the unversioned pairing wire format unreadable.
+    #[test]
+    fn pair_message_without_secret_is_refused() {
+        let mut bytes = vec![0x01u8];
+        bytes.extend_from_slice(&[1u8; 32]);
+        bytes.extend_from_slice(&[2u8; 32]);
+        assert!(matches!(
+            Message::decode(&bytes),
+            Err(MessageError::InvalidPairingPayload)
+        ));
+    }
+
+    /// A Pair with trailing garbage is refused (exact length).
+    #[test]
+    fn pair_message_with_trailing_bytes_is_refused() {
+        let msg = Message::Pair {
+            noise_pub: [1u8; 32],
+            signing_pub: [2u8; 32],
+            secret: [9u8; 32],
+        };
+        let mut bytes = msg.encode();
+        bytes.push(0u8);
+        assert!(matches!(
+            Message::decode(&bytes),
+            Err(MessageError::InvalidPairingPayload)
+        ));
     }
 
     /// A Revoke message round-trips.
@@ -367,20 +429,51 @@ mod tests {
         assert_eq!(s, signing_pub);
     }
 
-    /// pairing_token encodes and decodes recovering noise_pub, signing_pub, and name.
+    /// pairing_token encodes and decodes recovering noise_pub, signing_pub,
+    /// the Pairing Secret and the name (ADR-0023).
     #[test]
     fn pairing_token_encodes_and_decodes() {
         let noise_pub = [5u8; 32];
         let signing_pub = [6u8; 32];
-        let token = pairing_token(&noise_pub, &signing_pub);
-        // token must be a non-empty string
+        let secret = [42u8; 32];
+        let token = pairing_token(&noise_pub, &signing_pub, &secret);
         assert!(!token.is_empty());
-        let (n, s, name) = decode_pairing_token(&token).expect("should decode");
+        let (n, s, sec, name) = decode_pairing_token(&token).expect("should decode");
         assert_eq!(n, noise_pub);
         assert_eq!(s, signing_pub);
-        // name is deterministic from signing_pub
+        assert_eq!(sec, secret, "the secret must survive the token round-trip");
         assert!(!name.is_empty());
         assert_eq!(name, device_name(&signing_pub));
+    }
+
+    /// A pre-SYNC-3 token (no version byte, no secret) is refused, so a
+    /// stale QR code fails as InvalidToken instead of pairing into garbage.
+    #[test]
+    fn pairing_token_v1_format_is_refused() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&[5u8; 32]);
+        raw.extend_from_slice(&[6u8; 32]);
+        raw.extend_from_slice(b"ab12cd34");
+        let v1 = base64url_encode(&raw);
+        assert!(matches!(
+            decode_pairing_token(&v1),
+            Err(MessageError::InvalidPairingPayload)
+        ));
+    }
+
+    /// A token with an unknown version byte is refused.
+    #[test]
+    fn pairing_token_unknown_version_is_refused() {
+        let mut raw = vec![0x7Fu8];
+        raw.extend_from_slice(&[5u8; 32]);
+        raw.extend_from_slice(&[6u8; 32]);
+        raw.extend_from_slice(&[42u8; 32]);
+        raw.extend_from_slice(b"ab12cd34");
+        let tok = base64url_encode(&raw);
+        assert!(matches!(
+            decode_pairing_token(&tok),
+            Err(MessageError::InvalidPairingPayload)
+        ));
     }
 
     #[test]

@@ -503,6 +503,7 @@ fn every_message_type_fits_one_frame_at_the_limit() {
     let pair = framed_len(Message::Pair {
         noise_pub: sender.public_key().0,
         signing_pub: sender.signing_public_key().0,
+        secret: [0u8; 32],
     });
     assert!(pair <= NOISE_FRAME_PLAINTEXT_MAX, "Pair must fit one frame");
 

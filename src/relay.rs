@@ -1010,6 +1010,7 @@ mod tests {
         let pair_msg = Message::Pair {
             noise_pub: device_b.public_key().0,
             signing_pub: device_b.signing_public_key().0,
+            secret: [0u8; 32],
         };
         client_b
             .push(
@@ -1038,6 +1039,7 @@ mod tests {
             Message::Pair {
                 noise_pub: device_b.public_key().0,
                 signing_pub: device_b.signing_public_key().0,
+                secret: [0u8; 32],
             },
             "A should receive B's Pair message with B's public keys"
         );

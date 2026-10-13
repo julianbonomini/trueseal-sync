@@ -376,6 +376,7 @@ pub(super) fn build_subscribe_handler(
         if let Message::Pair {
             noise_pub,
             signing_pub,
+            secret: _secret, // secret check lands in the next SYNC-3 increment
         } = &msg
         {
             // SYNC-4 (#96): the Pair body's signing_pub must equal the key
@@ -665,12 +666,13 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Called by the joining device after scanning a QR code or receiving the token.
     /// Returns `SessionError::InvalidToken` if the token cannot be decoded.
     pub fn join_group(&self, token: &str) -> Result<(), SessionError> {
-        let (initiator_noise, _initiator_signing, _initiator_name) =
+        let (initiator_noise, _initiator_signing, secret, _initiator_name) =
             crate::message::decode_pairing_token(token).map_err(|_| SessionError::InvalidToken)?;
         let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         let msg = Message::Pair {
             noise_pub: ks.noise_pub.0,
             signing_pub: ks.signing_pub.0,
+            secret,
         };
         drop(ks);
         self.push_message(&msg, NoisePublicKey(initiator_noise))
@@ -1233,8 +1235,9 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// The token is single-use and expires when the window closes.
     pub fn pairing_token(&self) -> String {
         *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = Some(PairingWindow);
+        let secret: [u8; 32] = rand::random();
         let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-        crate::message::pairing_token(&ks.noise_pub.0, &ks.signing_pub.0)
+        crate::message::pairing_token(&ks.noise_pub.0, &ks.signing_pub.0, &secret)
     }
 
     pub fn cancel_pairing(&self) {
