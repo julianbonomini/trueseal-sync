@@ -48,13 +48,13 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
 ) {
     let mut backoff = cap.min(Duration::from_secs(1));
     let mut was_connected = false; // track last-known state to detect transitions
-    // ADR-0029: a Destroying device STAYS connected (its Revokes must reach
-    // the Relay) — the loop no longer exits on Destroy Group. In fact it
-    // has no exit condition at all: the thread runs until the process
-    // ends, keeping post-destroy connectivity so the device can pair again
-    // with its fresh identity (the same pump/reconnect threads also outlive
-    // Leave and Soft Removal wipes for the same reason). A formal shutdown
-    // signal (join on close()) is SYNC-15 (#107) scope.
+                                   // ADR-0029: a Destroying device STAYS connected (its Revokes must reach
+                                   // the Relay) — the loop no longer exits on Destroy Group. In fact it
+                                   // has no exit condition at all: the thread runs until the process
+                                   // ends, keeping post-destroy connectivity so the device can pair again
+                                   // with its fresh identity (the same pump/reconnect threads also outlive
+                                   // Leave and Soft Removal wipes for the same reason). A formal shutdown
+                                   // signal (join on close()) is SYNC-15 (#107) scope.
     loop {
         std::thread::sleep(Duration::from_millis(50));
         let connected = client
