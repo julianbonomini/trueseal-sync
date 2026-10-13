@@ -23,7 +23,13 @@ fn destroy_group_completes_after_relay_accepts_revokes() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
+            // Hold the XX session OPEN for the relay's life: dropping it
+            // EOFs the client's receive loop, and the pump only sends while
+            // connected — under slow CI the disconnect could win the race
+            // against the Revoke push and the Destroy would never complete.
+            let Ok(_sess) = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp) else {
+                return;
+            };
             while let Ok(p) = nk_rx.recv() {
                 let kp2 =
                     trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
@@ -177,7 +183,13 @@ fn push_sync_after_destroy_returns_group_destroyed() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
+            // Hold the XX session OPEN for the relay's life: dropping it
+            // EOFs the client's receive loop, and the pump only sends while
+            // connected — under slow CI the disconnect could win the race
+            // against the Revoke push and the Destroy would never complete.
+            let Ok(_sess) = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp) else {
+                return;
+            };
             while let Ok(p) = nk_rx.recv() {
                 let kp2 =
                     trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
@@ -283,7 +295,13 @@ fn destroy_completion_wipes_store_and_persists_fresh_identity() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
+            // Hold the XX session OPEN for the relay's life: dropping it
+            // EOFs the client's receive loop, and the pump only sends while
+            // connected — under slow CI the disconnect could win the race
+            // against the Revoke push and the Destroy would never complete.
+            let Ok(_sess) = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp) else {
+                return;
+            };
             while let Ok(p) = nk_rx.recv() {
                 let kp2 =
                     trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
