@@ -95,6 +95,17 @@ struct RecipientBackoff {
     next_attempt: Instant,
 }
 
+/// Exponential backoff for a recipient after `failures` consecutive
+/// temporary failures: `retry_base * 2^(failures-1)`, saturating, capped at
+/// `retry_cap` (ADR-0026: 1 s doubling up to a 5-minute cap).
+pub(super) fn backoff_delay(config: &SenderConfig, failures: u32) -> Duration {
+    let shift = failures.saturating_sub(1).min(20);
+    config
+        .retry_base
+        .saturating_mul(1u32 << shift)
+        .min(config.retry_cap)
+}
+
 /// Spawn the sender pump. Runs until the group is destroyed AND the outbox
 /// has drained (a Destroy Group queues its Revokes first; the pump's last
 /// job is to push them while connected — the durable Destroying state that
@@ -273,47 +284,54 @@ fn sender_loop<T: Read + Write + Send + 'static>(
                             .remove(&entry.object_id, entry.sequence);
                         backoffs.remove(&recipient);
                     }
-                    Err(e @ (RelayError::PushRejected | RelayError::EnvelopeTooLarge)) => {
-                        // Permanent refusal: delete the entry and report.
-                        let reason = match e {
-                            RelayError::PushRejected => SendFailedReason::Malformed,
-                            RelayError::EnvelopeTooLarge => SendFailedReason::TooLarge,
-                            _ => unreachable!("matched above"),
+                    Err(e) => {
+                        // Classify the refusal: permanent (the relay's Error
+                        // frame; an Envelope that cannot fit one Noise
+                        // frame) deletes the entry and reports; anything
+                        // else is temporary.
+                        let permanent = match e {
+                            RelayError::PushRejected => Some(SendFailedReason::Malformed),
+                            RelayError::EnvelopeTooLarge => Some(SendFailedReason::TooLarge),
+                            _ => None,
                         };
-                        op_log
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .remove(&entry.object_id, entry.sequence);
-                        issue_sink.lock().unwrap_or_else(|e| e.into_inner()).fire(
-                            DeliveryIssue::SendFailed {
-                                message_id: message_id(&local_signing_pub, entry.sequence),
-                                reason,
-                            },
-                        );
-                        // A permanent refusal says nothing about the
-                        // connection — the next entry may still succeed.
-                    }
-                    Err(_) => {
-                        // Temporary failure (network, handshake, an
-                        // unsupported Transport Version — a whole-connection
-                        // condition, not a per-entry one): back to Queued.
-                        // Back off this recipient and stop at the head of
-                        // its line: no later entry overtakes this one.
-                        let failures =
-                            backoffs.get(&recipient).map(|b| b.failures).unwrap_or(0) + 1;
-                        let shift = failures.saturating_sub(1).min(20);
-                        let delay = config
-                            .retry_base
-                            .saturating_mul(1u32 << shift)
-                            .min(config.retry_cap);
-                        backoffs.insert(
-                            recipient,
-                            RecipientBackoff {
-                                failures,
-                                next_attempt: Instant::now() + delay,
-                            },
-                        );
-                        break;
+                        match permanent {
+                            Some(reason) => {
+                                // Permanent refusal: delete the entry and
+                                // report.
+                                op_log
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .remove(&entry.object_id, entry.sequence);
+                                issue_sink.lock().unwrap_or_else(|e| e.into_inner()).fire(
+                                    DeliveryIssue::SendFailed {
+                                        message_id: message_id(&local_signing_pub, entry.sequence),
+                                        reason,
+                                    },
+                                );
+                                // A permanent refusal says nothing about the
+                                // connection — the next entry may still
+                                // succeed.
+                            }
+                            None => {
+                                // Temporary failure (network, handshake, an
+                                // unsupported Transport Version — a
+                                // whole-connection condition, not a
+                                // per-entry one): back to Queued. Back off
+                                // this recipient and stop at the head of its
+                                // line: no later entry overtakes this one.
+                                let failures =
+                                    backoffs.get(&recipient).map(|b| b.failures).unwrap_or(0) + 1;
+                                let delay = backoff_delay(&config, failures);
+                                backoffs.insert(
+                                    recipient,
+                                    RecipientBackoff {
+                                        failures,
+                                        next_attempt: Instant::now() + delay,
+                                    },
+                                );
+                                break;
+                            }
+                        }
                     }
                 }
             }

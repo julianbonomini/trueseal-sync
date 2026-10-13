@@ -391,6 +391,91 @@ fn dedup_record_survives_restart_and_prevents_rehandling() {
     );
 }
 
+/// The mirror of `dedup_record_survives_restart_and_prevents_rehandling`:
+/// the ONE sanctioned double-handle (ADR-0026 step 5). A Blob whose handler
+/// ran but whose dedup record never committed before the "crash" MUST be
+/// re-handled on redelivery — the contract is at-least-once to the handler,
+/// and the first handling's effects may have died with the process. Modeled
+/// as a restart over durable state that lacks the record (a fresh log).
+#[test]
+fn crash_before_dedup_commit_rehandles_on_redelivery() {
+    let relay_kp = make_relay_kp();
+    let device = DeviceKeypair::generate();
+    let sender = SigningKeypair::generate();
+    let msg = Message::Sync {
+        body: b"handled, then crash before the dedup commit".to_vec(),
+    };
+    let device_pub = device.public_key();
+
+    // First "process": the handler runs and the Blob is acked — then the
+    // process dies BEFORE the dedup record reaches durable storage (the
+    // in-memory log drops with the session: the commit never happened).
+    {
+        let (pipe_client, pipe_relay) = mem_pipe_pair();
+        let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+        let handled: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+        let handled_cb = handled.clone();
+        let device1 = DeviceKeypair::from_bytes(device.noise.private(), device.signing.to_bytes())
+            .expect("keypair bytes");
+        let _session = TruesealSession::<MemPipe>::connect_full(
+            pipe_client,
+            relay_pub(&relay_kp),
+            device1,
+            move |m, _a, _s| {
+                if matches!(m, Message::Sync { .. }) {
+                    handled_cb.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+            Box::new(MemLog::new()),
+            || {},
+            |_| {},
+            || {},
+            || Err("push factory unused".into()),
+        )
+        .expect("session");
+        relay.deliver(1, &msg, device_pub, &sender, 11);
+        wait_for(|| relay.deliver_acks() == vec![1], Duration::from_secs(3));
+        assert_eq!(
+            handled.load(Ordering::SeqCst),
+            1,
+            "handler ran before the crash"
+        );
+        // Session AND its log drop here — the "crash" before the dedup
+        // record committed.
+    }
+
+    // Second "process": durable state has NO dedup record for this Message
+    // ID. The relay re-delivers (new blob id, same Envelope). The library
+    // must NOT suppress it: the handler runs again.
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    let handled: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let handled_cb = handled.clone();
+    let _session = TruesealSession::<MemPipe>::connect_full(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        move |m, _a, _s| {
+            if matches!(m, Message::Sync { .. }) {
+                handled_cb.fetch_add(1, Ordering::SeqCst);
+            }
+        },
+        Box::new(MemLog::new()),
+        || {},
+        |_| {},
+        || {},
+        || Err("push factory unused".into()),
+    )
+    .expect("session");
+    relay.deliver(2, &msg, device_pub, &sender, 11);
+    wait_for(|| relay.deliver_acks() == vec![2], Duration::from_secs(3));
+    assert_eq!(
+        handled.load(Ordering::SeqCst),
+        1,
+        "no committed dedup record → the redelivery is re-handled (the one sanctioned duplicate)"
+    );
+}
+
 /// A replayed or superseded Group Manifest is BENIGN STALE (ADR-0034 §2):
 /// acked and dropped with no Delivery Issue and no duplicate member events.
 /// Relay re-deliveries and hostile-relay replays land here.
