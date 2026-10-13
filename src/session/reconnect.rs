@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -13,7 +13,8 @@ use crate::operation_log::OperationLog;
 use crate::relay::RelayClient;
 
 use super::{
-    EventSink, IssueSink, KeyState, LeavingRecord, PendingChange, PendingJoin, PendingMember,
+    DestroyingRecord, EventSink, IssueSink, KeyState, LeavingRecord, PendingChange, PendingJoin,
+    PendingMember,
 };
 
 /// Polls for relay disconnect, backs off, reconnects, and replays the outbox.
@@ -28,8 +29,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static + Clone,
     on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static>,
     on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static>,
-    on_group_destroyed: Arc<dyn Fn() + Send + Sync + 'static>,
-    destroyed: Arc<AtomicBool>,
+    destroying: Arc<Mutex<Option<DestroyingRecord>>>,
     pairing: Arc<Mutex<Option<super::PairingWindow>>>,
     pending_members: Arc<Mutex<HashMap<String, PendingMember>>>,
     on_member_request: Arc<Mutex<EventSink>>,
@@ -48,12 +48,11 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
 ) {
     let mut backoff = cap.min(Duration::from_secs(1));
     let mut was_connected = false; // track last-known state to detect transitions
+                                   // ADR-0029: a Destroying device STAYS connected (its Revokes must reach
+                                   // the Relay) — the loop no longer exits on Destroy Group; it ends when
+                                   // the session is dropped.
     loop {
         std::thread::sleep(Duration::from_millis(50));
-        // Exit the reconnect loop if the group has been destroyed.
-        if destroyed.load(Ordering::Acquire) {
-            break;
-        }
         let connected = client
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -97,8 +96,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             pending_join.clone(),
             on_removed_from_group.clone(),
             on_manifest_changed.clone(),
-            on_group_destroyed.clone(),
-            destroyed.clone(),
+            destroying.clone(),
             pairing.clone(),
             pending_members.clone(),
             on_member_request.clone(),

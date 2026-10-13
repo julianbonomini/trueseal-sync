@@ -156,7 +156,7 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
         );
     }
 
-    session_a.destroy_group();
+    session_a.destroy_group().expect("destroy");
 
     // Wait until B's on_group_destroyed fires (structural, not sleep-based).
     {
@@ -245,7 +245,7 @@ fn destroy_group_fires_on_group_destroyed_for_all_members() {
         b_noise, b_signing, &b_sk, a_noise, a_signing,
     ));
 
-    session_a.destroy_group();
+    session_a.destroy_group().expect("destroy");
     wait_for(|| *a_destroyed.lock().unwrap() >= 1, Duration::from_secs(5));
     wait_for(|| *b_destroyed.lock().unwrap() >= 1, Duration::from_secs(5));
 
@@ -374,8 +374,10 @@ fn revoke_from_unknown_device_is_ignored() {
 }
 
 /// destroy_group() with no manifest fires on_group_destroyed and sets terminal state.
+/// ADR-0029 state table: destroyGroup() in `notJoined` is a typed error,
+/// fires nothing and changes no state.
 #[test]
-fn destroy_group_with_no_manifest_fires_callback_and_is_terminal() {
+fn destroy_group_with_no_manifest_is_a_typed_error() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
@@ -406,19 +408,20 @@ fn destroy_group_with_no_manifest_fires_callback_and_is_terminal() {
     .expect("connect");
 
     assert!(session.manifest.lock().unwrap().is_none());
-    session.destroy_group();
-
+    let result = session.destroy_group();
+    assert!(
+        matches!(result, Err(SessionError::NotInGroup)),
+        "destroy_group without a group is NotInGroup, got: {result:?}"
+    );
     assert_eq!(
         *destroyed.lock().unwrap(),
-        1,
-        "on_group_destroyed should fire"
+        0,
+        "on_group_destroyed must not fire"
     );
-    // Session is terminal.
-    assert!(
-        matches!(
-            session.push_sync(b"test".to_vec()),
-            Err(SessionError::GroupDestroyed)
-        ),
-        "session terminal after destroy_group"
+    // Nothing changed: the device is still just not in a group.
+    assert_eq!(
+        session.group_status(),
+        super::super::GroupStatus::NotJoined,
+        "state unchanged"
     );
 }
