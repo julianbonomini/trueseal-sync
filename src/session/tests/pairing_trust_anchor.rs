@@ -1435,9 +1435,6 @@ impl OperationLog for FailingJoinLog {
     fn append_entry(&mut self, entry: crate::operation_log::LogEntry) {
         self.inner.append_entry(entry);
     }
-    fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64) {
-        self.inner.mark_delivered(object_id, sequence);
-    }
     fn remove(&mut self, object_id: &[u8; 32], sequence: u64) {
         self.inner.remove(object_id, sequence);
     }

@@ -38,6 +38,12 @@ async-trait = "0.1"
 futures = "0.3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 
+# iOS/macOS backup exclusion (SYNC-14): the NSURLIsExcludedFromBackupKey
+# resource value is persisted as a filesystem xattr; writing it directly
+# keeps the core free of an Objective-C dependency.
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 
