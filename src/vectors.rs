@@ -119,6 +119,11 @@ struct Vectors {
     msg_sync: Vec<u8>,
     msg_revoke: Vec<u8>,
     msg_manifest: Vec<u8>,
+    /// The pre-SYNC-3 65-byte Pair body (no Pairing Secret) — must NOT
+    /// decode (ADR-0022 clean break, ADR-0023).
+    pair_without_secret: Vec<u8>,
+    /// A frame with an unknown MsgType — must NOT parse (ADR-0034 §3).
+    unknown_frame: Vec<u8>,
 
     // Manifests
     genesis: GroupManifest,
@@ -174,6 +179,13 @@ fn build() -> Vectors {
     }
     .encode();
     let msg_revoke = Message::Revoke.encode();
+    // The refused pre-SYNC-3 Pair: tag || noise_pub || signing_pub, no
+    // secret (65 bytes total).
+    let mut pair_without_secret = vec![0x01u8];
+    pair_without_secret.extend_from_slice(&member2_noise_pub.0);
+    pair_without_secret.extend_from_slice(&member2_signing_pub);
+    // An unknown MsgType (0x7F), zero-length body.
+    let unknown_frame = vec![0x7Fu8, 0, 0, 0, 0];
 
     // Manifests: genesis (no parent) and an update naming genesis as parent
     // (ADR-0027 — the parent field + hash the vectors must cover).
@@ -275,6 +287,8 @@ fn build() -> Vectors {
         msg_sync,
         msg_revoke,
         msg_manifest,
+        pair_without_secret,
+        unknown_frame,
         genesis,
         update,
         sealed_prefix,
@@ -429,6 +443,16 @@ fn verify(v: &Vectors) {
         Message::decode(&[0x7F]),
         Err(message::MessageError::UnknownType(0x7F))
     ));
+    // Message: a pre-SYNC-3 Pair (no secret) must NOT decode — the clean
+    // break of ADR-0022 makes the unversioned pairing format unreadable.
+    assert_eq!(v.pair_without_secret.len(), 65);
+    assert!(matches!(
+        Message::decode(&v.pair_without_secret),
+        Err(message::MessageError::InvalidPairingPayload)
+    ));
+    // Frame: an unknown MsgType does not parse (→ malformed, ADR-0034 §3;
+    // with no blob id there is nothing to ack).
+    assert!(relay::parse(&v.unknown_frame).is_none());
 
     // The Message ID is the stable tsm1_ derivation.
     assert_eq!(v.message_id, message::message_id(&v.author_signing_pub, 7));
@@ -945,6 +969,25 @@ fn to_json(v: &Vectors) -> String {
                     ),
                 ]),
                 J::O(vec![
+                    ("layer", s("frame")),
+                    ("case", s("unknownFrameType")),
+                    ("input", J::O(vec![("frameHex", s(hex(&v.unknown_frame)))])),
+                    (
+                        "expect",
+                        J::O(vec![
+                            ("kind", s("deliveryIssue")),
+                            ("name", s("unreadable")),
+                            ("reason", s("malformed")),
+                            ("acked", J::B(false)),
+                            (
+                                "detail",
+                                s("an unknown MsgType does not parse; with no blob id there \
+                                   is nothing to ack (ADR-0034 §3)"),
+                            ),
+                        ]),
+                    ),
+                ]),
+                J::O(vec![
                     ("layer", s("envelope")),
                     ("case", s("badSignature")),
                     (
@@ -1089,6 +1132,33 @@ fn to_json(v: &Vectors) -> String {
                             ("name", s("unreadable")),
                             ("reason", s("malformed")),
                             ("acked", J::B(true)),
+                        ]),
+                    ),
+                ]),
+                J::O(vec![
+                    ("layer", s("message")),
+                    ("case", s("pairMissingSecret")),
+                    (
+                        "input",
+                        J::O(vec![
+                            ("messageHex", s(hex(&v.pair_without_secret))),
+                            (
+                                "detail",
+                                s("the pre-SYNC-3 65-byte Pair body (tag || noise_pub || \
+                                   signing_pub, no Pairing Secret) — the clean break of \
+                                   ADR-0022 makes the unversioned pairing format unreadable \
+                                   (ADR-0023)"),
+                            ),
+                        ]),
+                    ),
+                    (
+                        "expect",
+                        J::O(vec![
+                            ("kind", s("deliveryIssue")),
+                            ("name", s("unreadable")),
+                            ("reason", s("malformed")),
+                            ("acked", J::B(true)),
+                            ("reachesHandler", J::B(false)),
                         ]),
                     ),
                 ]),
