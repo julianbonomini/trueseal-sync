@@ -23,6 +23,8 @@ pub mod session;
 pub mod store;
 #[doc(hidden)]
 pub mod surface;
+#[cfg(test)]
+mod vectors;
 pub mod version;
 
 pub use keys::{NoisePublicKey, SigningPublicKey};
