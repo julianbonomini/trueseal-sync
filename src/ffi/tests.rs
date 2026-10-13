@@ -182,14 +182,15 @@ fn open_test_session(dir: &tempfile::TempDir, relay_addr: &str, namespace: &str)
     .expect("open")
 }
 
-/// Build the two-member genesis manifest {device, sender} and persist it to
-/// the namespace's store, so the next open() seeds it (SYNC-7).
+/// Build the two-member genesis manifest {device, sender} and commit it
+/// the way a real accept does (manifest + held history, atomically —
+/// ADR-0027), so the next open() seeds it (SYNC-7). Returns the manifest.
 fn persist_membership(
     dir: &tempfile::TempDir,
     namespace: &str,
     device: &DeviceKeypair,
     sender: &crate::envelope::SigningKeypair,
-) {
+) -> crate::manifest::GroupManifest {
     let self_sp = device.signing_public_key();
     let sender_sp = crate::keys::SigningPublicKey(sender.public_key_bytes());
     let manifest = crate::manifest::GroupManifest::new(
@@ -209,10 +210,23 @@ fn persist_membership(
         ],
         &ed25519_dalek::SigningKey::from_bytes(&device.signing.to_bytes()),
     );
-    crate::store::Store::open(dir.path(), namespace)
-        .expect("store")
-        .save_group_manifest(&manifest)
-        .expect("save manifest");
+    let mut log = crate::store::PersistentLog::new(
+        crate::store::Store::open(dir.path(), namespace).expect("store"),
+    );
+    crate::operation_log::OperationLog::commit_membership(
+        &mut log,
+        crate::operation_log::MembershipCommit {
+            manifest: manifest.encode(),
+            held: vec![(manifest.hash(), true)],
+            pending_changes: Vec::new(),
+            leaving: None,
+            destroying: None,
+            drop_sync_outbox: false,
+            outbox: Vec::new(),
+        },
+    )
+    .expect("commit membership");
+    manifest
 }
 
 fn load_identity(dir: &tempfile::TempDir, namespace: &str) -> DeviceKeypair {
@@ -800,4 +814,86 @@ mod serde_jsonless {
             .filter(|s| !s.is_empty())
             .collect()
     }
+}
+
+// ── The lifecycle rule (ADR-0028) ─────────────────────────────────────────────
+
+/// After a Soft Removal the SAME object reports `statusChanged(notJoined,
+/// removed)`, an emptied member list, and can pair again — no rebuild.
+#[test]
+fn removal_reports_not_joined_and_the_same_object_pairs_again() {
+    let relay = TcpRelay::spawn();
+    let dir = tempfile::TempDir::new().unwrap();
+
+    let first = open_test_session(&dir, &relay.address(), "app");
+    first.close();
+    let relay = TcpRelay::spawn();
+
+    let device = load_identity(&dir, "app");
+    // The remover: member B, holding a raw Ed25519 key for manifest
+    // signing plus the envelope wrapper for sealing.
+    let b_signing_bytes: [u8; 32] = rand::random();
+    let b_signing = ed25519_dalek::SigningKey::from_bytes(&b_signing_bytes);
+    let sender = crate::envelope::SigningKeypair::from_signing_key(
+        ed25519_dalek::SigningKey::from_bytes(&b_signing_bytes),
+    );
+    let v1 = persist_membership(&dir, "app", &device, &sender);
+
+    let session = open_test_session(&dir, &relay.address(), "app");
+    let events = Arc::new(Mutex::new(Vec::<TrueSealEvent>::new()));
+    session
+        .on_event(Box::new(EventLog(events.clone())))
+        .expect("on_event");
+
+    let me_before = session.me().expect("me").id;
+    assert_eq!(session.status().unwrap(), GroupStatus::Member);
+
+    // B issues v2 excluding this device, parent-linked to the v1 it held
+    // — a deliberate removal (ADR-0027).
+    let b_member = crate::manifest::ManifestMember {
+        noise_pub: crate::keys::NoisePublicKey([9u8; 32]),
+        signing_pub: crate::keys::SigningPublicKey(b_signing.verifying_key().to_bytes()),
+        name: "B".into(),
+    };
+    let v2 =
+        crate::manifest::GroupManifest::update(&v1, vec![b_member], &b_signing).expect("v2 issues");
+    let msg = crate::message::Message::GroupManifest { manifest: v2 };
+    let env = crate::envelope::Envelope::build_sealed(
+        42,
+        vec![],
+        device.public_key(),
+        &sender,
+        crate::operation_log::now_secs() * 1000,
+        &msg.encode(),
+    );
+    relay
+        .deliver_tx
+        .send((9, env.encode()))
+        .expect("relay alive");
+
+    wait_for(
+        || {
+            events.lock().unwrap().iter().any(|e| {
+                matches!(
+                    e,
+                    TrueSealEvent::StatusChanged {
+                        status: GroupStatus::NotJoined,
+                        reason: StatusReason::Removed
+                    }
+                )
+            })
+        },
+        Duration::from_secs(15),
+        "statusChanged(notJoined, removed)",
+    );
+    assert!(events.lock().unwrap().iter().any(|e| matches!(
+        e,
+        TrueSealEvent::MembersChanged { members } if members.is_empty()
+    )));
+    assert_eq!(session.status().unwrap(), GroupStatus::NotJoined);
+    // Identity rotated — the same object, a fresh device.
+    assert_ne!(session.me().unwrap().id, me_before);
+    // And it can pair again.
+    assert!(!session.start_pairing().expect("window opens").is_empty());
+    session.close();
 }

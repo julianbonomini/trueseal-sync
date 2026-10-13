@@ -351,7 +351,7 @@ fn main() {
                     continue;
                 }
                 match session.push_sync(rest.as_bytes().to_vec()) {
-                    Ok(()) => println!("sent"),
+                    Ok(mid) => println!("sent (message id {})", mid),
                     Err(e) => println!("error: {}", e),
                 }
             }
