@@ -54,8 +54,11 @@ fn connection_changed_fires_true_on_initial_connect() {
         },
         || Err("push factory unused in connection test".into()),
         Some(Duration::from_millis(50)), // short cap for fast reconnect
-        Some(Box::new(move |connected| {
-            ec.lock().unwrap().push(connected);
+        Some(Box::new(move |change| {
+            ec.lock().unwrap().push(matches!(
+                change,
+                crate::session::ConnectionChange::Connected
+            ));
         })),
     )
     .expect("session");
@@ -130,8 +133,11 @@ fn connection_changed_fires_sequence_on_disconnect_and_reconnect() {
         },
         || Err("push factory unused in connection test".into()),
         Some(Duration::from_millis(50)), // short cap
-        Some(Box::new(move |connected| {
-            ec.lock().unwrap().push(connected);
+        Some(Box::new(move |change| {
+            ec.lock().unwrap().push(matches!(
+                change,
+                crate::session::ConnectionChange::Connected
+            ));
         })),
     )
     .expect("session");

@@ -382,9 +382,16 @@ impl TruesealFfiSession {
                 Ok(s)
             }, // push_factory (NK, :7701)
             None, // use default 30-second cap
-            on_connection_changed.map(|cb| -> Box<dyn Fn(bool) + Send + Sync + 'static> {
-                Box::new(move |connected| cb.on_connection_changed(connected))
-            }),
+            on_connection_changed.map(
+                |cb| -> Box<dyn Fn(crate::session::ConnectionChange) + Send + Sync + 'static> {
+                    Box::new(move |change| {
+                        cb.on_connection_changed(matches!(
+                            change,
+                            crate::session::ConnectionChange::Connected
+                        ))
+                    })
+                },
+            ),
         )
         .map_err(SessionError::from)?;
 

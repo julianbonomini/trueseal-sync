@@ -172,8 +172,11 @@ fn unsupported_transport_version_leaves_outbox_queued() {
         transport_factory,
         || Err("push factory unused".into()),
         Some(Duration::from_millis(50)),
-        Some(Box::new(move |connected| {
-            events_cb.lock().unwrap().push(connected);
+        Some(Box::new(move |change| {
+            events_cb.lock().unwrap().push(matches!(
+                change,
+                crate::session::ConnectionChange::Connected
+            ));
         })),
     )
     .expect("session");

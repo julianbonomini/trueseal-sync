@@ -253,11 +253,17 @@ fn main() {
         },
         None, // reconnect_cap: use default (30s)
         // on_connection_changed
-        Some(Box::new(|connected| {
-            if connected {
-                println!("\n[relay: connected]");
-            } else {
-                println!("\n[relay: disconnected]");
+        Some(Box::new(|change| {
+            match change {
+                trueseal_sync::session::ConnectionChange::Connected => {
+                    println!("\n[relay: connected]");
+                }
+                trueseal_sync::session::ConnectionChange::Disconnected => {
+                    println!("\n[relay: disconnected]");
+                }
+                trueseal_sync::session::ConnectionChange::RelayVersionUnsupported { min, max } => {
+                    println!("\n[relay: unsupported transport version (supports {min}..={max})]");
+                }
             }
             print!("> ");
             io::stdout().flush().ok();

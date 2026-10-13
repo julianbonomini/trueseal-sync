@@ -115,19 +115,17 @@ impl RelayAddress {
 
 /// Parse exactly 64 hex characters into the relay's 32-byte public key.
 fn parse_key_hex(hex: &str) -> Result<NoisePublicKey, RelayAddressError> {
-    let err = || {
-        RelayAddressError(
-            "relay public key must be 64 hex characters (32 bytes)".to_string(),
-        )
-    };
+    let err =
+        || RelayAddressError("relay public key must be 64 hex characters (32 bytes)".to_string());
     if hex.len() != 64 {
         return Err(err());
     }
     let mut bytes = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
-        let hi = hex_val(chunk[0]).ok_or_else(err)?;
-        let lo = hex_val(chunk[1]).ok_or_else(err)?;
-        bytes[i] = (hi << 4) | lo;
+    let raw = hex.as_bytes();
+    for (i, b) in bytes.iter_mut().enumerate() {
+        let hi = hex_val(raw[2 * i]).ok_or_else(err)?;
+        let lo = hex_val(raw[2 * i + 1]).ok_or_else(err)?;
+        *b = (hi << 4) | lo;
     }
     Ok(NoisePublicKey(bytes))
 }
@@ -196,8 +194,9 @@ mod tests {
 
     fn key_bytes() -> [u8; 32] {
         let mut b = [0u8; 32];
-        for (i, pair) in KEY.as_bytes().chunks_exact(2).enumerate() {
-            b[i] = (hex_val(pair[0]).unwrap() << 4) | hex_val(pair[1]).unwrap();
+        for (i, byte) in b.iter_mut().enumerate() {
+            *byte = (hex_val(KEY.as_bytes()[2 * i]).unwrap() << 4)
+                | hex_val(KEY.as_bytes()[2 * i + 1]).unwrap();
         }
         b
     }
@@ -262,26 +261,23 @@ mod tests {
     #[test]
     fn malformed_addresses_are_rejected() {
         let cases = [
-            format!("http://{KEY}@host"),            // wrong scheme
-            format!("trueseal://{KEY}"),             // missing @host
-            format!("trueseal://{KEY}@"),            // empty host
-            format!("trueseal://{KEY}:host"),        // missing @
-            "trueseal://zz@host".to_string(),        // bad hex
+            format!("http://{KEY}@host"),              // wrong scheme
+            format!("trueseal://{KEY}"),               // missing @host
+            format!("trueseal://{KEY}@"),              // empty host
+            format!("trueseal://{KEY}:host"),          // missing @
+            "trueseal://zz@host".to_string(),          // bad hex
             format!("trueseal://{}@host", &KEY[..62]), // short key
-            format!("trueseal://{KEY}@host:abc"),    // non-numeric port
-            format!("trueseal://{KEY}@host:99999"),  // port overflow
-            format!("trueseal://{KEY}@host:7700x"),  // trailing junk
-            format!("trueseal://{KEY}@host?foo=1"),  // unknown query param
-            format!("trueseal://{KEY}@host?push="),  // empty push port
-            format!("trueseal://{KEY}@2001:db8::1"), // unbracketed IPv6
-            format!("trueseal://{KEY}@[::1"),        // unterminated bracket
-            format!("trueseal://{KEY}@:7700"),       // empty host with port
+            format!("trueseal://{KEY}@host:abc"),      // non-numeric port
+            format!("trueseal://{KEY}@host:99999"),    // port overflow
+            format!("trueseal://{KEY}@host:7700x"),    // trailing junk
+            format!("trueseal://{KEY}@host?foo=1"),    // unknown query param
+            format!("trueseal://{KEY}@host?push="),    // empty push port
+            format!("trueseal://{KEY}@2001:db8::1"),   // unbracketed IPv6
+            format!("trueseal://{KEY}@[::1"),          // unterminated bracket
+            format!("trueseal://{KEY}@:7700"),         // empty host with port
         ];
         for c in &cases {
-            assert!(
-                RelayAddress::parse(c).is_err(),
-                "should reject: {c}"
-            );
+            assert!(RelayAddress::parse(c).is_err(), "should reject: {c}");
         }
     }
 }

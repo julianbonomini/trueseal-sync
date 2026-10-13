@@ -85,10 +85,7 @@ fn calls_after_close_fail_typed() {
         session.join_group("garbage"),
         Err(SessionError::Closed)
     ));
-    assert!(matches!(
-        session.pairing_token(),
-        Err(SessionError::Closed)
-    ));
+    assert!(matches!(session.pairing_token(), Err(SessionError::Closed)));
     assert!(matches!(
         session.accept_member("unknown"),
         Err(SessionError::Closed)
@@ -127,8 +124,7 @@ fn close_severs_the_receive_link() {
     let relay_gone = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let relay_gone2 = relay_gone.clone();
     std::thread::spawn(move || {
-        if let Ok(sess) = crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2)
-        {
+        if let Ok(sess) = crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2) {
             // Hold the session open like a real relay until the client's
             // close kills the link (receive errors) — then record it.
             while sess.receive().is_ok() {}
@@ -158,8 +154,11 @@ fn close_severs_the_receive_link() {
         },
         || Err("push factory unused".into()),
         Some(Duration::from_millis(50)),
-        Some(Box::new(move |connected| {
-            ec.lock().unwrap().push(connected);
+        Some(Box::new(move |change| {
+            ec.lock().unwrap().push(matches!(
+                change,
+                crate::session::ConnectionChange::Connected
+            ));
         })),
     )
     .expect("connect_background");

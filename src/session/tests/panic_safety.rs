@@ -190,8 +190,11 @@ fn manifest_callback_panic_reconnects_and_delivery_recovers() {
         },
         || Err("push factory unused".into()),
         Some(Duration::from_millis(50)), // fast reconnect
-        Some(Box::new(move |connected| {
-            ec.lock().unwrap().push(connected);
+        Some(Box::new(move |change| {
+            ec.lock().unwrap().push(matches!(
+                change,
+                crate::session::ConnectionChange::Connected
+            ));
         })),
     )
     .expect("session");

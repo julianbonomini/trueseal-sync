@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,7 +44,7 @@ pub(super) fn reconnect_loop<T: crate::relay::Severable>(
     shutdown: Arc<AtomicBool>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
-    on_connection_changed: Arc<dyn Fn(bool) + Send + Sync + 'static>,
+    on_connection_changed: Arc<dyn Fn(super::ConnectionChange) + Send + Sync + 'static>,
 ) {
     let mut backoff = cap.min(Duration::from_secs(1));
     let mut was_connected = false; // track last-known state to detect transitions
@@ -68,7 +67,7 @@ pub(super) fn reconnect_loop<T: crate::relay::Severable>(
             backoff = Duration::from_secs(1);
             if !was_connected {
                 was_connected = true;
-                (on_connection_changed)(true);
+                (on_connection_changed)(super::ConnectionChange::Connected);
             }
             continue;
         }
@@ -76,7 +75,7 @@ pub(super) fn reconnect_loop<T: crate::relay::Severable>(
         // Transition: was connected, now disconnected.
         if was_connected {
             was_connected = false;
-            (on_connection_changed)(false);
+            (on_connection_changed)(super::ConnectionChange::Disconnected);
         }
 
         // Interruptible backoff: sleep in 50 ms slices so `close()` exits
@@ -147,12 +146,18 @@ pub(super) fn reconnect_loop<T: crate::relay::Severable>(
             Err(crate::relay::RelayError::RelayVersionUnsupported { min, max }) => {
                 // The relay refuses our Transport Version (ADR-0022). Keep
                 // retrying — the relay may be upgraded — and leave every
-                // outbox entry queued.
+                // outbox entry queued. Surface it as the
+                // `relayVersionUnsupported{min,max}` connection state
+                // (ADR-0028), not a bare log line.
                 log::warn!(
                     "relay supports Transport Version {min}..={max}, \
                      this build speaks {}; outbox stays queued",
                     crate::version::TRANSPORT_VERSION
                 );
+                (on_connection_changed)(super::ConnectionChange::RelayVersionUnsupported {
+                    min,
+                    max,
+                });
                 continue;
             }
             Err(_) => continue,

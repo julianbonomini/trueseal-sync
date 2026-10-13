@@ -7,7 +7,6 @@ mod tests;
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -440,6 +439,25 @@ impl KeyState {
 pub(super) struct PendingMember {
     pub noise_pub: NoisePublicKey,
     pub signing_pub: SigningPublicKey,
+}
+
+/// A relay-link transition (ADR-0028's `connection`, event form). The
+/// steady "never connected yet" state (`connecting`) is the FFI getter's
+/// initial value, not an event: the library connects in the background
+/// from construction, and the first observable transition is `Connected`
+/// or `RelayVersionUnsupported`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionChange {
+    /// The Receive Session is up.
+    Connected,
+    /// The Receive Session dropped; the library reconnects automatically.
+    Disconnected,
+    /// The Relay refused our Transport Version and reported the range it
+    /// supports (ADR-0022). Every outbox entry stays queued and the
+    /// library keeps retrying in case the Relay is upgraded. Surfaced as
+    /// the `relayVersionUnsupported{min,max}` connection state, not an
+    /// error (ADR-0028).
+    RelayVersionUnsupported { min: u32, max: u32 },
 }
 
 /// Session-side Delivery Issue channel (ADR-0034 §3).
@@ -2206,7 +2224,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
-        on_connection_changed: Option<Box<dyn Fn(bool) + Send + Sync + 'static>>,
+        on_connection_changed: Option<Box<dyn Fn(ConnectionChange) + Send + Sync + 'static>>,
     ) -> Result<Self, SessionError> {
         Self::connect_with_reconnect_rotating(
             transport,
@@ -2239,7 +2257,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
-        on_connection_changed: Option<Box<dyn Fn(bool) + Send + Sync + 'static>>,
+        on_connection_changed: Option<Box<dyn Fn(ConnectionChange) + Send + Sync + 'static>>,
     ) -> Result<Self, SessionError> {
         let transport_factory = Arc::new(transport_factory);
         let session = Self::connect_full_rotating(
@@ -2275,8 +2293,8 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
         let rotation_pending_arc = session.rotation_pending.clone();
         let shutdown_arc = session.shutdown.clone();
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
-        let on_cc: Arc<dyn Fn(bool) + Send + Sync + 'static> = on_connection_changed
-            .map(|f| -> Arc<dyn Fn(bool) + Send + Sync + 'static> { Arc::new(f) })
+        let on_cc: Arc<dyn Fn(ConnectionChange) + Send + Sync + 'static> = on_connection_changed
+            .map(|f| -> Arc<dyn Fn(ConnectionChange) + Send + Sync + 'static> { Arc::new(f) })
             .unwrap_or_else(|| Arc::new(|_| {}));
         std::thread::spawn(move || {
             reconnect::reconnect_loop(
@@ -2344,7 +2362,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
-        on_connection_changed: Option<Box<dyn Fn(bool) + Send + Sync + 'static>>,
+        on_connection_changed: Option<Box<dyn Fn(ConnectionChange) + Send + Sync + 'static>>,
     ) -> Result<Self, SessionError> {
         Self::connect_background_rotating(
             relay_pub,
@@ -2377,7 +2395,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
-        on_connection_changed: Option<Box<dyn Fn(bool) + Send + Sync + 'static>>,
+        on_connection_changed: Option<Box<dyn Fn(ConnectionChange) + Send + Sync + 'static>>,
     ) -> Result<Self, SessionError> {
         // Build all arcs directly — mirrors connect_full but without an initial transport.
         let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
@@ -2610,8 +2628,8 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
         };
 
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
-        let on_cc: Arc<dyn Fn(bool) + Send + Sync + 'static> = on_connection_changed
-            .map(|f| -> Arc<dyn Fn(bool) + Send + Sync + 'static> { Arc::new(f) })
+        let on_cc: Arc<dyn Fn(ConnectionChange) + Send + Sync + 'static> = on_connection_changed
+            .map(|f| -> Arc<dyn Fn(ConnectionChange) + Send + Sync + 'static> { Arc::new(f) })
             .unwrap_or_else(|| Arc::new(|_| {}));
         std::thread::spawn(move || {
             reconnect::reconnect_loop(
