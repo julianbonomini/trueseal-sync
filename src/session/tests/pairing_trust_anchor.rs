@@ -24,7 +24,7 @@ use crate::keys::{NoisePublicKey, SigningPublicKey};
 use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
 use crate::member::member_name;
 use crate::message::Message;
-use crate::operation_log::MemLog;
+use crate::operation_log::{MemLog, OperationLog};
 use crate::session::GroupStatus;
 use crate::store::{PersistentLog, Store};
 
@@ -1225,6 +1225,71 @@ fn admitter_restart_spends_the_secret() {
         0,
         "the pre-restart secret must be spent — windows never survive a restart"
     );
+}
+
+/// Admitter crash point (ADR-0023): a crash AFTER accept commits loses the
+/// window, but the admission manifest was persisted and queued first — the
+/// outbox still holds it after a restart, so the sender pump re-sends it.
+#[test]
+fn admitter_restart_keeps_the_queued_admission_manifest() {
+    let dir = tempfile::TempDir::new().expect("tmp dir");
+    let relay_kp = make_relay_kp();
+
+    let device_a = DeviceKeypair::generate();
+    let a_noise_priv = device_a.noise.private();
+    let a_signing_priv = device_a.signing.to_bytes();
+    let joiner = DeviceKeypair::generate();
+
+    // First "process": admit the joiner while the push path is down (the
+    // Pair from the joiner never arrives — the admit uses accept_pair
+    // directly, the primitive accept_member wraps), then die.
+    {
+        let (pipe_client, pipe_relay) = mem_pipe_pair();
+        let _relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+        let store = Store::open(dir.path(), "ns").expect("store");
+        let session = TruesealSession::<MemPipe>::connect_full(
+            pipe_client,
+            relay_pub(&relay_kp),
+            device_a,
+            |_, _, _| {},
+            Box::new(PersistentLog::new(store)),
+            || {},
+            |_| {},
+            || {},
+            || Err("push path down".into()),
+        )
+        .expect("session");
+        let _token = session.pairing_token();
+        assert!(
+            session.accept_pair(joiner.public_key(), joiner.signing_public_key()),
+            "admission commits"
+        );
+        // The manifest is local and queued; nothing could be pushed.
+        assert!(session.manifest.lock().unwrap().is_some());
+    }
+
+    // Second "process": the queued GroupManifest control entries survived —
+    // the joiner (and any prior members) still get the admission.
+    {
+        let store = Store::open(dir.path(), "ns").expect("reopen");
+        let log = PersistentLog::new(store);
+        let undelivered = log.undelivered_entries();
+        assert!(
+            undelivered.iter().any(|e| matches!(
+                crate::message::Message::decode(&e.blob),
+                Ok(Message::GroupManifest { .. })
+            )),
+            "the admission manifest must still be queued after the crash"
+        );
+        assert!(
+            undelivered
+                .iter()
+                .all(|e| e.object_id == joiner.public_key().0),
+            "genesis admission notifies exactly the joiner"
+        );
+        // Sanity: the identity is intact for the restart.
+        let _ = (a_noise_priv, a_signing_priv);
+    }
 }
 
 /// A fresh window gets a FRESH secret: a Pair under an older window's
