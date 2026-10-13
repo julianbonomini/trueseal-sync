@@ -76,7 +76,7 @@ Errors are 14 typed cases — no catch-all. `namespace` scopes the SQLite databa
 - **Data at rest:** protected only by the OS sandbox (encryption at rest is 1.0 work). The library keeps the footprint small — see "What you get" above for exactly what is tested.
 - **Not defended against / not yet:** end-to-end forward secrecy (2.0 candidate), an independent audit, network-level IP hiding.
 
-Every claim above is backed by tests; the canonical claims table with its evidence lives on the Threat Model page at [trueseal.dev](https://trueseal.dev) ([trueseal-docs](../trueseal-docs)).
+Every claim above is backed by tests; the canonical claims table with its evidence lives on the Threat Model page at [trueseal.dev](https://trueseal.dev) ([trueseal-docs](../trueseal-docs)). Found a security issue? See [SECURITY.md](SECURITY.md) — report privately via GitHub Security Advisories, never in a public issue.
 
 ## Relay
 
