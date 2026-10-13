@@ -164,7 +164,12 @@ fn sync_queued_before_e2e_bump_is_delivered_once_with_original_id_and_stamp() {
         || {},
         {
             let pipe: Arc<Mutex<Option<MemPipe>>> = Arc::new(Mutex::new(Some(pipe_b_client)));
-            move || pipe.lock().unwrap().take().ok_or_else(|| "exhausted".to_string())
+            move || {
+                pipe.lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| "exhausted".to_string())
+            }
         },
         nk.factory(),
         Some(Duration::from_millis(50)),
@@ -189,7 +194,12 @@ fn sync_queued_before_e2e_bump_is_delivered_once_with_original_id_and_stamp() {
         || {},
         {
             let pipe: Arc<Mutex<Option<MemPipe>>> = Arc::new(Mutex::new(Some(pipe_a_client)));
-            move || pipe.lock().unwrap().take().ok_or_else(|| "exhausted".to_string())
+            move || {
+                pipe.lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| "exhausted".to_string())
+            }
         },
         nk.factory(),
         Some(Duration::from_millis(50)),
@@ -264,10 +274,12 @@ fn store_reset_clears_everything_and_reopen_is_clean() {
         let mut log = PersistentLog::new(s);
         log.append(&[9u8; 32], 1, b"queued".to_vec());
         // Lose the version keys → unversioned (a dev-build store).
-        let conn =
-            rusqlite::Connection::open(dir.path().join("trueseal_ns.db")).unwrap();
-        conn.execute("DELETE FROM meta WHERE key IN ('store_version', 'e2e_version')", [])
-            .unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("trueseal_ns.db")).unwrap();
+        conn.execute(
+            "DELETE FROM meta WHERE key IN ('store_version', 'e2e_version')",
+            [],
+        )
+        .unwrap();
     }
     let (s, outcome) = Store::open_with_outcome(dir.path(), "ns").expect("reset open");
     assert!(outcome.reset);

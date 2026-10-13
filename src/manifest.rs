@@ -199,7 +199,6 @@ impl GroupManifest {
     /// version with a lower hash — the tie rule that makes every device
     /// pick the same winner from the same concurrent pair.
     pub fn verify(&self, previous: Option<&GroupManifest>) -> Result<(), ManifestError> {
-
         // SYNC-10 (#102): a manifest at u64::MAX can never be incremented,
         // so accepting it would freeze membership for good — reject it on
         // receipt, as genesis or update (ADR-0027).

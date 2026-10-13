@@ -790,7 +790,8 @@ mod store_versioning_ffi_tests {
             let conn = rusqlite::Connection::open(dir.path().join("trueseal_app.db")).unwrap();
             conn.execute("UPDATE meta SET value = 99 WHERE key = 'store_version'", [])
                 .unwrap();
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
         }
         let before = std::fs::read(dir.path().join("trueseal_app.db")).unwrap();
         let result = TruesealFfiSession::create(
