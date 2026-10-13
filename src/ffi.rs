@@ -63,6 +63,11 @@ pub enum SessionError {
     /// stays open.
     #[error("group is full: maximum {max} members")]
     GroupFull { max: u32 },
+    /// The store was written by a newer release (a rollback) and is
+    /// refused, unmodified — upgrade the SDK (ADR-0032; the 13th error
+    /// case `storeTooNew` in ADR-0028's list).
+    #[error("store was written by a newer release (store version {found}; this build supports up to {supported})")]
+    StoreTooNew { found: u32, supported: u32 },
 }
 
 /// Where the local Device stands in its namespace's Sync Group (ADR-0023,
@@ -205,6 +210,17 @@ pub trait ConnectionChangedCallback: Send + Sync {
     fn on_connection_changed(&self, connected: bool);
 }
 
+/// Fired once from `create` when the store was unmigratable — unversioned
+/// (a development-build store) or from before a Store Reset release — and
+/// was automatically reset: group state wiped, fresh identity generated,
+/// status `notJoined` with reason `storeReset` (ADR-0032, ADR-0028). The
+/// object stays usable and can pair again. SYNC-15 folds this into the
+/// canonical `statusChanged(status, reason)` event stream.
+#[uniffi::export(callback_interface)]
+pub trait StoreResetCallback: Send + Sync {
+    fn on_store_reset(&self);
+}
+
 // ── TruesealFfiSession ────────────────────────────────────────────────────────────
 
 /// A connected trueseal-sync session over TCP.
@@ -238,6 +254,7 @@ impl TruesealFfiSession {
         on_removed_from_group: Box<dyn RemovedFromGroupCallback>,
         on_group_destroyed: Box<dyn GroupDestroyedCallback>,
         on_connection_changed: Option<Box<dyn ConnectionChangedCallback>>,
+        on_store_reset: Option<Box<dyn StoreResetCallback>>,
     ) -> Result<Arc<Self>, SessionError> {
         // Validate namespace: must be non-empty and match [a-zA-Z0-9_-]+
         if namespace.is_empty()
@@ -249,11 +266,22 @@ impl TruesealFfiSession {
                 msg: format!("namespace must match [a-zA-Z0-9_-]+ (got {:?})", namespace),
             });
         }
-        let store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
-            SessionError::InvalidNamespace {
-                msg: format!("store: {e}"),
-            }
-        })?;
+        // SYNC-13 (ADR-0032): the first open runs the Store Version state
+        // machine — chained migrations, an automatic Store Reset for an
+        // unmigratable store, a typed refusal for a newer one. Later opens
+        // see a current store and are no-ops.
+        let (store, open_outcome) = Store::open_with_outcome(Path::new(&base_dir), &namespace)
+            .map_err(|e| match e {
+                crate::store::StoreError::StoreTooNew { found, supported } => {
+                    SessionError::StoreTooNew { found, supported }
+                }
+                other => SessionError::StoreFailed {
+                    msg: format!("store: {other}"),
+                },
+            })?;
+        // After a Store Reset the identity row is empty: the library
+        // generates a fresh identity here, and the session below starts
+        // NotJoined — `storeReset` is reported once construction succeeds.
         let keypair = load_or_generate_keypair(&store)?;
         let relay_pub_key =
             noise_pub_from_bytes(&relay_pub).map_err(|_| SessionError::InvalidRelayPublicKey)?;
@@ -366,7 +394,16 @@ impl TruesealFfiSession {
         )
         .map_err(SessionError::from)?;
 
-        Ok(Arc::new(Self { inner }))
+        let session = Arc::new(Self { inner });
+        // ADR-0032: report the automatic Store Reset —
+        // `statusChanged(notJoined, storeReset)` in ADR-0028's terms — once
+        // the object exists and is usable (it can pair again immediately).
+        if open_outcome.reset {
+            if let Some(cb) = &on_store_reset {
+                cb.on_store_reset();
+            }
+        }
+        Ok(session)
     }
 
     /// Opens a pairing window and returns an opaque base64url token carrying a
@@ -622,6 +659,7 @@ mod tests {
                 Box::new(NoopRfg),
                 Box::new(NoopGd),
                 None,
+                None,
             );
             assert!(
                 matches!(result, Err(SessionError::InvalidNamespace { .. })),
@@ -671,5 +709,109 @@ mod tests {
             kp2.public_key(),
             "same namespace must return same identity after re-open"
         );
+    }
+}
+
+#[cfg(test)]
+mod store_versioning_ffi_tests {
+    //! SYNC-13 (#105, ADR-0032): the FFI surface of the Store Version state
+    //! machine — the automatic Store Reset reports `storeReset` and the
+    //! object can pair again; a newer store is refused with `storeTooNew`.
+
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct NoopMsg;
+    impl MessageCallback for NoopMsg {
+        fn on_message(&self, _blob: Vec<u8>, _snp: Vec<u8>, _message_id: String) {}
+    }
+    struct NoopRfg;
+    impl RemovedFromGroupCallback for NoopRfg {
+        fn on_removed_from_group(&self) {}
+    }
+    struct NoopGd;
+    impl GroupDestroyedCallback for NoopGd {
+        fn on_group_destroyed(&self) {}
+    }
+
+    struct CountingReset(Arc<AtomicUsize>);
+    impl StoreResetCallback for CountingReset {
+        fn on_store_reset(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A store whose version keys are gone (a development-build artifact) is
+    /// unmigratable: create() resets it, fires on_store_reset once, and the
+    /// session is NotJoined with a fresh identity, ready to pair again.
+    #[test]
+    fn unversioned_store_is_reset_reported_and_pairable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let base = dir.path().to_string_lossy().into_owned();
+        // A populated store that then loses its version keys.
+        {
+            let s = crate::store::Store::open(dir.path(), "app").expect("open");
+            let kp = DeviceKeypair::generate();
+            s.save_keypair(&kp).expect("save");
+            let conn = rusqlite::Connection::open(dir.path().join("trueseal_app.db")).unwrap();
+            conn.execute(
+                "DELETE FROM meta WHERE key IN ('store_version', 'e2e_version')",
+                [],
+            )
+            .unwrap();
+        }
+        let resets = Arc::new(AtomicUsize::new(0));
+        let session = TruesealFfiSession::create(
+            base.clone(),
+            "app".into(),
+            "127.0.0.1:9".into(), // unreachable — connectivity is background
+            vec![0u8; 32],
+            Box::new(NoopMsg),
+            Box::new(NoopRfg),
+            Box::new(NoopGd),
+            None,
+            Some(Box::new(CountingReset(resets.clone()))),
+        )
+        .expect("create succeeds — the reset is automatic");
+        assert_eq!(resets.load(Ordering::SeqCst), 1, "storeReset reported once");
+        assert_eq!(session.group_status(), GroupStatus::NotJoined);
+        // The object can pair again.
+        assert!(!session.pairing_token().is_empty());
+        session.destroy_group();
+    }
+
+    /// A store written by a newer release: create() fails with the typed
+    /// StoreTooNew and the store's bytes are unchanged.
+    #[test]
+    fn newer_store_fails_create_with_store_too_new() {
+        let dir = tempfile::TempDir::new().unwrap();
+        {
+            let _s = crate::store::Store::open(dir.path(), "app").expect("open");
+            let conn = rusqlite::Connection::open(dir.path().join("trueseal_app.db")).unwrap();
+            conn.execute("UPDATE meta SET value = 99 WHERE key = 'store_version'", [])
+                .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+        let before = std::fs::read(dir.path().join("trueseal_app.db")).unwrap();
+        let result = TruesealFfiSession::create(
+            dir.path().to_string_lossy().into_owned(),
+            "app".into(),
+            "127.0.0.1:9".into(),
+            vec![0u8; 32],
+            Box::new(NoopMsg),
+            Box::new(NoopRfg),
+            Box::new(NoopGd),
+            None,
+            None,
+        );
+        match result {
+            Err(SessionError::StoreTooNew { found, supported }) => {
+                assert_eq!(found, 99);
+                assert_eq!(supported, crate::version::STORE_VERSION);
+            }
+            other => panic!("expected StoreTooNew, got {:?}", other.map(|_| "session")),
+        }
+        let after = std::fs::read(dir.path().join("trueseal_app.db")).unwrap();
+        assert_eq!(before, after, "refused store: bytes unchanged");
     }
 }
