@@ -1,6 +1,6 @@
 # Destroy Group: a durable, forwarded Revoke, then wipe and re-pair
 
-Status: accepted (decided 2026-09-29 in [trueseal-roadmap#10](https://github.com/julianbonomini/trueseal-roadmap/issues/10); not yet implemented). This completes the Destroy Group transitions that ADR-0027 left open. It keeps ADR-0028's rule that the same `TrueSeal` object is reused after a wipe, and it adds a `destroying` status.
+Status: accepted (decided 2026-09-29 in [trueseal-roadmap#10](https://github.com/julianbonomini/trueseal-roadmap/issues/10)); implemented 2026-10-13 (SYNC-11, #103). This completes the Destroy Group transitions that ADR-0027 left open. It keeps ADR-0028's rule that the same `TrueSeal` object is reused after a wipe, and it adds a `destroying` status.
 
 Destroy Group ends a Sync Group. The initiator stays in a persisted **Destroying** state until the Relay has accepted a Revoke for every member. Every device that receives a valid Revoke passes it on to the members it knows about, and then wipes in the same way. A Revoke is honoured from any device that appears in any Group Manifest the receiver has held for that group. There is no key rotation inside the session. Every surviving device starts over with a fresh identity, and the user pairs again.
 

@@ -45,7 +45,7 @@ The admitter's view of a `Pair` that proved it knows the Pairing Secret. The lib
 _Avoid_: member request token, pairing request, invitation
 
 **Group Status**:
-Where the local Device stands in its namespace's Sync Group: `notJoined`, `pendingJoin`, `member` or `leaving`. Changes are reported as `statusChanged` with a reason (`created`, `joined`, `left`, `removed` or `destroyed`). After removal, leave or Destroy Group the Device is back at `notJoined` with a fresh identity, and the same SDK object can pair again (ADR-0028).
+Where the local Device stands in its namespace's Sync Group: `notJoined`, `pendingJoin`, `member`, `leaving` or `destroying`. Changes are reported as `statusChanged` with a reason (`created`, `joined`, `left`, `removed` or `destroyed`). After removal, leave or Destroy Group the Device is back at `notJoined` with a fresh identity, and the same SDK object can pair again (ADR-0028).
 _Avoid_: join state, connection state (that is the relay link)
 
 **Relay Address**:
