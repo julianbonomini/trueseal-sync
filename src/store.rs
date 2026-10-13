@@ -350,7 +350,19 @@ fn reseal_outbox_rows(conn: &rusqlite::Connection, to_e2e: u32) -> Result<usize,
             continue;
         };
         let old_hash = manifest.hash();
-        if remap.contains_key(&old_hash) {
+        // Fan-out queues the SAME manifest bytes to every member. A row
+        // whose manifest was already re-signed for an earlier row still
+        // needs its own UPDATE — skipping it would leave the duplicate
+        // signed under the old version, and upgraded peers would reject it
+        // (an admission queued for N members during an upgrade must reach
+        // all N). Ed25519 is deterministic: the remapped bytes are exactly
+        // the ones the first re-sign produced.
+        if let Some((_, new_bytes)) = remap.get(&old_hash) {
+            conn.execute(
+                "UPDATE outbox SET blob = ?3 WHERE object_id = ?1 AND sequence = ?2",
+                rusqlite::params![oid, seq, new_bytes],
+            )?;
+            resealed += 1;
             continue;
         }
         let parent = manifest
@@ -2292,6 +2304,64 @@ mod versioning_tests {
         // The store is still usable: a retry at the real version opens fine.
         let (_s, outcome) = Store::open_with_outcome(dir.path(), "ns").expect("still opens");
         assert_eq!(outcome, OpenOutcome::default());
+    }
+
+    /// Fan-out queues the same manifest bytes to every member (one row per
+    /// recipient). A bump must re-seal EVERY duplicate row — a row skipped
+    /// because another copy was already re-signed keeps an old-domain
+    /// signature, and upgraded peers reject it: an admission queued for N
+    /// members during the upgrade would reach only one.
+    #[test]
+    fn e2e_bump_reseals_fan_out_duplicates_on_every_row() {
+        let dir = tmp_dir();
+        let kp = DeviceKeypair::generate();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        s.save_keypair(&kp).expect("save");
+        let genesis =
+            GroupManifest::new(oid(9), 0, vec![member(&kp, "me")], &kp.signing);
+        // The same manifest to two recipients — fan-out's row shape.
+        let encoded = Message::GroupManifest {
+            manifest: genesis.clone(),
+        }
+        .encode();
+        let mut log = PersistentLog::new(s);
+        log.append_control(&oid(1), 1, encoded.clone());
+        log.append_control(&oid(2), 2, encoded.clone());
+
+        let (_s, outcome) = Store::open_inner(
+            dir.path(),
+            "ns",
+            crate::version::STORE_VERSION,
+            crate::version::END_TO_END_VERSION + 1,
+            MIGRATIONS,
+        )
+        .expect("open reseals");
+        assert!(outcome.resealed_from_e2e.is_some());
+
+        let new_e2e = crate::version::END_TO_END_VERSION + 1;
+        let mut new_hashes = Vec::new();
+        for seq in [1i64, 2] {
+            let (blob, _, _) = outbox_row(dir.path(), "ns", seq);
+            let Message::GroupManifest { manifest } = Message::decode(&blob).unwrap()
+            else {
+                panic!("seq {seq} is a manifest");
+            };
+            manifest
+                .verify_signature_for_version(new_e2e)
+                .unwrap_or_else(|_| panic!("row seq {seq} verifies under the new version"));
+            assert!(
+                manifest
+                    .verify_signature_for_version(crate::version::END_TO_END_VERSION)
+                    .is_err(),
+                "row seq {seq} no longer verifies under the old version"
+            );
+            new_hashes.push(manifest.hash());
+        }
+        assert_eq!(
+            new_hashes[0], new_hashes[1],
+            "deterministic re-sign: identical bytes on both rows"
+        );
+        assert_ne!(new_hashes[0], genesis.hash());
     }
 
     #[test]
