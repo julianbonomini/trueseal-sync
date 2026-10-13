@@ -47,9 +47,24 @@ The Deliver body (relay → client on XX session) is `body[32:]` — identical t
 
 ### Heartbeat
 
-The relay sends `Heartbeat` on idle Receive Sessions (XX) to prevent NAT timeout. The client echoes `Heartbeat` back from the receive dispatch loop. No payload. No application semantics — pure keepalive.
+> **Amended 2026-10-13 (SYNC-16, #108):** the direction is reversed per
+> trueseal-relay ADR-0012. **The client sends a `Heartbeat` every 25 s on
+> the Receive Session; the relay echoes it.** The relay closes a Receive
+> Session after 75 s with no frame received, so the client heartbeat is
+> what keeps an idle session alive. The client treats ANY inbound frame as
+> liveness — not only heartbeat echoes, which the relay may legitimately
+> drop under Deliver saturation (trueseal-relay #47) — and severs the
+> session when no inbound frame arrives within 75 s, handing off to the
+> reconnect loop. The client never echoes inbound Heartbeats: the relay
+> does not initiate them (trueseal-relay #13, wontfix), and echoing the
+> relay's echoes would ping-pong without bound. The text below records the
+> original, superseded direction.
 
-The dispatch loop (`run_loop`) handles `MsgType::Heartbeat` by calling `session.send(&frame(MsgType::Heartbeat, &[]))` directly. Two send paths exist (push send thread + dispatch thread), both serialised on the conn Mutex in trueseal-noise Session. No ordering guarantee between heartbeat echoes and push frames — not required.
+~~The relay sends `Heartbeat` on idle Receive Sessions (XX) to prevent NAT timeout. The client echoes `Heartbeat` back from the receive dispatch loop.~~ Superseded — see the amendment above.
+
+Heartbeat writes are serialised with every other send on the session (push send thread, DeliverAcks from the dispatch thread, and the heartbeat thread) by the conn Mutex in trueseal-noise Session. No ordering guarantee between heartbeats and push frames — not required.
+
+The same change (SYNC-16) also bounds two previously unbounded waits at the client seams, per trueseal-relay ADR-0012's deadlines: the post-`0x01` Noise handshake (10 s — trueseal-noise's `RetryConn` retries `WouldBlock` with no deadline of its own) and the whole Push Session including the Ack wait (30 s). Both surface as typed, temporary failures (`HandshakeFailed` / `PushFailed`), so the outbox pump backs off and retries per ADR-0026 instead of spinning or wedging silently.
 
 ### Push Ack
 
@@ -86,15 +101,15 @@ The relay team needs to know exactly three things about the wire format:
 
 **Receive Session (Noise XX):**
 - Send Deliver: `[0x02][len][envelope_proto]` (the stored `body[32:]`)
-- Send Heartbeat on idle: `[0x03][0x00 0x00 0x00 0x00]`
-- Accept Heartbeat echo from client: same frame, ignore body
+- Accept Heartbeat from the client (every 25 s): `[0x03][0x00 0x00 0x00 0x00]` — echo it (amended 2026-10-13; the relay never initiates one)
+- Close the Receive Session after 75 s with no frame received (trueseal-relay ADR-0012)
 
 **No proto decode required anywhere on the relay.**
 
 ## Consequences
 
 - `mark_delivered` now has "relay persisted" semantics. The outbox replay safety window closes.
-- Heartbeat prevents silent connection death.
+- Heartbeat prevents silent connection death. (Amended 2026-10-13: client-initiated every 25 s; any inbound frame is liveness; 75 s of silence severs the session and reconnects. A hung handshake or Ack wait now resolves typed within 10 s / 30 s instead of hanging forever.)
 - Relay has zero Envelope schema knowledge. It is structurally incapable of reading content — not just policy-forbidden.
 - One extra round-trip per push (NK send → Ack receive). Acceptable.
 - `push_message` (Revoke, GroupManifest, PairAccept) also waits for Ack. Rare control messages. Accepted.
