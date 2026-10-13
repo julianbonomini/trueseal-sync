@@ -545,6 +545,15 @@ fn manifest_from_unknown_issuer_raises_unauthorized() {
         },
         Duration::from_secs(3),
     );
+    // The issue is raised BEFORE the DeliverAck on every rejection path
+    // (ADR-0034 §3, B10 repair) — so once the issue is observed the ack is
+    // still in flight. Wait for it rather than asserting synchronously
+    // (B12b flake fix: the synchronous assert raced the ack write under
+    // full-suite load). Same assertion, event-driven wait.
+    wait_for(
+        || relay.deliver_acks() == vec![1],
+        Duration::from_secs(3),
+    );
     assert_eq!(
         relay.deliver_acks(),
         vec![1],
