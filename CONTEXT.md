@@ -288,6 +288,10 @@ This boundary means trueseal-sync is a **transport primitive with ordering, encr
 - "revocation" — previously meant only Destroy Group. Now encompasses both Soft Removal and Destroy Group. Be specific.
 - "paired" / "pairing" — pairing is the key exchange ceremony. Being in the group is defined by the Group Manifest, not by having run the pairing ceremony. A device can be paired (keys exchanged) but not in any group manifest if it was removed. Use "group member" to mean "in the current manifest."
 
+## Test vectors
+
+`docs/test-vectors/sync-v1.json` pins the preview wire format byte-for-byte (ADR-0022, gate G5): signing inputs, addressed encryption, the Message ID, every message and frame type, the Transport Version prefix, and one rejection per layer. Generated from the real code paths with fixed test-only inputs — never hand-written. The checked-in file is a CI gate (drift fails the build); regenerate only on a deliberate protocol change with `cargo test --lib vectors -- --ignored`. The relay (RELAY-5) and the SDKs (SDK-2) verify against it; the consumption contract is `docs/test-vectors/README.md`.
+
 ## API layers
 
 trueseal-sync exposes two layers:
