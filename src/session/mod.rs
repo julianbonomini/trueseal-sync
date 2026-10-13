@@ -2404,6 +2404,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
                 transport_factory,
                 cap,
                 on_cc,
+                crate::relay::SessionTimeouts::default(),
             );
         });
         Ok(session)
@@ -2477,6 +2478,81 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
         on_connection_changed: Option<Box<dyn Fn(ConnectionChange) + Send + Sync + 'static>>,
+    ) -> Result<Self, SessionError> {
+        Self::connect_background_rotating_inner(
+            relay_pub,
+            keypair,
+            on_message,
+            op_log,
+            manifest,
+            on_removed_from_group,
+            on_manifest_changed,
+            on_group_destroyed,
+            on_identity_rotated,
+            transport_factory,
+            push_factory,
+            reconnect_cap,
+            on_connection_changed,
+            crate::relay::SessionTimeouts::default(),
+        )
+    }
+
+    /// Test seam: the reconnect loop's heartbeat/liveness knobs (B23c —
+    /// relay-kill detection must be exercisable without the production
+    /// 75 s liveness window). Production callers use
+    /// `connect_background_rotating`, which passes the defaults.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn connect_background_with_timeouts(
+        relay_pub: NoisePublicKey,
+        keypair: DeviceKeypair,
+        on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static + Clone,
+        op_log: Box<dyn OperationLog>,
+        manifest: Arc<Mutex<Option<GroupManifest>>>,
+        on_removed_from_group: impl Fn() + Send + Sync + 'static,
+        on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
+        on_group_destroyed: impl Fn() + Send + Sync + 'static,
+        on_identity_rotated: impl Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static,
+        transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
+        push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
+        reconnect_cap: Option<Duration>,
+        on_connection_changed: Option<Box<dyn Fn(ConnectionChange) + Send + Sync + 'static>>,
+        timeouts: crate::relay::SessionTimeouts,
+    ) -> Result<Self, SessionError> {
+        Self::connect_background_rotating_inner(
+            relay_pub,
+            keypair,
+            on_message,
+            op_log,
+            manifest,
+            on_removed_from_group,
+            on_manifest_changed,
+            on_group_destroyed,
+            on_identity_rotated,
+            transport_factory,
+            push_factory,
+            reconnect_cap,
+            on_connection_changed,
+            timeouts,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn connect_background_rotating_inner(
+        relay_pub: NoisePublicKey,
+        keypair: DeviceKeypair,
+        on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static + Clone,
+        op_log: Box<dyn OperationLog>,
+        manifest: Arc<Mutex<Option<GroupManifest>>>,
+        on_removed_from_group: impl Fn() + Send + Sync + 'static,
+        on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
+        on_group_destroyed: impl Fn() + Send + Sync + 'static,
+        on_identity_rotated: impl Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static,
+        transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
+        push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
+        reconnect_cap: Option<Duration>,
+        on_connection_changed: Option<Box<dyn Fn(ConnectionChange) + Send + Sync + 'static>>,
+        timeouts: crate::relay::SessionTimeouts,
     ) -> Result<Self, SessionError> {
         // Build all arcs directly — mirrors connect_full but without an initial transport.
         let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
@@ -2743,6 +2819,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
                 transport_factory,
                 cap,
                 on_cc,
+                timeouts,
             );
         });
 

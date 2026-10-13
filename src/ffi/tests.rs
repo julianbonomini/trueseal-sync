@@ -1385,3 +1385,48 @@ fn leaving_device_applies_manifests_without_a_spurious_joined_event() {
     assert_eq!(session.status().unwrap(), GroupStatus::Leaving);
     session.close();
 }
+
+/// B23c DIAGNOSTIC (the D1 finding): with PRODUCTION timeouts, a silent
+/// relay must be detected dead through the full FFI stack — watchdog →
+/// sever → reconnect loop → ListenerBus. The stub never echoes heartbeats,
+/// so the liveness window starts at connect: Disconnected must surface
+/// within ~100 s (75 s liveness + one 25 s heartbeat tick + slack).
+/// Ignored in the suite (production timeouts make it slow); the fast,
+/// committed coverage is src/session/tests/relay_kill.rs.
+#[test]
+#[ignore = "B23c diagnostic: runs at production timeouts (~100 s)"]
+fn silent_relay_is_detected_through_the_ffi_stack() {
+    let relay = TcpRelay::spawn();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session = open_test_session(&dir, &relay.address(), "app");
+
+    let events = Arc::new(Mutex::new(Vec::<TrueSealEvent>::new()));
+    struct L(Arc<Mutex<Vec<TrueSealEvent>>>);
+    impl TrueSealEventListener for L {
+        fn on_event(&self, event: TrueSealEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+    session
+        .on_event(Box::new(L(events.clone())))
+        .expect("on_event");
+
+    let saw = |want: fn(&ConnectionState) -> bool| {
+        events.lock().unwrap().iter().any(
+            |e| matches!(e, TrueSealEvent::ConnectionChanged { connection } if want(connection)),
+        )
+    };
+    wait_for(
+        || saw(|c| matches!(c, ConnectionState::Connected)),
+        Duration::from_secs(10),
+        "connected",
+    );
+    // The stub never echoes heartbeats: silence begins at connect. The
+    // watchdog severs at the first tick past 75 s of silence.
+    wait_for(
+        || saw(|c| matches!(c, ConnectionState::Disconnected)),
+        Duration::from_secs(150),
+        "disconnected after the liveness window",
+    );
+    session.close();
+}
