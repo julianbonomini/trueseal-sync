@@ -27,6 +27,7 @@ mod revocation;
 mod sealed_envelope;
 mod sender_contract;
 mod size_limit;
+mod store_versioning;
 mod version_arithmetic;
 
 use ed25519_dalek::SigningKey;

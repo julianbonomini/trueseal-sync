@@ -90,8 +90,26 @@ fn signing_message(
     members: &[ManifestMember],
     parent: &Option<[u8; 32]>,
 ) -> Vec<u8> {
-    // `crate::` — the `version` parameter shadows the module name here.
-    let mut msg = crate::version::manifest_signing_domain();
+    signing_message_for(
+        &crate::version::manifest_signing_domain(),
+        group_id,
+        version,
+        members,
+        parent,
+    )
+}
+
+/// [`signing_message`] under an explicit domain. The migration re-seal
+/// (ADR-0034 §1, SYNC-13) re-signs queued manifests under the End-to-End
+/// Version being migrated to.
+fn signing_message_for(
+    domain: &[u8],
+    group_id: &[u8; 32],
+    version: u64,
+    members: &[ManifestMember],
+    parent: &Option<[u8; 32]>,
+) -> Vec<u8> {
+    let mut msg = domain.to_vec();
     msg.extend_from_slice(group_id);
     msg.extend_from_slice(&version.to_le_bytes());
     for m in members {
@@ -181,8 +199,6 @@ impl GroupManifest {
     /// version with a lower hash — the tie rule that makes every device
     /// pick the same winner from the same concurrent pair.
     pub fn verify(&self, previous: Option<&GroupManifest>) -> Result<(), ManifestError> {
-        use ed25519_dalek::{Signature, VerifyingKey};
-
         // SYNC-10 (#102): a manifest at u64::MAX can never be incremented,
         // so accepting it would freeze membership for good — reject it on
         // receipt, as genesis or update (ADR-0027).
@@ -236,12 +252,70 @@ impl GroupManifest {
         }
 
         // Verify signature
+        self.verify_signature_for_version(crate::version::END_TO_END_VERSION)
+    }
+
+    /// Verify only the issuer's signature, under the signing domain of an
+    /// explicit End-to-End Version. The migration re-seal checks its own
+    /// re-signed manifests against the version being migrated to; normal
+    /// acceptance goes through [`GroupManifest::verify`], which uses this
+    /// build's version.
+    pub(crate) fn verify_signature_for_version(
+        &self,
+        e2e_version: u32,
+    ) -> Result<(), ManifestError> {
+        use ed25519_dalek::{Signature, VerifyingKey};
         let vk = VerifyingKey::from_bytes(&self.issued_by)
             .map_err(|_| ManifestError::InvalidSignature)?;
         let sig = Signature::from_bytes(&self.signature);
-        let msg = signing_message(&self.group_id, self.version, &self.members, &self.parent);
+        let msg = signing_message_for(
+            &crate::version::manifest_signing_domain_for(e2e_version),
+            &self.group_id,
+            self.version,
+            &self.members,
+            &self.parent,
+        );
         vk.verify_strict(&msg, &sig)
             .map_err(|_| ManifestError::InvalidSignature)
+    }
+
+    /// Re-sign this manifest under the signing domain of End-to-End Version
+    /// `e2e_version`, keeping `group_id`, `version` and `members` and naming
+    /// `parent` (already remapped by the caller when an ancestor was itself
+    /// re-signed). The migration re-seal (ADR-0034 §1, SYNC-13) uses this on
+    /// queued, never-accepted manifests this Device issued. The re-signed
+    /// manifest has a different hash than the original — the caller owns
+    /// propagating the old→new hash remap.
+    ///
+    /// Refuses to re-sign another Device's issuance (`issued_by` must be the
+    /// key's public half): only the issuer may re-sign.
+    pub(crate) fn resign_for_version(
+        &self,
+        parent: Option<[u8; 32]>,
+        e2e_version: u32,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<Self, ManifestError> {
+        use ed25519_dalek::Signer;
+        let issued_by: [u8; 32] = signing_key.verifying_key().to_bytes();
+        if issued_by != self.issued_by {
+            return Err(ManifestError::UnknownIssuer);
+        }
+        let msg = signing_message_for(
+            &crate::version::manifest_signing_domain_for(e2e_version),
+            &self.group_id,
+            self.version,
+            &self.members,
+            &parent,
+        );
+        let sig = signing_key.sign(&msg);
+        Ok(Self {
+            group_id: self.group_id,
+            version: self.version,
+            members: self.members.clone(),
+            issued_by,
+            signature: sig.to_bytes(),
+            parent,
+        })
     }
 
     pub fn encode(&self) -> Vec<u8> {

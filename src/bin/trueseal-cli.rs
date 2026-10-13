@@ -80,6 +80,27 @@ use trueseal_sync::{
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
+    // trueseal-cli emit-fixture --dir <dir> --state <member-with-outbox|dedup-in-use>
+    // Writes a G6 upgrade-fixture store (ADR-0032) and exits — no relay needed.
+    if args.get(1).map(String::as_str) == Some("emit-fixture") {
+        let dir = PathBuf::from(require_flag(&args, "--dir"));
+        let namespace = optional_flag(&args, "--namespace").unwrap_or_else(|| "device".into());
+        let state = require_flag(&args, "--state");
+        std::fs::create_dir_all(&dir).expect("create state dir");
+        let state = trueseal_sync::fixtures::FixtureState::parse(&state).unwrap_or_else(|| {
+            eprintln!("unknown --state {state:?} (known: member-with-outbox, dedup-in-use)");
+            std::process::exit(1);
+        });
+        trueseal_sync::fixtures::emit_upgrade_fixture(&dir, &namespace, state)
+            .expect("emit fixture");
+        println!(
+            "fixture {} written to {}",
+            state.name(),
+            dir.join(format!("trueseal_{namespace}.db")).display()
+        );
+        return;
+    }
+
     let dir = require_flag(&args, "--dir");
     let relay_host = require_flag(&args, "--relay");
     let relay_pub_hex = require_flag(&args, "--relay-pub");
@@ -359,6 +380,10 @@ fn main() {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn optional_flag(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
 
 fn require_flag(args: &[String], flag: &str) -> String {
     args.windows(2)

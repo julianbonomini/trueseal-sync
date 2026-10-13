@@ -7,6 +7,8 @@ pub mod delivery_issue;
 pub mod device;
 pub mod envelope;
 pub mod ffi;
+#[doc(hidden)] // G6 upgrade-fixture emission — a dev utility, not SDK API
+pub mod fixtures;
 pub mod keys;
 pub mod limits;
 pub mod manifest;

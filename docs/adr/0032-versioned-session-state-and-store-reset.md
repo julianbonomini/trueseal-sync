@@ -1,6 +1,6 @@
 # Session State is versioned and migrates forward; a Store Reset needs explicit approval
 
-Status: accepted (decided 2026-09-30 in [trueseal-roadmap#20](https://github.com/julianbonomini/trueseal-roadmap/issues/20); not yet implemented). This refines the outbox rule of ADR-0022 and adds one status reason and one error case to ADR-0028. The relay's store follows the same policy in trueseal-relay ADR-0013. Amended by ADR-0034.
+Status: accepted (decided 2026-09-30 in [trueseal-roadmap#20](https://github.com/julianbonomini/trueseal-roadmap/issues/20); implemented in SYNC-13 (#105)). This refines the outbox rule of ADR-0022 and adds one status reason and one error case to ADR-0028. The relay's store follows the same policy in trueseal-relay ADR-0013. Amended by ADR-0034.
 
 The store has no schema version and no migrations today. The preview ADRs already add a lot of durable state: Pending Join, Leaving, Destroying, the dedup table, held manifests and Pending Membership Changes. So 0.6.0 starts a new store format no matter what. This ADR decides what happens between preview releases.
 

@@ -28,6 +28,24 @@ pub const END_TO_END_VERSION: u32 = 1;
 /// and dropped with `unreadable(droppedWhileHeld)` (ADR-0034).
 pub const MAX_HELD_BLOBS: usize = 100;
 
+// ── Store versions (ADR-0032) ─────────────────────────────────────────────────
+//
+// Store Versions are independent of protocol versions: they version the local
+// Session State format, not the wire. The first preview release (0.6.0)
+// writes Store Version 1.
+
+/// The Store Version this build writes (ADR-0032). Session State records it;
+/// every later release migrates forward in chains from any version at or
+/// above the floor.
+pub const STORE_VERSION: u32 = 1;
+
+/// The migration floor (ADR-0032): the oldest Store Version this build will
+/// migrate. Anything older — including the unversioned stores development
+/// builds left behind — is unmigratable and reset automatically with the
+/// `storeReset` status reason. A Store Reset release moves the floor to
+/// itself and needs the product owner's explicit approval.
+pub const STORE_MIGRATION_FLOOR: u32 = 1;
+
 // ── Domain-separated cryptographic bindings ───────────────────────────────────
 //
 // Every string below is derived from END_TO_END_VERSION so the constants above
@@ -53,7 +71,15 @@ pub fn envelope_signing_domain() -> Vec<u8> {
 
 /// Domain separator prepended to the Group Manifest signing input.
 pub fn manifest_signing_domain() -> Vec<u8> {
-    format!("trueseal-sync manifest v{END_TO_END_VERSION}\0").into_bytes()
+    manifest_signing_domain_for(END_TO_END_VERSION)
+}
+
+/// The manifest signing domain for an explicit End-to-End Version. The
+/// migration re-seal (ADR-0034 §1, SYNC-13) re-signs queued manifests under
+/// the version being migrated TO, which is not this build's constant while a
+/// bump is simulated in tests.
+pub fn manifest_signing_domain_for(version: u32) -> Vec<u8> {
+    format!("trueseal-sync manifest v{version}\0").into_bytes()
 }
 
 // ── Transport Version prefix ──────────────────────────────────────────────────
