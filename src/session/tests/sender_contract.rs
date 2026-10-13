@@ -256,7 +256,6 @@ fn reconnect_clears_backoff_and_retries_immediately() {
     let keys = Arc::new(Mutex::new(KeyState::from_keypair(&device)));
     let op_log: Arc<Mutex<Box<dyn OperationLog>>> = Arc::new(Mutex::new(Box::new(MemLog::new())));
     let issue_sink = Arc::new(Mutex::new(IssueSink::new()));
-    let destroyed = Arc::new(AtomicBool::new(false));
     let kick = Arc::new(Kick::new());
     spawn_sender(
         client_slot.clone(),
@@ -265,7 +264,7 @@ fn reconnect_clears_backoff_and_retries_immediately() {
         relay_pub.0,
         Arc::new(nk.factory()),
         issue_sink,
-        destroyed,
+        Arc::new(Mutex::new(None)),
         kick.clone(),
         SenderConfig {
             retry_base: Duration::from_secs(5),
@@ -275,6 +274,7 @@ fn reconnect_clears_backoff_and_retries_immediately() {
         },
         Arc::new(Mutex::new(None)),
         Arc::new(AtomicBool::new(false)),
+        Box::new(|| {}),
         Box::new(|| {}),
     );
 
@@ -866,21 +866,10 @@ fn delivered_rows_are_deleted_and_sequence_survives_restart() {
         );
         assert_eq!(relay.pushes().len(), 1);
         first_max_seq = open_seq(&relay.pushes()[0].1, &recipient);
-        // Stop this session's pump cleanly: destroy_group sets `destroyed`
-        // and queues nothing (no peers besides the recipient... it queues
-        // one Revoke — which the pump drains before exiting).
-        session.destroy_group();
-        wait_for(
-            || {
-                session
-                    .op_log
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .undelivered_entries()
-                    .is_empty()
-            },
-            Duration::from_secs(3),
-        );
+        // End the first "process". (ADR-0029 note: destroy_group is no
+        // longer usable as teardown here — a completed Destroy wipes the
+        // store, sequence state included, by design.)
+        drop(session);
     }
 
     // Second "process" over the same store: the next send must NOT re-use
@@ -908,7 +897,7 @@ fn delivered_rows_are_deleted_and_sequence_survives_restart() {
         second_seq > first_max_seq,
         "sequence must never be re-used after restart: first process used {first_max_seq}, second sent {second_seq}"
     );
-    session2.destroy_group();
+    drop(session2);
 }
 
 /// The full crash point, end to end (ADR-0026): the relay persisted the

@@ -4,6 +4,7 @@ mod connection;
 mod convergence;
 mod delivery_contract;
 mod destroy_group;
+mod destroy_group_state;
 mod early_deliver;
 mod fanout;
 mod join_group;

@@ -1496,6 +1496,12 @@ impl OperationLog for FailingJoinLog {
     fn leaving(&self) -> Option<Vec<u8>> {
         self.inner.leaving()
     }
+    fn destroying(&self) -> Option<Vec<u8>> {
+        self.inner.destroying()
+    }
+    fn is_held_signer(&self, signing_pub: &[u8; 32]) -> bool {
+        self.inner.is_held_signer(signing_pub)
+    }
     fn wipe_group_state(&mut self) {
         self.inner.wipe_group_state();
     }

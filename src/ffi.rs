@@ -84,6 +84,10 @@ pub enum GroupStatus {
     /// it; then the device wipes, rotates its identity and returns to
     /// `NotJoined` (ADR-0027).
     Leaving,
+    /// Started or received Destroy Group and waiting for the Relay to
+    /// accept every queued Revoke; then the device wipes, rotates its
+    /// identity and returns to `NotJoined` (ADR-0029).
+    Destroying,
 }
 
 impl From<crate::session::GroupStatus> for GroupStatus {
@@ -93,6 +97,7 @@ impl From<crate::session::GroupStatus> for GroupStatus {
             crate::session::GroupStatus::PendingJoin => GroupStatus::PendingJoin,
             crate::session::GroupStatus::Member => GroupStatus::Member,
             crate::session::GroupStatus::Leaving => GroupStatus::Leaving,
+            crate::session::GroupStatus::Destroying => GroupStatus::Destroying,
         }
     }
 }
@@ -305,12 +310,9 @@ impl TruesealFfiSession {
             Store::open(Path::new(&base_dir), &namespace).map_err(map_store_error)?,
         ));
 
-        // Open a fourth store handle for wiping on group destroy, and a
-        // fifth for the wipe + rotate on deliberate removal / completed
-        // Leave (ADR-0027).
-        let wipe_store = Arc::new(Mutex::new(
-            Store::open(Path::new(&base_dir), &namespace).map_err(map_store_error)?,
-        ));
+        // Open a fourth store handle for the wipe + rotate on deliberate
+        // removal, a completed Leave and a completed Destroy Group
+        // (ADR-0027, ADR-0029).
         let rotate_store = Arc::new(Mutex::new(
             Store::open(Path::new(&base_dir), &namespace).map_err(map_store_error)?,
         ));
@@ -345,8 +347,12 @@ impl TruesealFfiSession {
                     .unwrap_or_else(|e| e.into_inner())
                     .save_group_manifest(m);
             },
+            // ADR-0029: this fires at Destroy COMPLETION — the Relay has
+            // accepted every queued Revoke and the wipe + identity rotation
+            // already ran through `on_identity_rotated` (below). Pure
+            // notification: wiping here would delete the fresh keypair the
+            // rotation just persisted.
             move || {
-                let _ = wipe_store.lock().unwrap_or_else(|e| e.into_inner()).wipe();
                 on_group_destroyed.on_group_destroyed();
             },
             // ADR-0027: on deliberate removal or a completed Leave the core
@@ -532,10 +538,15 @@ impl TruesealFfiSession {
         self.inner.leave_group().map_err(SessionError::from)
     }
 
-    /// Destroy the group: push Revoke to all members, wipe local state, fire on_group_destroyed.
-    /// Session becomes terminal — all subsequent `send()` calls return `GroupDestroyed`.
-    pub fn destroy_group(&self) {
-        self.inner.destroy_group();
+    /// Destroy the group (ADR-0029): persist the Destroying state and queue one
+    /// Revoke per member through the outbox, in one transaction. The device stays
+    /// `GroupStatus::Destroying` — no `send()`, no handlers, still connected —
+    /// until the relay has accepted every Revoke; then it wipes, rotates its
+    /// identity and `on_group_destroyed` fires as the device returns to
+    /// `NotJoined`. No-op while already Destroying; `NotInGroup` in
+    /// `pendingJoin` / `notJoined`.
+    pub fn destroy_group(&self) -> Result<(), SessionError> {
+        self.inner.destroy_group().map_err(SessionError::from)
     }
 }
 
@@ -766,7 +777,12 @@ mod store_versioning_ffi_tests {
         assert_eq!(session.group_status(), GroupStatus::NotJoined);
         // The object can pair again.
         assert!(!session.pairing_token().is_empty());
-        session.destroy_group();
+        // Destroying outside a group is a typed error, not a panic
+        // (ADR-0029 state table).
+        assert!(matches!(
+            session.destroy_group(),
+            Err(SessionError::NotInGroup)
+        ));
     }
 
     /// A store written by a newer release: create() fails with the typed

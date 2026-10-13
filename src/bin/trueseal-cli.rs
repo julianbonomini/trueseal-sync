@@ -366,8 +366,12 @@ fn main() {
             }
 
             "destroy" => {
-                session.destroy_group();
-                println!("group destroyed");
+                match session.destroy_group() {
+                    // ADR-0029: the device is now Destroying — the wipe
+                    // happens once the relay has accepted every Revoke.
+                    Ok(()) => println!("destroying (wipes once the relay accepts every revoke)"),
+                    Err(e) => println!("error: {}", e),
+                }
             }
 
             "quit" | "exit" => break,

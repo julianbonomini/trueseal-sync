@@ -36,7 +36,9 @@ use crate::message::{message_id, Message};
 use crate::operation_log::{now_secs, LogEntry, OperationLog, OutboxKind};
 use crate::relay::{build_push_blob, push_send, RelayClient, RelayError};
 
-use super::{leaving_refs_drained, IssueSink, KeyState, LeavingRecord};
+use super::{
+    leaving_refs_drained, refs_drained, DestroyingRecord, IssueSink, KeyState, LeavingRecord,
+};
 
 /// Tunables for the sender pump. Defaults follow ADR-0026: backoff from
 /// 1 s to a 5 min cap, and a 30-day expiry on `Sync` entries.
@@ -106,14 +108,13 @@ pub(super) fn backoff_delay(config: &SenderConfig, failures: u32) -> Duration {
         .min(config.retry_cap)
 }
 
-/// Spawn the sender pump. Runs until the group is destroyed AND the outbox
-/// has drained (a Destroy Group queues its Revokes first; the pump's last
-/// job is to push them while connected — the durable Destroying state that
-/// survives a restart is SYNC-11 scope).
+/// Spawn the sender pump. Runs for the session's lifetime.
 ///
-/// Two ADR-0027 duties on top of the outbox state machine:
+/// Three duties on top of the outbox state machine:
 /// - complete a Leaving once the Relay has accepted every Leave push
-///   (`on_leave_complete` wipes and rotates);
+///   (`on_leave_complete` wipes and rotates, ADR-0027);
+/// - complete a Destroying once the Relay has accepted every queued Revoke
+///   (`on_destroy_complete` wipes, rotates and reports — ADR-0029);
 /// - rebind the Receive Session after an identity rotation: the client is
 ///   swapped for the disconnected stub and the reconnect loop redials with
 ///   the fresh keys.
@@ -125,12 +126,13 @@ pub(super) fn spawn_sender<T: Read + Write + Send + 'static>(
     relay_pub_bytes: [u8; 32],
     push_factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     issue_sink: Arc<Mutex<IssueSink>>,
-    destroyed: Arc<AtomicBool>,
+    destroying: Arc<Mutex<Option<DestroyingRecord>>>,
     kick: Arc<Kick>,
     config: SenderConfig,
     leaving: Arc<Mutex<Option<LeavingRecord>>>,
     rotation_pending: Arc<AtomicBool>,
     on_leave_complete: Box<dyn Fn() + Send>,
+    on_destroy_complete: Box<dyn Fn() + Send>,
 ) {
     std::thread::spawn(move || {
         sender_loop(
@@ -140,12 +142,13 @@ pub(super) fn spawn_sender<T: Read + Write + Send + 'static>(
             relay_pub_bytes,
             push_factory,
             issue_sink,
-            destroyed,
+            destroying,
             kick,
             config,
             leaving,
             rotation_pending,
             on_leave_complete,
+            on_destroy_complete,
         );
     });
 }
@@ -158,12 +161,13 @@ fn sender_loop<T: Read + Write + Send + 'static>(
     relay_pub_bytes: [u8; 32],
     push_factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     issue_sink: Arc<Mutex<IssueSink>>,
-    destroyed: Arc<AtomicBool>,
+    destroying: Arc<Mutex<Option<DestroyingRecord>>>,
     kick: Arc<Kick>,
     config: SenderConfig,
     leaving: Arc<Mutex<Option<LeavingRecord>>>,
     rotation_pending: Arc<AtomicBool>,
     on_leave_complete: Box<dyn Fn() + Send>,
+    on_destroy_complete: Box<dyn Fn() + Send>,
 ) {
     let mut backoffs: HashMap<[u8; 32], RecipientBackoff> = HashMap::new();
     let mut was_connected = false;
@@ -190,6 +194,18 @@ fn sender_loop<T: Read + Write + Send + 'static>(
             }
         }
 
+        // ADR-0029: a Destroying completes when the Relay has accepted
+        // every queued Revoke — then wipe, rotate and report. The device
+        // stays connected until then (there is no timeout). Same placement
+        // as Leaving: a drain that happened just before a disconnect still
+        // completes.
+        let destroying_rec = destroying.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(rec) = destroying_rec {
+            if refs_drained(&op_log, &rec.refs) {
+                (on_destroy_complete)();
+            }
+        }
+
         let connected = client
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -210,12 +226,6 @@ fn sender_loop<T: Read + Write + Send + 'static>(
             .unwrap_or_else(|e| e.into_inner())
             .undelivered_entries();
 
-        // The pump's exit condition: destroyed AND nothing left to send.
-        // (The Revokes destroy_group queued are pushed first, while the
-        // session is still connected.)
-        if entries.is_empty() && destroyed.load(Ordering::Acquire) {
-            break;
-        }
         if entries.is_empty() {
             kick.wait(config.poll);
             continue;

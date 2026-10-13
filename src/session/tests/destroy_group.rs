@@ -11,9 +11,11 @@ use super::super::test_helpers::*;
 use super::super::{SessionError, TruesealSession};
 use super::make_two_member_manifest;
 
-/// destroy_group() fires on_group_destroyed on the initiating device.
+/// ADR-0029 initiator flow: destroy_group() enters Destroying (no Sync,
+/// no callback yet); when the Relay has accepted every queued Revoke the
+/// device wipes, rotates and fires on_group_destroyed exactly once.
 #[test]
-fn destroy_group_fires_on_group_destroyed_on_initiator() {
+fn destroy_group_completes_after_relay_accepts_revokes() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
@@ -21,7 +23,13 @@ fn destroy_group_fires_on_group_destroyed_on_initiator() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
+            // Hold the XX session OPEN for the relay's life: dropping it
+            // EOFs the client's receive loop, and the pump only sends while
+            // connected — under slow CI the disconnect could win the race
+            // against the Revoke push and the Destroy would never complete.
+            let Ok(_sess) = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp) else {
+                return;
+            };
             while let Ok(p) = nk_rx.recv() {
                 let kp2 =
                     trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
@@ -37,6 +45,10 @@ fn destroy_group_fires_on_group_destroyed_on_initiator() {
         });
     }
     let device = DeviceKeypair::generate();
+    let noise = device.public_key();
+    let signing = device.signing_public_key();
+    let sk = SigningKey::from_bytes(&device.signing.to_bytes());
+    let peer = DeviceKeypair::generate();
     let destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let dc = destroyed.clone();
     let session = TruesealSession::connect_full(
@@ -53,12 +65,45 @@ fn destroy_group_fires_on_group_destroyed_on_initiator() {
         nk.factory(),
     )
     .expect("connect");
+    session.set_manifest(make_two_member_manifest(
+        noise,
+        signing,
+        &sk,
+        peer.public_key(),
+        peer.signing_public_key(),
+    ));
 
-    session.destroy_group();
+    session.destroy_group().expect("member can destroy");
+
+    // Destroying: no Sync sends, the callback has NOT fired (the Relay
+    // hasn't accepted yet at this synchronous point).
     assert_eq!(
-        *destroyed.lock().unwrap(),
-        1,
-        "on_group_destroyed must fire once"
+        session.group_status(),
+        super::super::GroupStatus::Destroying,
+        "destroy_group enters the Destroying state"
+    );
+    assert!(
+        matches!(
+            session.push_sync(b"nope".to_vec()),
+            Err(SessionError::GroupDestroyed)
+        ),
+        "no Sync is sent while Destroying"
+    );
+
+    // The pump pushes the Revoke, the relay Acks it, the Destroy
+    // completes: wipe + rotate + exactly one callback.
+    wait_for(|| *destroyed.lock().unwrap() == 1, Duration::from_secs(20));
+    assert_eq!(
+        session.group_status(),
+        super::super::GroupStatus::NotJoined,
+        "a completed Destroy ends in notJoined"
+    );
+    assert!(
+        matches!(
+            session.push_sync(b"still nope".to_vec()),
+            Err(SessionError::NotInGroup)
+        ),
+        "after the wipe the device is simply not in a group (the object stays usable)"
     );
 }
 
@@ -115,8 +160,11 @@ fn destroy_group_fires_on_group_destroyed_on_all_members() {
     session_a.set_manifest(v1.clone());
     session_b.set_manifest(v1);
 
-    session_a.destroy_group();
-    wait_for(|| *b_destroyed.lock().unwrap() >= 1, Duration::from_secs(5));
+    session_a.destroy_group().expect("destroy");
+    wait_for(
+        || *b_destroyed.lock().unwrap() >= 1,
+        Duration::from_secs(20),
+    );
 
     assert_eq!(
         *b_destroyed.lock().unwrap(),
@@ -135,7 +183,13 @@ fn push_sync_after_destroy_returns_group_destroyed() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
+            // Hold the XX session OPEN for the relay's life: dropping it
+            // EOFs the client's receive loop, and the pump only sends while
+            // connected — under slow CI the disconnect could win the race
+            // against the Revoke push and the Destroy would never complete.
+            let Ok(_sess) = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp) else {
+                return;
+            };
             while let Ok(p) = nk_rx.recv() {
                 let kp2 =
                     trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
@@ -177,7 +231,7 @@ fn push_sync_after_destroy_returns_group_destroyed() {
     );
     session.set_manifest(v1);
 
-    session.destroy_group();
+    session.destroy_group().expect("destroy");
     let result = session.push_sync(b"should fail".to_vec());
     assert!(
         matches!(result, Err(SessionError::GroupDestroyed)),
@@ -227,10 +281,12 @@ fn store_wipe_clears_keypair_and_manifest() {
     );
 }
 
-/// on_group_destroyed wires wipe: after destroy_group fires the callback,
-/// the store is wiped and load_group_manifest returns None.
+/// ADR-0029 FFI wiring: on Destroy COMPLETION the identity-rotation
+/// callback wipes the store and persists the fresh keypair (the FFI maps
+/// that to its rotate_store); on_group_destroyed is a pure notification —
+/// wiping there would delete the fresh identity just persisted.
 #[test]
-fn on_group_destroyed_callback_wipes_store() {
+fn destroy_completion_wipes_store_and_persists_fresh_identity() {
     let dir = tempfile::TempDir::new().unwrap();
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
@@ -239,7 +295,13 @@ fn on_group_destroyed_callback_wipes_store() {
     {
         let kp = trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let _ = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp);
+            // Hold the XX session OPEN for the relay's life: dropping it
+            // EOFs the client's receive loop, and the pump only sends while
+            // connected — under slow CI the disconnect could win the race
+            // against the Revoke push and the Destroy would never complete.
+            let Ok(_sess) = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp) else {
+                return;
+            };
             while let Ok(p) = nk_rx.recv() {
                 let kp2 =
                     trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
@@ -261,15 +323,11 @@ fn on_group_destroyed_callback_wipes_store() {
     let sk = SigningKey::from_bytes(&device.signing.to_bytes());
     let dummy = DeviceKeypair::generate();
 
-    // Simulate what the FFI does: open a wipe_store, pass its wipe in the closure.
-    let wipe_store = Store::open(dir.path(), "ns").expect("open wipe store");
+    // Simulate what the FFI does: a rotate_store wiped and re-keyed inside
+    // on_identity_rotated; a check handle to observe it.
+    let rotate_store = Store::open(dir.path(), "ns").expect("open rotate store");
     let check_store = Store::open(dir.path(), "ns").expect("open check store");
 
-    // Pre-populate the store with a keypair and manifest.
-    let kp_for_store = DeviceKeypair::generate();
-    wipe_store
-        .save_keypair(&kp_for_store)
-        .expect("pre-save keypair");
     let manifest = make_two_member_manifest(
         noise,
         signing,
@@ -277,13 +335,15 @@ fn on_group_destroyed_callback_wipes_store() {
         dummy.public_key(),
         dummy.signing_public_key(),
     );
-    wipe_store
+    rotate_store
         .save_group_manifest(&manifest)
         .expect("pre-save manifest");
 
-    let wipe_store = Arc::new(Mutex::new(wipe_store));
+    let rotate_store = Arc::new(Mutex::new(rotate_store));
+    let destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let dc = destroyed.clone();
 
-    let session = TruesealSession::connect_full(
+    let session = TruesealSession::connect_full_rotating(
         pipe_client,
         relay_pub,
         device,
@@ -292,7 +352,12 @@ fn on_group_destroyed_callback_wipes_store() {
         || {},
         |_| {},
         move || {
-            let _ = wipe_store.lock().unwrap().wipe();
+            *dc.lock().unwrap() += 1;
+        },
+        move |fresh: DeviceKeypair| {
+            let store = rotate_store.lock().unwrap();
+            let _ = store.wipe();
+            let _ = store.save_keypair(&fresh);
         },
         nk.factory(),
     )
@@ -307,45 +372,69 @@ fn on_group_destroyed_callback_wipes_store() {
     );
     session.set_manifest(v1);
 
-    session.destroy_group();
+    session.destroy_group().expect("member can destroy");
 
-    // The wipe_store's wipe() should have cleared both tables.
-    assert!(
-        check_store.load_keypair().unwrap().is_none(),
-        "keypair cleared after destroy_group"
-    );
+    // Completion: the relay Acks the Revoke, the wipe + rotation runs, the
+    // callback fires once.
+    wait_for(|| *destroyed.lock().unwrap() == 1, Duration::from_secs(20));
     assert!(
         check_store.load_group_manifest().unwrap().is_none(),
-        "manifest cleared after destroy_group"
+        "manifest cleared after the Destroy completed"
+    );
+    let fresh = check_store
+        .load_keypair()
+        .unwrap()
+        .expect("fresh keypair persisted after the wipe");
+    assert_ne!(
+        fresh.public_key(),
+        noise,
+        "the persisted identity is the rotated one, not the old device key"
     );
 }
 
-/// destroy_group() stops the reconnect loop — undelivered outbox blobs are
-/// NOT replayed after the group is destroyed.
+/// ADR-0029: destroy_group() drops pending Sync sends WITHOUT reporting
+/// them, queues the Revoke, and stays connected — the Revoke IS replayed
+/// after reconnect (the old "destroy stops the outbox" behavior is
+/// inverted: durability is the whole point). Completion (Relay accepts
+/// the Revoke) then wipes and fires on_group_destroyed.
 #[test]
-fn destroy_group_stops_outbox_replay() {
+fn destroy_group_drops_sync_sends_and_replays_revoke_after_reconnect() {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
 
-    // Relay that counts received pushes.
+    // Relay: holds the XX Receive Session; counts and Acks pushes on the
+    // NK push side (ADR-0018).
     let relay_received: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
     let rr = relay_received.clone();
     let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
     {
         let relay_kp2 =
             trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
         std::thread::spawn(move || {
-            let s = match crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2) {
-                Ok(s) => s,
-                Err(_) => return,
+            // Hold the XX session open — dropping it EOFs the client's
+            // receive loop and the reconnect loop would exhaust the one
+            // pipe this test provides.
+            let Ok(_sess) = crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2)
+            else {
+                return;
             };
-            while let Ok(raw) = s.receive() {
-                if let Some((crate::relay::MsgType::Push, _)) = crate::relay::parse(&raw) {
-                    *rr.lock().unwrap() += 1;
-                }
+            while let Ok(p) = nk_rx.recv() {
+                let kp =
+                    trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+                let rr2 = rr.clone();
+                std::thread::spawn(move || {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(p, kp) {
+                        if sess.receive().is_ok() {
+                            *rr2.lock().unwrap() += 1;
+                            let _ =
+                                sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                        }
+                    }
+                });
             }
         });
     }
@@ -390,7 +479,7 @@ fn destroy_group_stops_outbox_replay() {
                 Err("not yet".to_string())
             }
         },
-        || Err("push factory unused in this test".into()), // destroy_group test never reconnects
+        nk.factory(),
         Some(Duration::from_millis(50)),
         None,
     )
@@ -409,29 +498,57 @@ fn destroy_group_stops_outbox_replay() {
         "2 outbox entries"
     );
 
-    // Destroy BEFORE allowing reconnect.
-    session.destroy_group();
+    // Destroy BEFORE allowing reconnect: the two Sync sends drop
+    // (unreported), one Revoke is queued, the device is Destroying and
+    // nothing has fired — the Relay is unreachable, so the Destroy holds.
+    session.destroy_group().expect("member can destroy");
+    assert_eq!(
+        session.group_status(),
+        super::super::GroupStatus::Destroying,
+        "Destroying holds while the Relay is unreachable (no timeout)"
+    );
+    {
+        let log = session.op_log.lock().unwrap();
+        let entries = log.undelivered_entries();
+        assert_eq!(entries.len(), 1, "only the queued Revoke survives");
+        assert_eq!(
+            entries[0].kind,
+            crate::operation_log::OutboxKind::Control,
+            "the survivor is the control-plane Revoke"
+        );
+    }
     assert_eq!(
         *destroyed_count.lock().unwrap(),
-        1,
-        "on_group_destroyed fired"
+        0,
+        "on_group_destroyed fires only at completion, not at call time"
     );
     assert!(
         matches!(
             session.push_sync(b"after-destroy".to_vec()),
             Err(super::super::SessionError::GroupDestroyed)
         ),
-        "session is terminal after destroy"
+        "no Sync while Destroying"
     );
 
-    // Now allow the factory to succeed — but the loop has exited (destroyed=true).
+    // Reconnect: the pump replays the Revoke, the relay receives exactly
+    // one push and Acks it — completion wipes and fires once.
     should_connect.store(true, std::sync::atomic::Ordering::Release);
-
-    // Wait well beyond reconnect backoff — relay must receive nothing.
-    std::thread::sleep(Duration::from_millis(400));
+    wait_for(
+        || *relay_received.lock().unwrap() >= 1,
+        Duration::from_secs(20),
+    );
     assert_eq!(
         *relay_received.lock().unwrap(),
-        0,
-        "no blobs replayed after destroy_group — reconnect loop exited"
+        1,
+        "exactly the Revoke was replayed — the dropped Sync sends never leave"
+    );
+    wait_for(
+        || *destroyed_count.lock().unwrap() == 1,
+        Duration::from_secs(20),
+    );
+    assert_eq!(
+        session.group_status(),
+        super::super::GroupStatus::NotJoined,
+        "the completed Destroy ends in notJoined"
     );
 }

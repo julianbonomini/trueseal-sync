@@ -1042,6 +1042,8 @@ fn leave_completes_at_construction_when_refs_drained_pre_crash() {
             held: vec![(leave_manifest.hash(), false)],
             pending_changes: Vec::new(),
             leaving: Some(record.encode()),
+            destroying: None,
+            drop_sync_outbox: false,
             outbox: Vec::new(),
         })
         .expect("stage leave");
@@ -1278,6 +1280,94 @@ fn replayed_old_manifest_changes_no_state() {
     assert_eq!(manifest_of(&session_b).hash(), before, "no state change");
     assert_eq!(*changed.lock().unwrap(), 0, "no manifest-changed events");
     assert!(issues.lock().unwrap().is_empty(), "replays are unreported");
+}
+
+/// B9 review note, fixed in SYNC-11: a Leave must survive a false-removal +
+/// re-inclusion sequence. The false removal clears the Pending Membership
+/// Change set (a non-member's changes carry no authority); on the old rule
+/// the NEXT accepted manifest cancelled Leaving silently, because the cancel
+/// fired on the Leave intent's mere absence from the set. Now only
+/// deliberate supersession (W built directly on the Leave's carrier)
+/// cancels — the Leaving record survives and the Leave still completes.
+#[test]
+fn leave_survives_false_removal_then_reinclusion() {
+    let a = DeviceKeypair::generate();
+    let b = DeviceKeypair::generate();
+    let b_signing_before = b.signing_public_key();
+
+    // B online for inbound delivery, but its pushes never drain (failing NK
+    // factory) — the Leave stays in flight for the whole test.
+    let relay_kp = make_relay_kp();
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    let session_b = TruesealSession::connect_full(
+        pipe_client,
+        relay_pub(&relay_kp),
+        clone_kp(&b),
+        |_, _, _| {},
+        Box::new(MemLog::new()),
+        || {},
+        |_| {},
+        || {},
+        || -> Result<MemPipeSimple, String> { Err("pushes offline".into()) },
+    )
+    .expect("B");
+
+    let v1 = genesis_ab(&a, &b);
+    session_b.set_manifest(v1.clone());
+    session_b.leave_group().expect("leave");
+    assert_eq!(session_b.group_status(), GroupStatus::Leaving);
+
+    let a_sk = SigningKey::from_bytes(&a.signing.to_bytes());
+
+    // FALSE REMOVAL: a manifest excluding B whose parent B has never held
+    // (A issued `unseen` but B never received it, then built W on top).
+    let unseen =
+        GroupManifest::update(&v1, vec![member_of(&a)], &a_sk).expect("unseen intermediate");
+    let w = GroupManifest::update(&unseen, vec![member_of(&a)], &a_sk).expect("w");
+    deliver_manifest(&relay, 100, &w, &b, &a, 900);
+    wait_for(
+        || manifest_of(&session_b).hash() == w.hash(),
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        session_b.group_status(),
+        GroupStatus::Leaving,
+        "ADR-0027: a Leaving record survives a false removal"
+    );
+    assert!(
+        session_b
+            .op_log
+            .lock()
+            .unwrap()
+            .pending_membership_changes()
+            .is_none(),
+        "the false removal cleared the change set (the silent-cancel setup)"
+    );
+
+    // RE-INCLUSION: a manifest built on W includes B again. With the change
+    // set empty, the old rule would read this as supersession and cancel
+    // the Leave.
+    let w3 = GroupManifest::update(&w, vec![member_of(&a), member_of(&b)], &a_sk).expect("w3");
+    deliver_manifest(&relay, 101, &w3, &b, &a, 901);
+    wait_for(
+        || manifest_of(&session_b).hash() == w3.hash(),
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        session_b.group_status(),
+        GroupStatus::Leaving,
+        "the Leave is NOT cancelled by a manifest that was not built on its carrier"
+    );
+    assert_eq!(
+        session_b.signing_pub(),
+        b_signing_before,
+        "no wipe happened either — the Leave simply continues"
+    );
+    assert!(
+        session_b.op_log.lock().unwrap().leaving().is_some(),
+        "the Leaving record is still persisted"
+    );
 }
 
 // ── Encodings (fail closed) ─────────────────────────────────────────────────

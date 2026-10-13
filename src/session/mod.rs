@@ -119,6 +119,12 @@ pub enum GroupStatus {
     /// Survives restarts. A Leaving device does not send `Sync` and does
     /// not run handlers.
     Leaving,
+    /// Started or received Destroy Group and waiting for the Relay to
+    /// accept every queued Revoke; then the device wipes its group state,
+    /// rotates its identity and returns to `notJoined` (ADR-0029).
+    /// Survives restarts. A Destroying device sends no `Sync`, runs no
+    /// handlers and stays connected.
+    Destroying,
 }
 
 impl From<crate::relay::RelayError> for SessionError {
@@ -344,6 +350,30 @@ impl LeavingRecord {
     }
 }
 
+/// The persisted Destroying record (ADR-0029): the outbox refs the Destroy
+/// waits on — one queued Revoke per recipient in the destroying device's
+/// own member view. The Destroy completes when every referenced entry has
+/// been accepted by the Relay (delivered rows are deleted, ADR-0026) —
+/// then the device wipes, rotates its identity and reports
+/// `notJoined(destroyed)`. Same encoding as the Leaving record.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct DestroyingRecord {
+    pub refs: Vec<([u8; 32], u64)>,
+}
+
+impl DestroyingRecord {
+    fn encode(&self) -> Vec<u8> {
+        LeavingRecord {
+            refs: self.refs.clone(),
+        }
+        .encode()
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        LeavingRecord::decode(bytes).map(|r| Self { refs: r.refs })
+    }
+}
+
 /// Load and decode the persisted Pending Membership Changes (ADR-0027).
 /// A corrupt record fails closed — treated as empty (no re-applications).
 fn load_pending_changes(op_log: &Arc<Mutex<Box<dyn OperationLog>>>) -> Vec<PendingChange> {
@@ -362,6 +392,15 @@ fn load_leaving(op_log: &Arc<Mutex<Box<dyn OperationLog>>>) -> Option<LeavingRec
     let log = op_log.lock().unwrap_or_else(|e| e.into_inner());
     log.leaving()
         .and_then(|bytes| LeavingRecord::decode(&bytes))
+}
+
+/// Load and decode the persisted Destroying record (ADR-0029).
+/// A corrupt record fails closed — absent — and the wipe completion check
+/// simply never fires; the queued Revokes still replay from the outbox.
+fn load_destroying(op_log: &Arc<Mutex<Box<dyn OperationLog>>>) -> Option<DestroyingRecord> {
+    let log = op_log.lock().unwrap_or_else(|e| e.into_inner());
+    log.destroying()
+        .and_then(|bytes| DestroyingRecord::decode(&bytes))
 }
 
 /// All mutable key material — replaced atomically on key rotation.
@@ -609,11 +648,10 @@ pub struct TruesealSession<T: Read + Write + Send + 'static> {
     /// Fired whenever the local manifest changes (inbound update or accept_pair).
     /// Callers use this to persist the manifest to SQLite.
     on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static>,
-    /// Fired when the group is destroyed (destroyGroup or receiving Revoke).
-    on_group_destroyed: Arc<dyn Fn() + Send + Sync + 'static>,
-    /// Set to true after destroy_group() or receiving Revoke. All subsequent
-    /// operations that mutate state return SessionError::GroupDestroyed.
-    destroyed: Arc<AtomicBool>,
+    /// The Destroying record (ADR-0029): present while a Destroy waits for
+    /// the Relay to accept every queued Revoke. Seeded from the op log at
+    /// construction so a crash in Destroying resumes Destroying.
+    destroying: Arc<Mutex<Option<DestroyingRecord>>>,
     /// Pending member requests keyed by opaque token, set via set_on_member_request.
     pending_members: Arc<Mutex<HashMap<String, PendingMember>>>,
     /// Fired when a Pair message arrives inside an open pairing window.
@@ -680,6 +718,7 @@ pub(super) fn wipe_and_rotate(
     sequence: &Arc<Mutex<u64>>,
     pending_changes: &Arc<Mutex<Vec<PendingChange>>>,
     leaving: &Arc<Mutex<Option<LeavingRecord>>>,
+    destroying: &Arc<Mutex<Option<DestroyingRecord>>>,
     pending_join: &Arc<Mutex<Option<PendingJoin>>>,
     on_identity_rotated: &Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static>,
     rotation_pending: &Arc<AtomicBool>,
@@ -703,6 +742,7 @@ pub(super) fn wipe_and_rotate(
         .unwrap_or_else(|e| e.into_inner())
         .clear();
     *leaving.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *destroying.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *pending_join.lock().unwrap_or_else(|e| e.into_inner()) = None;
     // A fresh identity starts a fresh sequence space (the high-water mark
     // was wiped with the group state).
@@ -713,11 +753,11 @@ pub(super) fn wipe_and_rotate(
     rotation_pending.store(true, Ordering::Release);
 }
 
-/// Have all the Leaving record's outbox refs been accepted by the Relay?
+/// Have all the given outbox refs been accepted by the Relay?
 /// (Delivered rows are deleted, ADR-0026.)
-pub(super) fn leaving_refs_drained(
+pub(super) fn refs_drained(
     op_log: &Arc<Mutex<Box<dyn OperationLog>>>,
-    record: &LeavingRecord,
+    refs: &[([u8; 32], u64)],
 ) -> bool {
     let log = op_log.lock().unwrap_or_else(|e| e.into_inner());
     let undelivered: std::collections::HashSet<([u8; 32], u64)> = log
@@ -725,7 +765,15 @@ pub(super) fn leaving_refs_drained(
         .into_iter()
         .map(|e| (e.object_id, e.sequence))
         .collect();
-    record.refs.iter().all(|r| !undelivered.contains(r))
+    refs.iter().all(|r| !undelivered.contains(r))
+}
+
+/// Have all the Leaving record's outbox refs been accepted by the Relay?
+pub(super) fn leaving_refs_drained(
+    op_log: &Arc<Mutex<Box<dyn OperationLog>>>,
+    record: &LeavingRecord,
+) -> bool {
+    refs_drained(op_log, &record.refs)
 }
 
 /// Builds the full manifest-aware subscribe handler.
@@ -740,8 +788,7 @@ pub(super) fn build_subscribe_handler(
     pending_join: Arc<Mutex<Option<PendingJoin>>>,
     on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static>,
     on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static>,
-    on_group_destroyed: Arc<dyn Fn() + Send + Sync + 'static>,
-    destroyed: Arc<AtomicBool>,
+    destroying: Arc<Mutex<Option<DestroyingRecord>>>,
     pairing: Arc<Mutex<Option<PairingWindow>>>,
     pending_members: Arc<Mutex<HashMap<String, PendingMember>>>,
     on_member_request: Arc<Mutex<EventSink>>,
@@ -828,6 +875,16 @@ pub(super) fn build_subscribe_handler(
         // ── GroupManifest (before the member filter: the FIRST manifest is
         // gated by the Pending Join, not by membership — ADR-0023) ────────
         if let Message::GroupManifest { manifest: incoming } = &msg {
+            // ADR-0029: a Destroying device is ending the group — it does
+            // not accept manifests (accepting one could trigger a removal
+            // wipe before the Relay has accepted its Revokes).
+            if destroying
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+            {
+                return;
+            }
             let (local_signing_pub, local_noise_pub) = {
                 let ks = keys.lock().unwrap_or_else(|e| e.into_inner());
                 (ks.signing_pub.0, ks.noise_pub.0)
@@ -895,6 +952,8 @@ pub(super) fn build_subscribe_handler(
                     held: vec![(incoming.hash(), true)],
                     pending_changes: Vec::new(),
                     leaving: None,
+                    destroying: None,
+                    drop_sync_outbox: false,
                     outbox: Vec::new(),
                 };
                 if op_log
@@ -1000,6 +1059,7 @@ pub(super) fn build_subscribe_handler(
                         &outbox_sequence,
                         &pending_changes,
                         &leaving,
+                        &destroying,
                         &pending_join,
                         &on_identity_rotated,
                         &rotation_pending,
@@ -1026,6 +1086,8 @@ pub(super) fn build_subscribe_handler(
                     held: vec![(incoming.hash(), false)],
                     pending_changes: Vec::new(),
                     leaving: None,
+                    destroying: None,
+                    drop_sync_outbox: false,
                     outbox: Vec::new(),
                 };
                 if op_log
@@ -1083,6 +1145,22 @@ pub(super) fn build_subscribe_handler(
             // change's new carrier). All overwritten changes re-apply in
             // ONE manifest — an honest issuer always steps by one.
             let self_sp = SigningPublicKey(local_signing_pub);
+            // The Leave intent's carrier BEFORE the re-check: a Leaving
+            // cancel is only legitimate as deliberate supersession (W was
+            // built directly on this carrier). The change set can also lose
+            // the Leave intent through a false removal (its changes are
+            // cleared — a non-member's changes carry no authority), and
+            // cancelling on mere absence would silently drop the Leave on
+            // the NEXT accepted manifest (B9 review). Captured here because
+            // the false-removal path and the commit below both replace the
+            // set.
+            let leave_carrier: Option<[u8; 32]> = {
+                let changes = pending_changes.lock().unwrap_or_else(|e| e.into_inner());
+                changes
+                    .iter()
+                    .find(|c| c.intent == PendingIntent::Leave)
+                    .map(|c| c.carrier)
+            };
             let overwritten: Vec<PendingChange> = {
                 let changes = pending_changes.lock().unwrap_or_else(|e| e.into_inner());
                 changes
@@ -1201,11 +1279,20 @@ pub(super) fn build_subscribe_handler(
                 }
             }
 
-            // A Leave that was deliberately superseded by W (W was built on
-            // the Leave's carrier and includes this device again) cancels
-            // Leaving: the record clears and the device is a member.
+            // A Leave that was deliberately superseded by W (W was built
+            // DIRECTLY on the Leave's carrier and includes this device
+            // again) cancels Leaving: the record clears and the device is a
+            // member. Gating on the carrier — not on the intent's mere
+            // absence — closes the silent cancel through the false-removal
+            // path (B9 review): after a false removal clears the change
+            // set, a later re-including manifest must NOT cancel the Leave;
+            // the Leaving record survives and the Leave still completes
+            // (ADR-0027: "a Leaving record, if any, stays so the Leave
+            // still completes").
             if was_leaving
                 && leaving_update.is_none()
+                && leave_carrier.is_some()
+                && leave_carrier == incoming.parent
                 && !new_changes.iter().any(|c| c.intent == PendingIntent::Leave)
             {
                 leaving_update = Some(Vec::new());
@@ -1231,6 +1318,8 @@ pub(super) fn build_subscribe_handler(
                 },
                 pending_changes: PendingChange::encode_set(&new_changes),
                 leaving: leaving_update.clone(),
+                destroying: None,
+                drop_sync_outbox: false,
                 outbox: reapplied_outbox,
             };
             if op_log
@@ -1303,7 +1392,106 @@ pub(super) fn build_subscribe_handler(
             return;
         }
 
-        // ── Manifest-based inbound filtering (Sync, Revoke) ────────────────────
+        // ── Revoke (BEFORE the member filter: Destroy authority is any
+        // PAST or present member, not the current view — ADR-0029) ────────
+        if let Message::Revoke = &msg {
+            // A device that is already Destroying (or done) ignores further
+            // Revokes — each device forwards at most once, and replaying a
+            // Revoke changes no state (ADR-0034).
+            if destroying
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+            {
+                return;
+            }
+            // `pendingJoin` / `notJoined`: ignored — there is no manifest
+            // to check the author against (ADR-0029 state table).
+            let view = {
+                let guard = manifest.lock().unwrap_or_else(|e| e.into_inner());
+                match *guard {
+                    Some(ref m) => m.clone(),
+                    None => return,
+                }
+            };
+            // Authority: the author appears in ANY Group Manifest this
+            // device has held for the group, current or past. A thief who
+            // removed the owner first cannot block Destroy. A Revoke from
+            // a device that never appeared in a held manifest is ignored.
+            let authorised = op_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_held_signer(&author_signing_pub);
+            if !authorised {
+                return;
+            }
+
+            // Forward, then wipe (ADR-0029): queue a Revoke to every
+            // member of the device's OWN view except the author — this
+            // reaches members admitted concurrently, who are missing from
+            // the initiator's view. The same rules as the initiator:
+            // pending Sync sends and Pending Membership Changes drop
+            // without reporting, an in-flight Leave is abandoned, and the
+            // whole transition is one durable commit. The ack follows the
+            // commit (ADR-0026) — a crash before it re-delivers the Revoke
+            // and the transition runs again idempotently.
+            let self_noise = keys.lock().unwrap_or_else(|e| e.into_inner()).noise_pub;
+            let encoded = Message::Revoke.encode();
+            let mut refs: Vec<([u8; 32], u64)> = Vec::new();
+            let mut outbox: Vec<([u8; 32], u64, Vec<u8>)> = Vec::new();
+            for member in &view.members {
+                if member.signing_pub.0 == author_signing_pub || member.noise_pub == self_noise {
+                    continue;
+                }
+                let seq = {
+                    let mut s = outbox_sequence.lock().unwrap_or_else(|e| e.into_inner());
+                    let v = *s;
+                    *s += 1;
+                    v
+                };
+                op_log
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .record_sequence(seq);
+                refs.push((member.noise_pub.0, seq));
+                outbox.push((member.noise_pub.0, seq, encoded.clone()));
+            }
+            let record = DestroyingRecord { refs };
+            let commit = crate::operation_log::MembershipCommit {
+                manifest: view.encode(),
+                held: Vec::new(),
+                pending_changes: Vec::new(),
+                leaving: Some(Vec::new()),
+                destroying: Some(record.encode()),
+                drop_sync_outbox: true,
+                outbox,
+            };
+            if op_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .commit_membership(commit)
+                .is_err()
+            {
+                return; // durable write failed; the Blob is re-delivered
+            }
+            *destroying.lock().unwrap_or_else(|e| e.into_inner()) = Some(record);
+            *leaving.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            pending_changes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            // A Destroying device admits no one: close any open Pairing
+            // Window (its pending requests die with it).
+            *pairing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            pending_members
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            return;
+        }
+
+        // ── Manifest-based inbound filtering (Sync only — Revoke returned
+        // above with its own authority rule) ─────────────────────────────
         {
             let guard = manifest.lock().unwrap_or_else(|e| e.into_inner());
             match *guard {
@@ -1312,29 +1500,12 @@ pub(super) fn build_subscribe_handler(
                         return; // not a member — discard
                     }
                 }
-                // ADR-0023: a device with no manifest drops every Sync and
-                // Revoke. This closes the pre-SYNC-3 fail-open gap (the
-                // filter used to be skipped entirely without a manifest).
+                // ADR-0023: a device with no manifest drops every Sync.
+                // This closes the pre-SYNC-3 fail-open gap (the filter
+                // used to be skipped entirely without a manifest).
                 // Routine internet garbage — no report.
                 None => return,
             }
-        }
-
-        // ── Revoke ────────────────────────────────────────────────────────────
-        if let Message::Revoke = &msg {
-            let in_group = {
-                let guard = manifest.lock().unwrap_or_else(|e| e.into_inner());
-                guard
-                    .as_ref()
-                    .map(|m| m.contains_signing_pub(&author_signing_pub))
-                    .unwrap_or(false)
-            };
-            if in_group {
-                *manifest.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                destroyed.store(true, Ordering::Release);
-                (on_group_destroyed)();
-            }
-            return;
         }
 
         // ── Application message: library-owned dedup + handler attempts ─────
@@ -1355,12 +1526,19 @@ pub(super) fn build_subscribe_handler(
             }
         }
 
-        // ADR-0027: a Leaving device does not run handlers. The message is
-        // still dedup-recorded and acked — Leaving is brief (it ends when
-        // the Relay accepts the Leave pushes) and terminal (the wipe drops
-        // everything anyway), so holding the Blob unacked would only stall
-        // the sender's relay inbox.
-        if leaving.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+        // ADR-0027 / ADR-0029: a Leaving or Destroying device runs no
+        // handlers. The message is still dedup-recorded and acked — both
+        // states are terminal (the wipe drops everything anyway), so
+        // holding the Blob unacked would only stall the sender's inbox.
+        let terminal_state = {
+            let leaving = leaving.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+            let destroying = destroying
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+            leaving || destroying
+        };
+        if terminal_state {
             op_log
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1490,7 +1668,12 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// cannot be decoded or predates the Pairing Secret (ADR-0022 clean
     /// break). `cancel_join` abandons the wait.
     pub fn join_group(&self, token: &str) -> Result<(), SessionError> {
-        if self.destroyed.load(Ordering::Acquire) {
+        if self
+            .destroying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             return Err(SessionError::GroupDestroyed);
         }
         if self
@@ -1551,6 +1734,13 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// ADR-0027, ADR-0028).
     pub fn group_status(&self) -> GroupStatus {
         if self
+            .destroying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            GroupStatus::Destroying
+        } else if self
             .leaving
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1673,14 +1863,15 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             Arc::new(on_manifest_changed);
         let on_group_destroyed: Arc<dyn Fn() + Send + Sync + 'static> =
             Arc::new(on_group_destroyed);
-        let destroyed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        // ADR-0029: the Destroying record — seeded from the op log below,
+        // once the log exists (a crash in Destroying resumes Destroying).
+        let destroying: Arc<Mutex<Option<DestroyingRecord>>> = Arc::new(Mutex::new(None));
 
         let keys_cb = keys.clone();
         let manifest_cb = manifest.clone();
         let on_rfg_cb = on_removed_from_group.clone();
         let on_mc_cb = on_manifest_changed.clone();
-        let on_gd_cb = on_group_destroyed.clone();
-        let destroyed_cb = destroyed.clone();
+        let destroying_cb = destroying.clone();
         let pending_cb: Arc<Mutex<HashMap<String, PendingMember>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let on_mr_cb: Arc<Mutex<EventSink>> = Arc::new(Mutex::new(EventSink::new()));
@@ -1718,6 +1909,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             Arc::new(Mutex::new(load_pending_changes(&op_log)));
         let leaving: Arc<Mutex<Option<LeavingRecord>>> =
             Arc::new(Mutex::new(load_leaving(&op_log)));
+        *destroying.lock().unwrap_or_else(|e| e.into_inner()) = load_destroying(&op_log);
         let on_identity_rotated: Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static> =
             Arc::new(on_identity_rotated);
         let rotation_pending = Arc::new(AtomicBool::new(false));
@@ -1732,8 +1924,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             pending_join.clone(),
             on_rfg_cb,
             on_mc_cb,
-            on_gd_cb,
-            destroyed_cb,
+            destroying_cb,
             pairing_cb,
             pending_cb,
             on_mr_cb,
@@ -1768,6 +1959,32 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let push_factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync + 'static> =
             Arc::new(push_factory);
 
+        // ADR-0029: a crash after the Destroying commit or mid-wipe
+        // resumes here — a Destroying record whose Revoke refs are already
+        // drained completes now (the wipe is idempotent; the destroying row
+        // only disappears inside the wipe transaction).
+        {
+            let rec = destroying.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(rec) = rec {
+                if refs_drained(&op_log, &rec.refs) {
+                    wipe_and_rotate(
+                        &op_log,
+                        &manifest,
+                        &keys,
+                        &sequence,
+                        &pending_changes,
+                        &leaving,
+                        &destroying,
+                        &pending_join,
+                        &on_identity_rotated,
+                        &rotation_pending,
+                    );
+                    // Fired after the wipe: a crash mid-wipe leaves a wiped
+                    // store and the app observes `notJoined` on next open.
+                    (on_group_destroyed)();
+                }
+            }
+        }
         // ADR-0027: a crash during the wipe restarts the wipe — a Leaving
         // record whose outbox refs are already drained completes now.
         {
@@ -1781,6 +1998,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                         &sequence,
                         &pending_changes,
                         &leaving,
+                        &destroying,
                         &pending_join,
                         &on_identity_rotated,
                         &rotation_pending,
@@ -1803,6 +2021,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             let sequence = sequence.clone();
             let pending_changes = pending_changes.clone();
             let leaving = leaving.clone();
+            let destroying = destroying.clone();
             let pending_join = pending_join.clone();
             let on_identity_rotated = on_identity_rotated.clone();
             let rotation_pending = rotation_pending.clone();
@@ -1814,10 +2033,42 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                     &sequence,
                     &pending_changes,
                     &leaving,
+                    &destroying,
                     &pending_join,
                     &on_identity_rotated,
                     &rotation_pending,
                 );
+            }
+        };
+        // ADR-0029: the Destroy completes when the Relay has accepted every
+        // queued Revoke — then wipe + rotate (same machinery as a completed
+        // Leave) and report the destroy.
+        let on_destroy_complete = {
+            let op_log = op_log.clone();
+            let manifest = manifest.clone();
+            let keys = keys.clone();
+            let sequence = sequence.clone();
+            let pending_changes = pending_changes.clone();
+            let leaving = leaving.clone();
+            let destroying = destroying.clone();
+            let pending_join = pending_join.clone();
+            let on_identity_rotated = on_identity_rotated.clone();
+            let rotation_pending = rotation_pending.clone();
+            let on_group_destroyed = on_group_destroyed.clone();
+            move || {
+                wipe_and_rotate(
+                    &op_log,
+                    &manifest,
+                    &keys,
+                    &sequence,
+                    &pending_changes,
+                    &leaving,
+                    &destroying,
+                    &pending_join,
+                    &on_identity_rotated,
+                    &rotation_pending,
+                );
+                (on_group_destroyed)();
             }
         };
         sender::spawn_sender(
@@ -1827,12 +2078,13 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             relay_pub.0,
             push_factory.clone(),
             issue_sink.clone(),
-            destroyed.clone(),
+            destroying.clone(),
             kick.clone(),
             sender::SenderConfig::default(),
             leaving.clone(),
             rotation_pending.clone(),
             Box::new(on_leave_complete),
+            Box::new(on_destroy_complete),
         );
 
         // SYNC-8 (#100): drop oversize entries persisted by pre-fix builds —
@@ -1852,8 +2104,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             manifest,
             on_removed_from_group,
             on_manifest_changed,
-            on_group_destroyed,
-            destroyed,
+            destroying,
             pending_members: pending_cb_ret,
             on_member_request: on_mr_cb_ret,
             on_member_joined: on_mj_cb_ret,
@@ -1938,8 +2189,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let manifest_arc = session.manifest.clone();
         let on_rfg_arc = session.on_removed_from_group.clone();
         let on_mc_arc = session.on_manifest_changed.clone();
-        let on_gd_arc = session.on_group_destroyed.clone();
-        let destroyed_arc = session.destroyed.clone();
+        let destroying_arc = session.destroying.clone();
         let pairing_arc = session.pairing.clone();
         let pending_arc = session.pending_members.clone();
         let on_mr_arc = session.on_member_request.clone();
@@ -1966,8 +2216,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 on_message,
                 on_rfg_arc,
                 on_mc_arc,
-                on_gd_arc,
-                destroyed_arc,
+                destroying_arc,
                 pairing_arc,
                 pending_arc,
                 on_mr_arc,
@@ -2066,7 +2315,9 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             Arc::new(on_manifest_changed);
         let on_group_destroyed: Arc<dyn Fn() + Send + Sync + 'static> =
             Arc::new(on_group_destroyed);
-        let destroyed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        // ADR-0029: the Destroying record — seeded from the op log below,
+        // once the log exists (a crash in Destroying resumes Destroying).
+        let destroying: Arc<Mutex<Option<DestroyingRecord>>> = Arc::new(Mutex::new(None));
         let pending_members: Arc<Mutex<HashMap<String, PendingMember>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let on_member_request: Arc<Mutex<EventSink>> = Arc::new(Mutex::new(EventSink::new()));
@@ -2126,10 +2377,37 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             Arc::new(Mutex::new(load_pending_changes(&op_log_arc)));
         let leaving: Arc<Mutex<Option<LeavingRecord>>> =
             Arc::new(Mutex::new(load_leaving(&op_log_arc)));
+        *destroying.lock().unwrap_or_else(|e| e.into_inner()) = load_destroying(&op_log_arc);
         let on_identity_rotated: Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static> =
             Arc::new(on_identity_rotated);
         let rotation_pending = Arc::new(AtomicBool::new(false));
 
+        // ADR-0029: a crash after the Destroying commit or mid-wipe
+        // resumes here — a Destroying record whose Revoke refs are already
+        // drained completes now (the wipe is idempotent; the destroying row
+        // only disappears inside the wipe transaction).
+        {
+            let rec = destroying.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(rec) = rec {
+                if refs_drained(&op_log_arc, &rec.refs) {
+                    wipe_and_rotate(
+                        &op_log_arc,
+                        &manifest,
+                        &keys,
+                        &sequence,
+                        &pending_changes,
+                        &leaving,
+                        &destroying,
+                        &pending_join,
+                        &on_identity_rotated,
+                        &rotation_pending,
+                    );
+                    // Fired after the wipe: a crash mid-wipe leaves a wiped
+                    // store and the app observes `notJoined` on next open.
+                    (on_group_destroyed)();
+                }
+            }
+        }
         // ADR-0027: a crash during the wipe restarts the wipe — a Leaving
         // record whose outbox refs are already drained completes now.
         {
@@ -2143,6 +2421,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                         &sequence,
                         &pending_changes,
                         &leaving,
+                        &destroying,
                         &pending_join,
                         &on_identity_rotated,
                         &rotation_pending,
@@ -2164,6 +2443,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             let sequence = sequence.clone();
             let pending_changes = pending_changes.clone();
             let leaving = leaving.clone();
+            let destroying = destroying.clone();
             let pending_join = pending_join.clone();
             let on_identity_rotated = on_identity_rotated.clone();
             let rotation_pending = rotation_pending.clone();
@@ -2175,10 +2455,42 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                     &sequence,
                     &pending_changes,
                     &leaving,
+                    &destroying,
                     &pending_join,
                     &on_identity_rotated,
                     &rotation_pending,
                 );
+            }
+        };
+        // ADR-0029: the Destroy completes when the Relay has accepted every
+        // queued Revoke — then wipe + rotate (same machinery as a completed
+        // Leave) and report the destroy.
+        let on_destroy_complete = {
+            let op_log = op_log_arc.clone();
+            let manifest = manifest.clone();
+            let keys = keys.clone();
+            let sequence = sequence.clone();
+            let pending_changes = pending_changes.clone();
+            let leaving = leaving.clone();
+            let destroying = destroying.clone();
+            let pending_join = pending_join.clone();
+            let on_identity_rotated = on_identity_rotated.clone();
+            let rotation_pending = rotation_pending.clone();
+            let on_group_destroyed = on_group_destroyed.clone();
+            move || {
+                wipe_and_rotate(
+                    &op_log,
+                    &manifest,
+                    &keys,
+                    &sequence,
+                    &pending_changes,
+                    &leaving,
+                    &destroying,
+                    &pending_join,
+                    &on_identity_rotated,
+                    &rotation_pending,
+                );
+                (on_group_destroyed)();
             }
         };
         sender::spawn_sender(
@@ -2188,12 +2500,13 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             relay_pub.0,
             push_factory_arc.clone(),
             issue_sink.clone(),
-            destroyed.clone(),
+            destroying.clone(),
             kick.clone(),
             sender::SenderConfig::default(),
             leaving.clone(),
             rotation_pending.clone(),
             Box::new(on_leave_complete),
+            Box::new(on_destroy_complete),
         );
 
         let session = Self {
@@ -2205,8 +2518,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             manifest: manifest.clone(),
             on_removed_from_group: on_removed_from_group.clone(),
             on_manifest_changed: on_manifest_changed.clone(),
-            on_group_destroyed: on_group_destroyed.clone(),
-            destroyed: destroyed.clone(),
+            destroying: destroying.clone(),
             pending_members: pending_members.clone(),
             on_member_request: on_member_request.clone(),
             on_member_joined: on_member_joined.clone(),
@@ -2235,8 +2547,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 on_message,
                 on_removed_from_group,
                 on_manifest_changed,
-                on_group_destroyed,
-                destroyed,
+                destroying,
                 pairing,
                 pending_members,
                 on_member_request,
@@ -2271,7 +2582,12 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// deletes delivered rows. `Ok(())` means "durably queued" — the caller
     /// must not retry (ADR-0017); observing failures is optional.
     pub fn push_sync(&self, blob: Vec<u8>) -> Result<(), SessionError> {
-        if self.destroyed.load(Ordering::Acquire) {
+        if self
+            .destroying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             return Err(SessionError::GroupDestroyed);
         }
         // ADR-0027: a Leaving device does not send Sync.
@@ -2359,11 +2675,14 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     }
 
     /// Queue a control-plane message (Pair, Group Manifest, Revoke) for
-    /// `recipient_pub`. ADR-0026: the control plane goes through the outbox
-    /// under the same contract as `Sync` — durable before the caller
+    /// `recipient_pub`. Test-only: production control-plane sends commit
+    /// atomically through `MembershipCommit` (ADR-0027/0029). ADR-0026:
+    /// the control plane goes through the outbox under the same contract
+    /// as `Sync` — durable before the caller
     /// proceeds, retried while connected, never expired — and the sender
     /// pump delivers it. An unsupported Transport Version leaves the entry
     /// queued until the library or relay is upgraded (ADR-0022).
+    #[cfg(test)]
     pub(crate) fn push_message(
         &self,
         msg: &Message,
@@ -2380,50 +2699,83 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
 
     // ── Destroy Group (ADR-0015) ──────────────────────────────────────────────
 
-    /// Push `Message::Revoke` to all manifest members, wipe local manifest,
-    /// set session terminal, and fire `on_group_destroyed`.
+    /// Destroy the Sync Group (ADR-0029): persist the **Destroying** state
+    /// and queue one Revoke per member of the current view through the
+    /// outbox — in ONE transaction. The device then stays Destroying (no
+    /// `Sync` sends, no handlers, still connected) until the Relay has
+    /// accepted every Revoke; only then does it wipe its group state,
+    /// rotate its identity, fire `on_group_destroyed` and return to
+    /// `notJoined`. There is no timeout: a crash or going offline resumes
+    /// Destroying on the next start.
     ///
-    /// After this call, all subsequent `push_sync` / `send` calls return
-    /// `SessionError::GroupDestroyed`. The next `create()` on the same namespace
-    /// generates a fresh identity automatically.
-    pub fn destroy_group(&self) {
+    /// Per the ADR state table: a no-op while already Destroying; a typed
+    /// `NotInGroup` error in `pendingJoin` / `notJoined`; an in-flight
+    /// Leave is abandoned. Pending `Sync` sends and Pending Membership
+    /// Changes drop without reporting, as removal does.
+    pub fn destroy_group(&self) -> Result<(), SessionError> {
+        if self
+            .destroying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            return Ok(()); // already Destroying — a second call is a no-op
+        }
+
+        // Lock discipline: keys copied out and released before the manifest
+        // lock (the handler locks manifest → keys).
         let self_noise = self
             .keys
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .noise_pub;
-        let peers: Vec<NoisePublicKey> = {
+        let (current, refs, outbox) = {
             let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
-            match *guard {
-                None => vec![],
-                Some(ref m) => m
-                    .members
-                    .iter()
-                    .filter(|mb| mb.noise_pub != self_noise)
-                    .map(|mb| mb.noise_pub)
-                    .collect(),
+            let current = guard.clone().ok_or(SessionError::NotInGroup)?;
+            let encoded = Message::Revoke.encode();
+            let mut refs = Vec::new();
+            let mut outbox = Vec::new();
+            for member in current.members.iter() {
+                if member.noise_pub == self_noise {
+                    continue;
+                }
+                let seq = self.next_seq();
+                refs.push((member.noise_pub.0, seq));
+                outbox.push((member.noise_pub.0, seq, encoded.clone()));
             }
+            (current, refs, outbox)
         };
-        for peer in peers {
-            // SYNC-5: Revoke now goes through the outbox (ADR-0026 control
-            // plane) — durable before we proceed, retried while connected,
-            // and the sender pump drains it after `destroyed` is set. What
-            // is still missing is the durable Destroying state that survives
-            // a restart (the FFI wipe can delete a not-yet-accepted Revoke):
-            // that state machine is SYNC-11 (ADR-0029) scope.
-            let _ = self.push_message(&Message::Revoke, peer);
-        }
-        *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        // The terminal state supersedes any in-flight Leave or pending
-        // membership change (the store rows are wiped by the FFI's destroy
-        // callback; SYNC-11 owns the durable Destroying state).
+
+        let record = DestroyingRecord { refs };
+        // The Destroying record, the queued Revokes, the dropped Sync
+        // sends, the abandoned Leave and the cleared Pending Membership
+        // Changes commit in ONE transaction (ADR-0029 crash points: before
+        // the commit nothing changed; after it, Destroying resumes).
+        self.op_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .commit_membership(crate::operation_log::MembershipCommit {
+                manifest: current.encode(),
+                held: Vec::new(),
+                pending_changes: Vec::new(),
+                leaving: Some(Vec::new()),
+                destroying: Some(record.encode()),
+                drop_sync_outbox: true,
+                outbox,
+            })
+            .map_err(SessionError::Store)?;
+
+        *self.destroying.lock().unwrap_or_else(|e| e.into_inner()) = Some(record);
         *self.leaving.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.pending_changes
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        self.destroyed.store(true, Ordering::Release);
-        (self.on_group_destroyed)();
+        // A Destroying device admits no one: close any open Pairing Window
+        // (its pending requests die with it).
+        self.cancel_pairing();
+        self.kick.kick();
+        Ok(())
     }
 
     // ── Pairing ───────────────────────────────────────────────────────────────
@@ -2632,6 +2984,8 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 held: vec![(carrier, true)],
                 pending_changes: PendingChange::encode_set(&change_set),
                 leaving: None,
+                destroying: None,
+                drop_sync_outbox: false,
                 outbox,
             })
             .map_err(SessionError::Store)?;
@@ -2815,6 +3169,8 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 held: vec![(carrier, true)],
                 pending_changes: PendingChange::encode_set(&change_set),
                 leaving: None,
+                destroying: None,
+                drop_sync_outbox: false,
                 outbox,
             })
             .map_err(SessionError::Store)?;
@@ -2841,7 +3197,12 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Errors: `NotInGroup` when not a member, `GroupDestroyed`,
     /// `ManifestVersionExhausted`, `Store` (nothing changed in memory).
     pub fn leave_group(&self) -> Result<(), SessionError> {
-        if self.destroyed.load(Ordering::Acquire) {
+        if self
+            .destroying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
             return Err(SessionError::GroupDestroyed);
         }
         if self
@@ -2917,6 +3278,8 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 held: vec![(carrier, false)],
                 pending_changes: PendingChange::encode_set(&change_set),
                 leaving: Some(record.encode()),
+                destroying: None,
+                drop_sync_outbox: false,
                 outbox: refs,
             })
             .map_err(SessionError::Store)?;
@@ -2979,6 +3342,8 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 held: vec![(m.hash(), includes_self)],
                 pending_changes: pending,
                 leaving: None,
+                destroying: None,
+                drop_sync_outbox: false,
                 outbox: Vec::new(),
             });
         }
