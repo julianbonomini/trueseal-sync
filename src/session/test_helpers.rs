@@ -343,6 +343,57 @@ pub(super) fn spawn_bidirectional_relay(
     });
 }
 
+/// An N-device mesh relay: accepts every XX Receive Session, routes each NK
+/// push to the session whose noise_pub matches the Envelope recipient, and
+/// Acks the push. The Destroy Group forwarding tests (ADR-0029) need a real
+/// mesh: the initiator's Revoke and each device's forward must reach
+/// different members.
+pub(super) fn spawn_mesh_relay(
+    relay_kp: &Keypair,
+    pipes: Vec<MemPipe>,
+    nk_rx: mpsc::Receiver<MemPipe>,
+) {
+    let relay_priv = relay_kp.private();
+    let relay_pub_key = relay_kp.public_key;
+    std::thread::spawn(move || {
+        let mut sessions: Vec<([u8; 32], Arc<_>)> = Vec::new();
+        for (i, pipe) in pipes.into_iter().enumerate() {
+            let kp = Keypair::new(relay_priv, relay_pub_key);
+            let sess = xx_accept_after_prefix(pipe, kp)
+                .unwrap_or_else(|_| panic!("mesh relay: XX accept {i} failed"));
+            let noise = sess.remote_public_key();
+            sessions.push((noise, Arc::new(sess)));
+        }
+        let sessions = Arc::new(sessions);
+        while let Ok(nk_pipe) = nk_rx.recv() {
+            let kp = Keypair::new(relay_priv, relay_pub_key);
+            let sessions = sessions.clone();
+            std::thread::spawn(move || {
+                if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp) {
+                    if let Ok(raw) = sess.receive() {
+                        if let Some((MsgType::Push, body)) = parse(&raw) {
+                            if body.len() >= 32 {
+                                let recipient_pub = &body[0..32];
+                                let framed = {
+                                    let mut d = 0u64.to_be_bytes().to_vec();
+                                    d.extend_from_slice(&body[32..]);
+                                    frame(MsgType::Deliver, &d)
+                                };
+                                for (noise, target) in sessions.iter() {
+                                    if noise.as_slice() == recipient_pub {
+                                        let _ = target.send(&framed);
+                                    }
+                                }
+                            }
+                            let _ = sess.send(&frame(MsgType::Ack, &[]));
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
 /// Spawn a bidirectional relay where each side connects in its own thread,
 /// then routes once both are connected.  Safe to use when A and B connect at
 /// unpredictable times (e.g. reconnect tests).

@@ -1145,6 +1145,22 @@ pub(super) fn build_subscribe_handler(
             // change's new carrier). All overwritten changes re-apply in
             // ONE manifest — an honest issuer always steps by one.
             let self_sp = SigningPublicKey(local_signing_pub);
+            // The Leave intent's carrier BEFORE the re-check: a Leaving
+            // cancel is only legitimate as deliberate supersession (W was
+            // built directly on this carrier). The change set can also lose
+            // the Leave intent through a false removal (its changes are
+            // cleared — a non-member's changes carry no authority), and
+            // cancelling on mere absence would silently drop the Leave on
+            // the NEXT accepted manifest (B9 review). Captured here because
+            // the false-removal path and the commit below both replace the
+            // set.
+            let leave_carrier: Option<[u8; 32]> = {
+                let changes = pending_changes.lock().unwrap_or_else(|e| e.into_inner());
+                changes
+                    .iter()
+                    .find(|c| c.intent == PendingIntent::Leave)
+                    .map(|c| c.carrier)
+            };
             let overwritten: Vec<PendingChange> = {
                 let changes = pending_changes.lock().unwrap_or_else(|e| e.into_inner());
                 changes
@@ -1263,11 +1279,20 @@ pub(super) fn build_subscribe_handler(
                 }
             }
 
-            // A Leave that was deliberately superseded by W (W was built on
-            // the Leave's carrier and includes this device again) cancels
-            // Leaving: the record clears and the device is a member.
+            // A Leave that was deliberately superseded by W (W was built
+            // DIRECTLY on the Leave's carrier and includes this device
+            // again) cancels Leaving: the record clears and the device is a
+            // member. Gating on the carrier — not on the intent's mere
+            // absence — closes the silent cancel through the false-removal
+            // path (B9 review): after a false removal clears the change
+            // set, a later re-including manifest must NOT cancel the Leave;
+            // the Leaving record survives and the Leave still completes
+            // (ADR-0027: "a Leaving record, if any, stays so the Leave
+            // still completes").
             if was_leaving
                 && leaving_update.is_none()
+                && leave_carrier.is_some()
+                && leave_carrier == incoming.parent
                 && !new_changes.iter().any(|c| c.intent == PendingIntent::Leave)
             {
                 leaving_update = Some(Vec::new());
