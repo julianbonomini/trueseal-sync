@@ -426,7 +426,18 @@ fn overwritten_change_reapplied_after_issuer_restart() {
         &b_sk,
     )
     .expect("W");
-    let mut attempts = 0;
+    // The per-attempt win probability is EXACTLY v2a's hash as a fraction
+    // of 2^256 (each renamed W candidate is uniform). A small v2a draw
+    // makes any fixed cap flaky — a bottom-1% draw has ~37% odds of
+    // exhausting 100 attempts, and this flaked twice on CI. Budget 20/p
+    // attempts instead: failure odds are ~e^-20 regardless of the draw.
+    let p64 = u64::from_be_bytes(v2a.hash()[..8].try_into().expect("8 bytes"));
+    let expected_attempts = match p64 {
+        0 => u64::MAX,     // v2a's leading 64 bits all zero: p < 2^-64, cap rules
+        p => u64::MAX / p, // ≈ 2^64 / p64 = 1/p
+    };
+    let budget = expected_attempts.saturating_mul(20).clamp(100, 5_000_000);
+    let mut attempts = 0u64;
     while w.hash() >= v2a.hash() {
         attempts += 1;
         let renamed = ManifestMember {
@@ -435,7 +446,10 @@ fn overwritten_change_reapplied_after_issuer_restart() {
         };
         w = GroupManifest::update(&v1, vec![member_of(&a), member_of(&b), renamed], &b_sk)
             .expect("W retry");
-        assert!(attempts < 100, "hash tie-break should resolve quickly");
+        assert!(
+            attempts < budget,
+            "hash tie-break should resolve within 20/p attempts"
+        );
     }
 
     deliver_manifest(&relay_a2, 1, &w, &a, &b, 1);
