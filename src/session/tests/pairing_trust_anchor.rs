@@ -1460,6 +1460,9 @@ impl OperationLog for FailingJoinLog {
     fn is_handled(&self, message_id: &str) -> bool {
         self.inner.is_handled(message_id)
     }
+    fn handled_at(&self, message_id: &str) -> Option<u64> {
+        self.inner.handled_at(message_id)
+    }
     fn record_handled(&mut self, message_id: &str, now: u64) {
         self.inner.record_handled(message_id, now);
     }

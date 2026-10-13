@@ -1,6 +1,6 @@
 # Sealed Envelope: sender metadata and a Replay Window inside the ciphertext
 
-Status: accepted (decided 2026-09-29 in [trueseal-roadmap#16](https://github.com/julianbonomini/trueseal-roadmap/issues/16); not yet implemented). It uses the clean wire break from ADR-0022 and tightens the dedup rule from ADR-0026. Amended by ADR-0034.
+Status: accepted (decided 2026-09-29 in [trueseal-roadmap#16](https://github.com/julianbonomini/trueseal-roadmap/issues/16); implemented in SYNC-12, #104). It uses the clean wire break from ADR-0022 and tightens the dedup rule from ADR-0026. Amended by ADR-0034.
 
 The Relay-readable part of an Envelope shrinks to what routing and version rejection need: the End-to-End Version, the recipient public key, and the sealed payload. The sequence, parent hashes, sender timestamp and signature all move inside the Addressed Encryption. A receiver rejects any message whose signed sender timestamp is older than the **Replay Window** (60 days). It also keeps each handled Message ID until that message's own window has ended. Together these make the claim "a message is never delivered to your handler twice, even from a malicious Relay" true and testable.
 

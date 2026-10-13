@@ -8,6 +8,8 @@
 //! anything older than 60 days, and each handled Message ID is kept until
 //! 60 days after the LATER of the handling time and the Sender Timestamp.
 
+use super::super::test_helpers::*;
+
 /// Walk a protobuf wire encoding and return the field numbers present.
 /// Format-stable across the envelope reshape — this is how the red tests
 /// inspect what the Relay can read without depending on either API shape.
@@ -167,4 +169,364 @@ fn two_sends_share_no_relay_readable_sender_pseudonym() {
             );
         }
     }
+}
+
+// ── Replay Window (ADR-0031, ADR-0034 §2) ────────────────────────────────────
+
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+fn now_ms() -> u64 {
+    crate::operation_log::now_secs() * 1000
+}
+
+/// A connected two-member session against a scripted relay, with a Delivery
+/// Issue collector. Returns (relay, session, issues, sender, device_pub).
+fn window_session(
+    on_sync: impl Fn() + Send + 'static,
+) -> (
+    ScriptedRelay,
+    super::super::TruesealSession<MemPipe>,
+    std::sync::Arc<std::sync::Mutex<Vec<crate::delivery_issue::DeliveryIssue>>>,
+    crate::envelope::SigningKeypair,
+    crate::keys::NoisePublicKey,
+) {
+    let relay_kp = make_relay_kp();
+    let device = crate::device::DeviceKeypair::generate();
+    let sender = crate::envelope::SigningKeypair::generate();
+
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    let manifest = membership(&device, &sender);
+    let device_pub = device.public_key();
+
+    let session = super::super::TruesealSession::<MemPipe>::connect_full(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        move |msg, _author, _seq| {
+            if matches!(msg, crate::message::Message::Sync { .. }) {
+                on_sync();
+            }
+        },
+        Box::new(crate::operation_log::MemLog::new()),
+        || {},
+        |_| {},
+        || {},
+        || Err("push factory unused".into()),
+    )
+    .expect("session");
+    session.set_manifest(manifest);
+    let issues: std::sync::Arc<std::sync::Mutex<Vec<crate::delivery_issue::DeliveryIssue>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let issues_cb = issues.clone();
+    session.subscribe_delivery_issues(move |i| issues_cb.lock().unwrap().push(i));
+    (relay, session, issues, sender, device_pub)
+}
+
+/// Boundary, both sides of the 60-day Replay Window: a blob stamped 59 days
+/// ago is accepted and handled; one stamped 61 days ago is acked and dropped
+/// as `unreadable(expired)` and never reaches the handler.
+#[test]
+fn replay_window_accepts_59_days_and_rejects_61_days() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let handled = Arc::new(AtomicUsize::new(0));
+    let h = handled.clone();
+    let (relay, _session, issues, sender, device_pub) = window_session(move || {
+        h.fetch_add(1, Ordering::SeqCst);
+    });
+
+    relay.deliver_at(
+        1,
+        &crate::message::Message::Sync {
+            body: b"59 days old".to_vec(),
+        },
+        device_pub,
+        &sender,
+        1,
+        now_ms() - 59 * DAY_MS,
+    );
+    wait_for(
+        || handled.load(Ordering::SeqCst) == 1,
+        std::time::Duration::from_secs(5),
+    );
+    wait_for(
+        || relay.deliver_acks() == vec![1],
+        std::time::Duration::from_secs(5),
+    );
+
+    relay.deliver_at(
+        2,
+        &crate::message::Message::Sync {
+            body: b"61 days old".to_vec(),
+        },
+        device_pub,
+        &sender,
+        2,
+        now_ms() - 61 * DAY_MS,
+    );
+    wait_for(
+        || relay.deliver_acks() == vec![1, 2],
+        std::time::Duration::from_secs(5),
+    );
+    assert_eq!(
+        handled.load(Ordering::SeqCst),
+        1,
+        "the 61-day-old blob never reaches the handler"
+    );
+    wait_for(
+        || {
+            issues.lock().unwrap().iter().any(|i| {
+                matches!(
+                    i,
+                    crate::delivery_issue::DeliveryIssue::Unreadable(
+                        crate::delivery_issue::UnreadableReason::Expired
+                    )
+                )
+            })
+        },
+        std::time::Duration::from_secs(5),
+    );
+}
+
+/// A byte-identical replay (the SAME envelope bytes, new blob id — the
+/// hostile-Relay case) runs the handler exactly once.
+#[test]
+fn byte_identical_replay_delivers_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let handled = Arc::new(AtomicUsize::new(0));
+    let h = handled.clone();
+    let (relay, _session, _issues, sender, device_pub) = window_session(move || {
+        h.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let env = crate::envelope::Envelope::build_sealed(
+        5,
+        vec![],
+        device_pub,
+        &sender,
+        now_ms(),
+        &crate::message::Message::Sync {
+            body: b"raw replay".to_vec(),
+        }
+        .encode(),
+    );
+    relay.deliver_raw(1, env.encode());
+    relay.deliver_raw(2, env.encode());
+
+    wait_for(
+        || relay.deliver_acks().len() == 2,
+        std::time::Duration::from_secs(5),
+    );
+    assert_eq!(
+        handled.load(Ordering::SeqCst),
+        1,
+        "a byte-identical re-delivery is deduped by Message ID"
+    );
+}
+
+/// A `Sync` entry re-sealed on day 30 keeps its day-0 Sender Timestamp
+/// (ADR-0034 §2), so the copy a Hostile Relay delivers on day 75 is
+/// rejected as `unreadable(expired)` and never reaches the handler.
+#[test]
+fn resealed_sync_replayed_after_window_is_rejected() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let handled = Arc::new(AtomicUsize::new(0));
+    let h = handled.clone();
+    let (relay, _session, issues, sender, device_pub) = window_session(move || {
+        h.fetch_add(1, Ordering::SeqCst);
+    });
+
+    // Stamped at "send()" 75 days ago; the re-sealed copy arrives today.
+    relay.deliver_at(
+        1,
+        &crate::message::Message::Sync {
+            body: b"old sync".to_vec(),
+        },
+        device_pub,
+        &sender,
+        1,
+        now_ms() - 75 * DAY_MS,
+    );
+    wait_for(
+        || relay.deliver_acks() == vec![1],
+        std::time::Duration::from_secs(5),
+    );
+    assert_eq!(handled.load(Ordering::SeqCst), 0);
+    wait_for(
+        || {
+            issues.lock().unwrap().iter().any(|i| {
+                matches!(
+                    i,
+                    crate::delivery_issue::DeliveryIssue::Unreadable(
+                        crate::delivery_issue::UnreadableReason::Expired
+                    )
+                )
+            })
+        },
+        std::time::Duration::from_secs(5),
+    );
+}
+
+/// Future timestamps are accepted (a fast sender clock still gets through),
+/// and the dedup record is clamped FORWARD to the Sender Timestamp: it
+/// lives until 60 days after the later of handling time and the stamp
+/// (ADR-0034 §2), so a replay can never arrive after its record expired.
+#[test]
+fn future_dated_message_is_accepted_and_dedup_record_is_clamped_forward() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let handled = Arc::new(AtomicUsize::new(0));
+    let h = handled.clone();
+    let (relay, session, _issues, sender, device_pub) = window_session(move || {
+        h.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let future = now_ms() + 30 * DAY_MS;
+    relay.deliver_at(
+        1,
+        &crate::message::Message::Sync {
+            body: b"from the future".to_vec(),
+        },
+        device_pub,
+        &sender,
+        7,
+        future,
+    );
+    wait_for(
+        || handled.load(Ordering::SeqCst) == 1,
+        std::time::Duration::from_secs(5),
+    );
+
+    let mid = crate::message::message_id(&sender.public_key_bytes(), 7);
+    let log = session.op_log.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(log.is_handled(&mid), "the future-dated message is recorded");
+    assert_eq!(
+        log.handled_at(&mid),
+        Some(future / 1000),
+        "the record is clamped to the Sender Timestamp — kept until stamp + 60d"
+    );
+}
+
+/// A re-addressed blob (outer routing field swapped) or an
+/// ephemeral-swapped blob fails and is reported `unreadable(malformed)`.
+#[test]
+fn readdressed_or_ephemeral_swapped_blob_fails() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let handled = Arc::new(AtomicUsize::new(0));
+    let h = handled.clone();
+    let (relay, _session, issues, sender, device_pub) = window_session(move || {
+        h.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let env = crate::envelope::Envelope::build_sealed(
+        1,
+        vec![],
+        device_pub,
+        &sender,
+        now_ms(),
+        &crate::message::Message::Sync {
+            body: b"addressed".to_vec(),
+        }
+        .encode(),
+    );
+
+    // Re-addressed: outer recipient_pub swapped for another key.
+    let other =
+        crate::keys::NoisePublicKey(crate::envelope::SigningKeypair::generate().public_key_bytes());
+    let mut tampered = env.clone();
+    tampered.recipient_pub = other.0;
+    relay.deliver_raw(1, tampered.encode());
+
+    // Ephemeral-swapped: the first 32 payload bytes replaced.
+    let mut swapped = env.clone();
+    let eph: [u8; 32] = crate::envelope::SigningKeypair::generate().public_key_bytes();
+    swapped.payload[..32].copy_from_slice(&eph);
+    relay.deliver_raw(2, swapped.encode());
+
+    wait_for(
+        || relay.deliver_acks().len() == 2,
+        std::time::Duration::from_secs(5),
+    );
+    assert_eq!(
+        handled.load(Ordering::SeqCst),
+        0,
+        "neither tampered copy reaches the handler"
+    );
+    wait_for(
+        || {
+            issues
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|i| {
+                    matches!(
+                        i,
+                        crate::delivery_issue::DeliveryIssue::Unreadable(
+                            crate::delivery_issue::UnreadableReason::Malformed
+                        )
+                    )
+                })
+                .count()
+                == 2
+        },
+        std::time::Duration::from_secs(5),
+    );
+}
+
+/// Replaying a Revoke after the group is destroyed changes no state
+/// (ADR-0034 §2: "a Revoke for a group that is already destroyed does
+/// nothing"). The device wiped and rotated — the replayed copy is dropped
+/// by the manifestless filter and the destroyed callback does not re-fire.
+#[test]
+fn replayed_revoke_after_destroy_does_nothing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let relay_kp = make_relay_kp();
+    let device = crate::device::DeviceKeypair::generate();
+    let sender = crate::envelope::SigningKeypair::generate();
+
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    let manifest = membership(&device, &sender);
+    let device_pub = device.public_key();
+
+    let destroyed = Arc::new(AtomicUsize::new(0));
+    let d = destroyed.clone();
+    let session = super::super::TruesealSession::<MemPipe>::connect_full(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        move |_msg, _author, _seq| {},
+        Box::new(crate::operation_log::MemLog::new()),
+        || {},
+        |_| {},
+        move || {
+            d.fetch_add(1, Ordering::SeqCst);
+        },
+        || Err("push factory unused".into()),
+    )
+    .expect("session");
+    session.set_manifest(manifest);
+
+    relay.deliver(1, &crate::message::Message::Revoke, device_pub, &sender, 1);
+    wait_for(
+        || destroyed.load(Ordering::SeqCst) == 1,
+        std::time::Duration::from_secs(5),
+    );
+
+    // The hostile replay: same content, fresh seal, new blob id.
+    relay.deliver(2, &crate::message::Message::Revoke, device_pub, &sender, 2);
+    wait_for(
+        || relay.deliver_acks() == vec![1, 2],
+        std::time::Duration::from_secs(5),
+    );
+    assert_eq!(
+        destroyed.load(Ordering::SeqCst),
+        1,
+        "a replayed Revoke changes no state"
+    );
 }

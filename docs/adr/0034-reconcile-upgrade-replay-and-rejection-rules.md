@@ -1,6 +1,6 @@
 # Re-seal every outbox entry, a Sender Timestamp fixed at send(), a 30-day relay TTL cap, and reasons on `unreadable`
 
-Status: accepted (decided 2026-09-30 in [trueseal-roadmap#30](https://github.com/julianbonomini/trueseal-roadmap/issues/30); not yet implemented). This amends ADR-0022, ADR-0026, ADR-0028, ADR-0031 and ADR-0032, and trueseal-relay ADR-0012. Where they disagree with this ADR, this ADR wins.
+Status: accepted (decided 2026-09-30 in [trueseal-roadmap#30](https://github.com/julianbonomini/trueseal-roadmap/issues/30); §2 Sender Timestamp + §3 `unreadable` reasons implemented in SYNC-12 (#104); §1's migration-transaction re-seal is SYNC-13 scope; the relay TTL cap is RELAY-8). This amends ADR-0022, ADR-0026, ADR-0028, ADR-0031 and ADR-0032, and trueseal-relay ADR-0012. Where they disagree with this ADR, this ADR wins.
 
 Compiling the Developer Preview Release Spec turned up three places where accepted ADRs contradicted each other or the code. This ADR settles all three.
 

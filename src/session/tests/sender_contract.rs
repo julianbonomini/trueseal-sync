@@ -734,6 +734,75 @@ fn control_entry_never_expires() {
     );
 }
 
+/// The Sender Timestamp rule (ADR-0034 §2), pinned at the seal: a `Sync`
+/// entry keeps the time it was queued (`send()`), through every re-seal —
+/// every copy leaves the Replay Window at the same moment. A control entry
+/// is stamped at EACH seal, so a long-queued Leave or Revoke is fresh when
+/// it lands and peers do not reject it as expired.
+#[test]
+fn sync_keeps_send_time_stamp_control_is_stamped_at_each_seal() {
+    let relay_kp = make_relay_kp();
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
+    let relay = ScriptedPushRelay::spawn(pipe_relay, &relay_kp, nk_rx, vec![], Verdict::Ack);
+
+    let device = DeviceKeypair::generate();
+    let recipient = DeviceKeypair::generate();
+    let session = TruesealSession::connect(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("connect");
+
+    let ten_days = 10 * 24 * 60 * 60;
+    let ninety_days = 90 * 24 * 60 * 60;
+    let sync_queued_at = now_secs() - ten_days;
+    {
+        let mut log = session.op_log.lock().unwrap_or_else(|e| e.into_inner());
+        log.append_entry(LogEntry {
+            object_id: recipient.public_key().0,
+            sequence: 0,
+            kind: OutboxKind::Sync,
+            created_at: sync_queued_at,
+            blob: b"stamped at send".to_vec(),
+        });
+        log.append_entry(LogEntry {
+            object_id: recipient.public_key().0,
+            sequence: 1,
+            kind: OutboxKind::Control,
+            created_at: now_secs() - ninety_days,
+            blob: Message::Revoke.encode(),
+        });
+    }
+    let before = now_secs();
+    wait_for(|| relay.pushes().len() == 2, Duration::from_secs(3));
+    let after = now_secs();
+
+    let sync_ts = relay.pushes()[0]
+        .1
+        .open_sealed(recipient.noise.private())
+        .expect("sealed to the recipient")
+        .sender_timestamp_ms;
+    assert_eq!(
+        sync_ts,
+        sync_queued_at * 1000,
+        "a Sync entry keeps its send() stamp through the seal"
+    );
+
+    let control_ts = relay.pushes()[1]
+        .1
+        .open_sealed(recipient.noise.private())
+        .expect("sealed to the recipient")
+        .sender_timestamp_ms;
+    assert!(
+        before.saturating_sub(60) * 1000 <= control_ts && control_ts <= (after + 60) * 1000,
+        "a control entry is stamped at each seal (≈ now), not at queue time: {control_ts}"
+    );
+}
+
 /// Delivered rows are DELETED (ADR-0026), and the sequence high-water mark
 /// keeps numbers unique across a restart anyway: a re-used sequence would
 /// collide in the recipient's dedup table.

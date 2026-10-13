@@ -205,10 +205,7 @@ impl Envelope {
         if prefix.len() < parents_end + 8 {
             return Err(EnvelopeError::OpenFailed);
         }
-        let parents = prefix[42..parents_end]
-            .as_chunks::<32>()
-            .0
-            .to_vec();
+        let parents = prefix[42..parents_end].as_chunks::<32>().0.to_vec();
         let sender_timestamp_ms = u64::from_le_bytes(
             prefix[parents_end..parents_end + 8]
                 .try_into()

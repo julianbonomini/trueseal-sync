@@ -145,6 +145,11 @@ pub trait OperationLog: Send {
     /// Record a handled Message ID, stamped `now` (Unix seconds), and prune
     /// records older than [`DEDUP_RETENTION_SECS`] relative to `now`.
     fn record_handled(&mut self, message_id: &str, now: u64);
+    /// The recorded stamp for a handled Message ID (Unix seconds), if any.
+    /// Diagnostic: the Replay Window clamps this forward to the Sender
+    /// Timestamp (ADR-0034 §2: "60 days after the LATER of the handling
+    /// time and the sender timestamp"), and tests assert the clamp here.
+    fn handled_at(&self, message_id: &str) -> Option<u64>;
 
     /// Persist the Pending Join record AND queue its `Pair` control entry
     /// as one unit (ADR-0023: "`joinGroup` persists the Pending Join in
@@ -351,6 +356,10 @@ impl OperationLog for MemLog {
         self.handled.insert(message_id.to_string(), now);
         let cutoff = now.saturating_sub(DEDUP_RETENTION_SECS);
         self.handled.retain(|_, handled_at| *handled_at >= cutoff);
+    }
+
+    fn handled_at(&self, message_id: &str) -> Option<u64> {
+        self.handled.get(message_id).copied()
     }
 
     fn begin_pending_join(
@@ -694,5 +703,33 @@ mod tests {
         log.mark_delivered(&oid(2), 7);
         // Delivered entries still count toward max_sequence.
         assert_eq!(log.max_sequence(), Some(7));
+    }
+
+    /// The Replay Window clamp (ADR-0034 §2): a future-dated message's
+    /// record is stamped FORWARD to its Sender Timestamp, so a later prune
+    /// that would drop a normally-stamped record keeps it — the replay can
+    /// never outlive its dedup record.
+    #[test]
+    fn future_clamped_record_survives_a_later_prune() {
+        let mut log = MemLog::new();
+        let now = 10_000_000u64;
+        // A message stamped 30 days in the future is recorded clamped.
+        log.record_handled("future_msg", now + 30 * 24 * 60 * 60);
+        // A message stamped normally.
+        log.record_handled("normal_msg", now);
+
+        // 61 days later (recorded via a new record's prune): the normal
+        // record is pruned, the clamped one survives.
+        log.record_handled("trigger", now + 61 * 24 * 60 * 60);
+
+        assert!(
+            !log.is_handled("normal_msg"),
+            "the normally-stamped record expired after 60 days"
+        );
+        assert!(
+            log.is_handled("future_msg"),
+            "the clamped record lives until stamp + 60 days"
+        );
+        assert_eq!(log.handled_at("future_msg"), Some(now + 30 * 24 * 60 * 60));
     }
 }

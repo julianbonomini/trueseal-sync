@@ -483,6 +483,18 @@ impl OperationLog for PersistentLog {
         }
     }
 
+    fn handled_at(&self, message_id: &str) -> Option<u64> {
+        self.store
+            .conn
+            .query_row(
+                "SELECT handled_at FROM handled_messages WHERE message_id = ?1",
+                rusqlite::params![message_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .map(|v| v as u64)
+    }
+
     fn begin_pending_join(
         &mut self,
         pending: &[u8],
