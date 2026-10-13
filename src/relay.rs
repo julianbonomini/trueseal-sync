@@ -400,10 +400,10 @@ impl<T: Severable> RelayClient<T> {
         )
     }
 
-    /// `connect_subscribed` with explicit heartbeat/liveness knobs — the
-    /// seam the SYNC-16 tests use; production callers get the ADR-0012
-    /// defaults (25 s / 75 s).
-    #[cfg(test)]
+    /// `connect_subscribed` with explicit heartbeat/liveness knobs —
+    /// production callers pass the ADR-0012 defaults (25 s / 75 s) via
+    /// `SessionTimeouts::default()`; tests pass scaled-down windows (B23c:
+    /// relay-kill liveness must be exercisable without a 75 s test).
     pub(crate) fn connect_subscribed_with_timeouts(
         transport: T,
         relay_pub: NoisePublicKey,
@@ -725,11 +725,22 @@ fn run_loop<T: Severable>(
     // relay-initiated keepalive): the client sends a Heartbeat every
     // `interval` while connected. The relay echoes it, but ANY inbound
     // frame counts as liveness; if no inbound frame arrives within
-    // `liveness`, the link is dead — sever it so the receive thread EOFs,
-    // this loop exits, DisconnectGuard flips is_connected and the
-    // reconnect loop redials. The thread exits the moment this run loop
-    // does (the stop channel's sender drops), so close() leaves no
-    // zombie behind.
+    // `liveness`, the link is dead. The watchdog then performs BOTH halves
+    // of link-down signaling itself — flips is_connected AND severs —
+    // because the DisconnectGuard at this run loop's scope only drops when
+    // the dispatch loop below exits, and that loop runs APP CALLBACKS on
+    // this thread: a PARKED handler (B7b covered panicking ones) would
+    // otherwise wedge disconnect detection forever — socket severed,
+    // receive thread dead, is_connected true, no Disconnected ever
+    // surfacing (B23c, the structural shape of the D1 finding). The
+    // guard's later store is idempotent, so the double signal is
+    // harmless, and the parked loop still drains its queue in order when
+    // the callback returns. A heartbeat SEND failure is the same verdict:
+    // a healthy link does not refuse 19 bytes (a WouldBlock under relay
+    // backpressure is a wedged link) — flip + sever, costing at most one
+    // spurious reconnect, the false-positive price the liveness stamp
+    // already accepts. The thread exits the moment this run loop does
+    // (the stop channel's sender drops), so close() leaves no zombie.
     let (heartbeat_stop_tx, heartbeat_stop_rx) = mpsc::channel::<()>();
     let _heartbeat_stop_tx = heartbeat_stop_tx;
     let last_inbound_heartbeat = last_inbound.clone();
@@ -2485,6 +2496,126 @@ mod tests {
             "regular inbound frames (no echoes) must keep the session alive"
         );
         drop(deliver_tx);
+    }
+
+    // ── B23c: relay kill over REAL TCP (the D1 finding) ─────────────────────
+    //
+    // Every liveness test above runs over MemPipe, whose sever EOFs cleanly.
+    // The D1 Swift task found that killing a REAL relay is never detected
+    // (≥150 s, no Disconnected): a real dead TCP socket behaves differently —
+    // a clean kill delivers FIN/RST, but a killed container / cable pull can
+    // black-hole the connection (no FIN at all). These tests run the real
+    // production transport (ConnectionFactory::open — a non-blocking
+    // TcpStream) against a real TCP relay stand-in and kill it both ways.
+
+    /// How the relay stand-in dies once told.
+    enum KillMode {
+        /// Drop the socket: the kernel delivers FIN (or RST with a heartbeat
+        /// in flight) — a clean process kill.
+        CleanKill,
+        /// Leak the socket without closing: no FIN, no RST, silence — a
+        /// killed container / pulled cable. The worst case for liveness:
+        /// only the watchdog can notice.
+        BlackHole,
+    }
+
+    /// A real-TCP relay stand-in: version exchange + XX accept, then echo
+    /// heartbeats exactly like the real relay until `kill_rx` fires, then die
+    /// per `mode`. Returns (addr, kill switch).
+    fn spawn_tcp_relay(
+        relay_kp: Keypair,
+        mode: KillMode,
+    ) -> (String, std::sync::mpsc::Sender<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind relay");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let (kill_tx, kill_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            // The relay side blocks; the client side is non-blocking (the
+            // production shape — ConnectionFactory sets non-blocking).
+            let session = xx_accept_after_prefix(stream, relay_kp).expect("accept handshake");
+            loop {
+                if kill_rx.try_recv().is_ok() {
+                    match mode {
+                        KillMode::CleanKill => drop(session),
+                        KillMode::BlackHole => std::mem::forget(session),
+                    }
+                    return;
+                }
+                match session.receive() {
+                    Ok(raw) => {
+                        if let Some((MsgType::Heartbeat, _)) = parse(&raw) {
+                            if session.send(&frame(MsgType::Heartbeat, &[])).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        (addr, kill_tx)
+    }
+
+    /// A client on the REAL production transport for the given relay address.
+    fn tcp_client(
+        addr: &str,
+        relay_pub: NoisePublicKey,
+        device: &DeviceKeypair,
+    ) -> RelayClient<std::net::TcpStream> {
+        let stream = crate::connection::ConnectionFactory::open(addr).expect("open");
+        RelayClient::connect_subscribed_with_timeouts(
+            stream,
+            relay_pub,
+            Keypair::new(device.noise.private(), device.noise.public_key),
+            |_, _, _, _| {},
+            None,
+            test_timeouts(100, 300),
+        )
+        .expect("connect")
+    }
+
+    /// Clean kill: the kernel delivers FIN/RST — the receive thread must
+    /// surface it and the session must go down.
+    #[test]
+    fn relay_clean_kill_is_detected_over_real_tcp() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let (addr, kill) = spawn_tcp_relay(relay_kp2, KillMode::CleanKill);
+
+        let device = DeviceKeypair::generate();
+        let client = tcp_client(&addr, relay_pub, &device);
+        assert!(client.is_connected(), "session should be up pre-kill");
+        // Let a heartbeat or two flow so the liveness stamp has moved.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        kill.send(()).expect("kill");
+        assert!(
+            wait_until(|| !client.is_connected(), 3_000),
+            "a cleanly killed relay (FIN/RST) must be detected over real TCP"
+        );
+    }
+
+    /// Black-hole kill: no FIN, no RST — the socket just goes silent. Only
+    /// the liveness watchdog can notice: it must sever within the window.
+    #[test]
+    fn relay_blackhole_kill_is_detected_over_real_tcp() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let (addr, kill) = spawn_tcp_relay(relay_kp2, KillMode::BlackHole);
+
+        let device = DeviceKeypair::generate();
+        let client = tcp_client(&addr, relay_pub, &device);
+        assert!(client.is_connected(), "session should be up pre-kill");
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        kill.send(()).expect("kill");
+        assert!(
+            wait_until(|| !client.is_connected(), 3_000),
+            "a black-holed relay (no FIN) must be severed by the liveness watchdog"
+        );
     }
 
     /// After the relay answers `0x01` (supported), a silent relay must not

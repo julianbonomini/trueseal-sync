@@ -47,6 +47,7 @@ pub(super) fn reconnect_loop<T: crate::relay::Severable>(
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
     on_connection_changed: Arc<dyn Fn(super::ConnectionChange) + Send + Sync + 'static>,
+    timeouts: crate::relay::SessionTimeouts,
 ) {
     let mut backoff = cap.min(Duration::from_secs(1));
     let mut was_connected = false; // track last-known state to detect transitions
@@ -138,12 +139,13 @@ pub(super) fn reconnect_loop<T: crate::relay::Severable>(
                 sink.lock().unwrap_or_else(|e| e.into_inner()).fire(issue);
             }
         };
-        let new_client = match RelayClient::connect_subscribed(
+        let new_client = match RelayClient::connect_subscribed_with_timeouts(
             transport,
             relay_pub,
             noise_kp,
             handler,
             Some(Box::new(issue_forwarder)),
+            timeouts,
         ) {
             Ok(c) => c,
             Err(crate::relay::RelayError::RelayVersionUnsupported { min, max }) => {

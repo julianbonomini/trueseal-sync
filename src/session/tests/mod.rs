@@ -24,6 +24,7 @@ mod pairing;
 mod pairing_trust_anchor;
 mod panic_safety;
 mod push;
+mod relay_kill;
 mod remove_member;
 mod remove_member_by_id;
 mod revocation;
