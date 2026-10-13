@@ -50,7 +50,8 @@ impl DeviceKeypair {
         SigningPublicKey(self.signing.verifying_key().to_bytes())
     }
 
-    /// Wrap the device's Ed25519 signing key as a `SigningKeypair` for use with `Envelope::build`.
+    /// Wrap the device's Ed25519 signing key as a `SigningKeypair` for use
+    /// with `Envelope::build_sealed`.
     pub fn signing_keypair(&self) -> SigningKeypair {
         // Reconstruct from secret key bytes — ed25519_dalek::SigningKey doesn't impl Clone.
         let secret = self.signing.to_bytes();

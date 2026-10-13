@@ -142,9 +142,21 @@ pub trait OperationLog: Send {
     /// Dedup table (ADR-0026 recipient step 3): has this Message ID already
     /// been handled?
     fn is_handled(&self, message_id: &str) -> bool;
-    /// Record a handled Message ID, stamped `now` (Unix seconds), and prune
-    /// records older than [`DEDUP_RETENTION_SECS`] relative to `now`.
-    fn record_handled(&mut self, message_id: &str, now: u64);
+    /// Record a handled Message ID, stamped `stamp` (Unix seconds), and
+    /// prune records older than [`DEDUP_RETENTION_SECS`].
+    ///
+    /// The STORED stamp is the later of the handling time and the Sender
+    /// Timestamp (ADR-0034 §2), so a future-dated message's record lives
+    /// until its stamp + 60 days. The PRUNE reference is always the real
+    /// wall clock, never the passed stamp: a far-future stamp must not
+    /// delete every existing record (a malicious relay could then
+    /// re-deliver 60 days of messages).
+    fn record_handled(&mut self, message_id: &str, stamp: u64);
+    /// The recorded stamp for a handled Message ID (Unix seconds), if any.
+    /// Diagnostic: the Replay Window clamps this forward to the Sender
+    /// Timestamp (ADR-0034 §2: "60 days after the LATER of the handling
+    /// time and the sender timestamp"), and tests assert the clamp here.
+    fn handled_at(&self, message_id: &str) -> Option<u64>;
 
     /// Persist the Pending Join record AND queue its `Pair` control entry
     /// as one unit (ADR-0023: "`joinGroup` persists the Pending Join in
@@ -347,10 +359,18 @@ impl OperationLog for MemLog {
         self.handled.contains_key(message_id)
     }
 
-    fn record_handled(&mut self, message_id: &str, now: u64) {
-        self.handled.insert(message_id.to_string(), now);
-        let cutoff = now.saturating_sub(DEDUP_RETENTION_SECS);
+    fn record_handled(&mut self, message_id: &str, stamp: u64) {
+        self.handled.insert(message_id.to_string(), stamp);
+        // Prune against the REAL WALL CLOCK, never the stored stamp: a
+        // far-future Sender Timestamp must not prune other records (the
+        // clamp-poisons-pruning attack). A future-stamped record survives
+        // because its stamp is never below the wall-clock cutoff.
+        let cutoff = now_secs().saturating_sub(DEDUP_RETENTION_SECS);
         self.handled.retain(|_, handled_at| *handled_at >= cutoff);
+    }
+
+    fn handled_at(&self, message_id: &str) -> Option<u64> {
+        self.handled.get(message_id).copied()
     }
 
     fn begin_pending_join(
@@ -663,16 +683,21 @@ mod tests {
     }
 
     /// Dedup: a recorded Message ID is handled; records older than the
-    /// 60-day retention are pruned on the next record.
+    /// 60-day retention (relative to the REAL wall clock) are pruned on
+    /// the next record.
     #[test]
     fn handled_ids_are_recorded_and_pruned() {
         let mut log = MemLog::new();
         assert!(!log.is_handled("tsm1_x"));
-        // An old record at t=1000.
-        log.record_handled("tsm1_old", 1_000);
+        // An old record, 61 days behind the wall clock (inserted directly:
+        // record_handled would drop an already-expired stamp on the spot).
+        log.handled.insert(
+            "tsm1_old".to_string(),
+            now_secs() - DEDUP_RETENTION_SECS - 1,
+        );
         assert!(log.is_handled("tsm1_old"));
-        // Recording at t=1000+60d+1 prunes the old one.
-        log.record_handled("tsm1_new", 1_000 + DEDUP_RETENTION_SECS + 1);
+        // Recording a fresh message prunes the expired one.
+        log.record_handled("tsm1_new", now_secs());
         assert!(log.is_handled("tsm1_new"));
         assert!(
             !log.is_handled("tsm1_old"),
@@ -694,5 +719,43 @@ mod tests {
         log.mark_delivered(&oid(2), 7);
         // Delivered entries still count toward max_sequence.
         assert_eq!(log.max_sequence(), Some(7));
+    }
+
+    /// The Replay Window clamp (ADR-0034 §2): a future-dated message's
+    /// record is stamped FORWARD to its Sender Timestamp and is never
+    /// pruned early — the wall-clock cutoff is always behind a future
+    /// stamp, so the record lives until stamp + 60 days.
+    #[test]
+    fn future_clamped_record_survives_a_later_prune() {
+        let mut log = MemLog::new();
+        let future = now_secs() + 30 * 24 * 60 * 60;
+        log.record_handled("future_msg", future);
+        // Many later records, each triggering a prune: the clamped record
+        // is never dropped.
+        for i in 0..10 {
+            log.record_handled(&format!("later_{i}"), now_secs());
+            assert!(
+                log.is_handled("future_msg"),
+                "the clamped record survives every wall-clock prune"
+            );
+        }
+        assert_eq!(log.handled_at("future_msg"), Some(future));
+    }
+
+    /// The clamp-poisons-pruning attack (review P1): a member seals a Sync
+    /// stamped ten years in the future (accepted — future stamps pass the
+    /// window). Recording its clamped stamp must NOT prune the existing
+    /// dedup records, or a malicious relay could re-deliver 60 days of
+    /// messages.
+    #[test]
+    fn far_future_stamp_does_not_prune_existing_records() {
+        let mut log = MemLog::new();
+        log.record_handled("m1", now_secs());
+        log.record_handled("m2", now_secs());
+        // The attack: one record stamped now + 10 years.
+        log.record_handled("evil", now_secs() + 10 * 365 * 24 * 60 * 60);
+        assert!(log.is_handled("m1"), "existing records survive the clamp");
+        assert!(log.is_handled("m2"), "existing records survive the clamp");
+        assert!(log.is_handled("evil"));
     }
 }

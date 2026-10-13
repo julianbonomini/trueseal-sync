@@ -24,6 +24,7 @@ mod push;
 mod remove_member;
 mod remove_member_by_id;
 mod revocation;
+mod sealed_envelope;
 mod sender_contract;
 mod size_limit;
 mod version_arithmetic;

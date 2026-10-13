@@ -181,7 +181,7 @@ A stable opaque identifier for one application `Sync` message. Derived inside tr
 _Avoid_: relay blob ID, payload hash, database ID, exactly-once token
 
 **Envelope**:
-The wrapper around a Blob. The Relay can read only its End-to-End Version, the recipient public key and the sealed payload. Everything else is inside the Addressed Encryption, where the Relay can't see it: the author's signing public key (`author_pub`), the Sequence, the parent hashes, the sender timestamp, the object ID and the signature. Two Envelopes from the same Device share no Relay-readable value apart from the version, and the recipient key when both go to the same Device (ADR-0031).
+The wrapper around a Blob. The Relay can read only its End-to-End Version, the recipient public key and the sealed payload. Everything else is inside the Addressed Encryption, where the Relay can't see it: the author's signing public key (`author_pub`), the Sequence, the parent hashes, the Sender Timestamp, the message (tag + body) and the signature. Two Envelopes from the same Device share no Relay-readable value apart from the version, and the recipient key when both go to the same Device (ADR-0031).
 _Avoid_: header, wrapper, frame, message
 
 **Parent Hash**:

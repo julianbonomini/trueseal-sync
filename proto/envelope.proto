@@ -3,40 +3,30 @@ syntax = "proto3";
 package trueseal.sync.v0;
 
 // Envelope is the wire format for all sync traffic in trueseal-sync.
-// It is the only thing the Relay ever sees. The Relay uses recipient_pub
-// for routing and sequence for ordering. All other fields are forwarded
-// blindly — the Relay never decrypts or interprets them.
+// It is the only thing the Relay ever sees — and by design it can read
+// almost nothing (ADR-0031): the End-to-End Version, so a Device can reject
+// a version before decrypting (ADR-0022); the recipient public key, for
+// routing; and the sealed payload, the Addressed Encryption output.
 //
-// Callers embed object identity, type, schema version, and any other
-// application-level metadata inside the encrypted payload. The Relay
-// has no knowledge of any of it.
+// Everything else — the author's signing key, the Sequence, the parent
+// hashes, the Sender Timestamp, the message and the signature — is sealed
+// inside the payload, where the Relay cannot see or test it. Two Envelopes
+// from the same Device share no Relay-readable value apart from the version
+// (and the recipient key when both go to the same Device).
 message Envelope {
-  // End-to-End Version (ADR-0022). Signed along with every other field.
-  // The only Envelope field besides recipient_pub and payload the Relay may
-  // read. 0 is reserved and means the refused pre-version format.
+  // End-to-End Version (ADR-0022). Plaintext so a Device can reject an
+  // unsupported version before decrypting. 0 is reserved and means the
+  // refused pre-version format.
   uint32 version = 7;
-
-  // Device-scoped monotonic counter. Used by the Relay to order Envelopes
-  // within a recipient's Inbox.
-  uint64 sequence = 1;
-
-  // Hashes (SHA-256) of parent Envelopes in the Operation Log.
-  // Empty for the root Envelope. Exactly one entry in v0.
-  // Multiple entries are valid in v1 to express DAG merge points (ADR-0004).
-  repeated bytes parents = 2;
 
   // X25519 public key of the recipient Device. The Relay routes to the
   // Inbox identified by this key. 32 bytes.
   bytes recipient_pub = 3;
 
-  // Ed25519 signature over: sequence || parents || recipient_pub || ciphertext.
-  // author_pub is inside the encrypted payload — the relay never sees it (ADR-0018).
-  // Signed by the author's Ed25519 private key.
-  // Verified by recipients after decryption. 64 bytes.
-  bytes signature = 5;
-
-  // Addressed-encrypted payload. Encrypted with crypto::encrypt(recipient_pub, author_pub, plaintext).
-  // First 32 bytes of the decrypted plaintext are author_pub (Ed25519 signing key).
-  // Opaque to the Relay.
+  // Addressed Encryption output: ephemeral_pub (32) || nonce (12) ||
+  // AEAD ciphertext. The sealed plaintext inside carries author_pub,
+  // sequence, parent hashes, the Sender Timestamp, the message and the
+  // signature (ADR-0031; byte layout in src/envelope.rs, pinned by the
+  // SYNC-2 test vectors). Opaque to the Relay.
   bytes payload = 6;
 }

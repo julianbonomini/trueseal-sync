@@ -434,9 +434,16 @@ fn every_message_type_fits_one_frame_at_the_limit() {
     let signing = sender.signing_keypair();
 
     let framed_len = |msg: Message| -> usize {
-        build_push_blob(&msg, recipient.public_key(), 1, vec![], &signing)
-            .expect("message must fit in one frame")
-            .len()
+        build_push_blob(
+            &msg,
+            recipient.public_key(),
+            1,
+            vec![],
+            &signing,
+            crate::operation_log::now_secs() * 1000,
+        )
+        .expect("message must fit in one frame")
+        .len()
     };
 
     let sync_framed = build_push_blob(
@@ -447,6 +454,7 @@ fn every_message_type_fits_one_frame_at_the_limit() {
         1,
         vec![],
         &signing,
+        crate::operation_log::now_secs() * 1000,
     )
     .expect("Sync at the Protocol Size Limit must fit one frame");
     assert!(

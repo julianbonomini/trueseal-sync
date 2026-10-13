@@ -1,14 +1,31 @@
-use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use prost::Message;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::crypto;
 use crate::keys::{NoisePublicKey, SigningPublicKey};
 use crate::version;
 
 // Include the prost-generated types from proto/envelope.proto
 mod proto {
     include!(concat!(env!("OUT_DIR"), "/trueseal.sync.v0.rs"));
+}
+
+/// The Replay Window (ADR-0031): a message whose signed Sender Timestamp is
+/// more than this far behind the receiver's clock is rejected as
+/// `unreadable(expired)` and acked. Sixty days — twice the 30-day Relay TTL
+/// and the 30-day Outbox expiry (both capped, ADR-0034 §2), so an honest
+/// message is never lost to the window and a hostile Relay can never replay
+/// a copy after its dedup record has expired.
+pub const REPLAY_WINDOW_MS: u64 = 60 * 24 * 60 * 60 * 1000;
+
+/// True when `sender_timestamp_ms` falls outside the Replay Window relative
+/// to `now_ms`. Future timestamps are NOT rejected (a fast sender clock
+/// still gets through; the dedup record is clamped forward instead,
+/// ADR-0034 §2).
+pub fn is_expired(sender_timestamp_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(sender_timestamp_ms) > REPLAY_WINDOW_MS
 }
 
 #[derive(Debug, Error)]
@@ -19,6 +36,10 @@ pub enum EnvelopeError {
     InvalidSignature,
     #[error("invalid key length")]
     InvalidKeyLength,
+    /// The sealed payload did not open, parse or verify (ADR-0031: all of
+    /// these are `unreadable(malformed)` on the receive path).
+    #[error("sealed envelope did not open")]
+    OpenFailed,
 }
 
 /// A device's Ed25519 signing keypair, used to sign and verify Envelopes.
@@ -44,48 +65,162 @@ impl SigningKeypair {
     }
 }
 
-/// An Envelope is the wire unit of sync. Wraps an encrypted payload with
-/// routing metadata the Relay can read, plus a signature only recipients verify.
-/// author_pub is NOT in the clear header — it is embedded inside the encrypted
-/// payload so the relay learns no stable sender identity (ADR-0018 / #49).
+/// An Envelope is the wire unit of sync (ADR-0031). The Relay can read only
+/// three things: the End-to-End Version, the recipient public key, and the
+/// sealed payload. Everything a recipient needs — the author's signing key,
+/// the Sequence, the parent hashes, the Sender Timestamp, the message and
+/// the signature — is inside the Addressed Encryption.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Envelope {
-    /// End-to-End Version (ADR-0022). Signed, and readable by the Relay.
-    /// Always `version::END_TO_END_VERSION` on envelopes this build creates;
-    /// 0 on decode means the refused pre-version format.
+    /// End-to-End Version (ADR-0022). Plaintext so a Device can reject an
+    /// unsupported version before decrypting; 0 on decode means the refused
+    /// pre-version format.
     pub version: u32,
-    pub sequence: u64,
-    pub parents: Vec<[u8; 32]>,
     pub recipient_pub: [u8; 32],
-    pub signature: [u8; 64],
+    /// Addressed Encryption output: ephemeral_pub || nonce || ciphertext.
     pub payload: Vec<u8>,
 }
 
+/// The sealed plaintext inside an Envelope's payload (ADR-0031). None of it
+/// is Relay-readable; all of it is signature-covered.
+///
+/// Wire layout (pinned cross-repo by the SYNC-2 test vectors):
+///
+/// ```text
+/// author_pub (32) || sequence (8 LE) || parents_len (2 LE) || parents (32*n)
+///   || sender_timestamp_ms (8 LE, unix) || message (rest) || signature (64)
+/// ```
+///
+/// The signature covers `domain || version || recipient_pub || eph_pub ||
+/// <everything above except the signature>`: the End-to-End Version, the
+/// recipient key, the ephemeral key and every sealed field (ADR-0031). A
+/// blob cannot be re-addressed, re-keyed or have its body swapped without
+/// the signature failing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SealedContent {
+    pub author_pub: [u8; 32],
+    pub sequence: u64,
+    pub parents: Vec<[u8; 32]>,
+    /// Unix milliseconds. A `Sync` message is stamped once at `send()` and
+    /// keeps the stamp through every re-seal; a control message is stamped
+    /// at each seal (ADR-0034 §2).
+    pub sender_timestamp_ms: u64,
+    /// The encoded `Message` (type tag + body).
+    pub message: Vec<u8>,
+    pub signature: [u8; 64],
+}
+
+const SIG_LEN: usize = 64;
+const PREFIX_FIXED_LEN: usize = 32 + 8 + 2 + 8; // author_pub + sequence + parents_len + timestamp
+
 impl Envelope {
-    /// Build and sign a new Envelope.
-    pub fn build(
+    /// Build, sign and seal a new Envelope (ADR-0031).
+    ///
+    /// Two-phase: the ephemeral key is generated first so the signature can
+    /// bind it; then the sealed plaintext (signature included) is encrypted
+    /// with that ephemeral key.
+    pub fn build_sealed(
         sequence: u64,
         parents: Vec<[u8; 32]>,
         recipient_pub: NoisePublicKey,
         author_keypair: &SigningKeypair,
-        payload: Vec<u8>,
+        sender_timestamp_ms: u64,
+        message: &[u8],
     ) -> Self {
-        let sig_bytes = sign(
+        let (eph_secret, eph_pub) = crypto::ephemeral_keypair();
+        let author_pub = author_keypair.public_key_bytes();
+
+        let mut prefix = Vec::with_capacity(PREFIX_FIXED_LEN + parents.len() * 32 + message.len());
+        prefix.extend_from_slice(&author_pub);
+        prefix.extend_from_slice(&sequence.to_le_bytes());
+        prefix.extend_from_slice(&(parents.len() as u16).to_le_bytes());
+        for p in &parents {
+            prefix.extend_from_slice(p);
+        }
+        prefix.extend_from_slice(&sender_timestamp_ms.to_le_bytes());
+        prefix.extend_from_slice(message);
+
+        let sig = sign(
             &author_keypair.0,
             version::END_TO_END_VERSION,
-            sequence,
-            &parents,
             &recipient_pub.0,
-            &payload,
+            &eph_pub,
+            &prefix,
         );
+
+        let mut sealed = prefix;
+        sealed.extend_from_slice(&sig);
+
+        let payload = crypto::encrypt_with_ephemeral(recipient_pub, &eph_secret, &sealed);
         Self {
             version: version::END_TO_END_VERSION,
-            sequence,
-            parents,
             recipient_pub: recipient_pub.0,
-            signature: sig_bytes,
             payload,
         }
+    }
+
+    /// Open the seal: decrypt with the recipient's private key, parse the
+    /// sealed content and verify the author's signature over the full
+    /// signing input. Any failure is `OpenFailed` — the receive path maps
+    /// all of them to `unreadable(malformed)` (ADR-0034 §3).
+    pub fn open_sealed(&self, my_noise_priv: [u8; 32]) -> Result<SealedContent, EnvelopeError> {
+        let sealed =
+            crypto::decrypt(my_noise_priv, &self.payload).map_err(|_| EnvelopeError::OpenFailed)?;
+        if sealed.len() < PREFIX_FIXED_LEN + SIG_LEN {
+            return Err(EnvelopeError::OpenFailed);
+        }
+        let (prefix, sig_bytes) = sealed.split_at(sealed.len() - SIG_LEN);
+        let signature: [u8; SIG_LEN] = sig_bytes
+            .try_into()
+            .expect("invariant: sig_bytes is SIG_LEN by split_at");
+
+        let author_pub: [u8; 32] = prefix[..32]
+            .try_into()
+            .expect("invariant: prefix.len() >= PREFIX_FIXED_LEN checked above");
+        let eph_pub = crypto::ephemeral_pub_of(&self.payload).ok_or(EnvelopeError::OpenFailed)?;
+
+        // Verify BEFORE parsing further: the signature covers the exact
+        // prefix bytes, so a tampered field fails here regardless of how it
+        // would have parsed. verify_strict: the author key is
+        // attacker-controlled bytes, so small-order keys (e.g. all-zero,
+        // for which a zero signature satisfies the verification equation)
+        // and non-canonical encodings are rejected outright.
+        let vk =
+            VerifyingKey::from_bytes(&author_pub).map_err(|_| EnvelopeError::InvalidKeyLength)?;
+        let msg = signing_message(self.version, &self.recipient_pub, &eph_pub, prefix);
+        vk.verify_strict(&msg, &ed25519_dalek::Signature::from_bytes(&signature))
+            .map_err(|_| EnvelopeError::OpenFailed)?;
+
+        let sequence = u64::from_le_bytes(
+            prefix[32..40]
+                .try_into()
+                .expect("invariant: prefix.len() >= 40"),
+        );
+        let parents_len = u16::from_le_bytes(
+            prefix[40..42]
+                .try_into()
+                .expect("invariant: prefix.len() >= 42"),
+        ) as usize;
+        let parents_end = 42 + parents_len * 32;
+        if prefix.len() < parents_end + 8 {
+            return Err(EnvelopeError::OpenFailed);
+        }
+        let parents = prefix[42..parents_end].as_chunks::<32>().0.to_vec();
+        let sender_timestamp_ms = u64::from_le_bytes(
+            prefix[parents_end..parents_end + 8]
+                .try_into()
+                .expect("invariant: bounds checked above"),
+        );
+        let message = prefix[parents_end + 8..].to_vec();
+
+        Ok(SealedContent {
+            author_pub,
+            sequence,
+            parents,
+            sender_timestamp_ms,
+            message,
+            signature,
+        })
     }
 
     /// Compute SHA-256 of this Envelope's encoded bytes — used as a parent hash.
@@ -93,51 +228,11 @@ impl Envelope {
         Sha256::digest(self.encode()).into()
     }
 
-    /// Build a new Envelope chained to `parent`.
-    /// Sets `sequence = parent.sequence + 1` and `parents = [parent.hash()]`.
-    /// For the standard v0 linear chain; use `Envelope::build` for DAG merges
-    /// with multiple parents or root envelopes with sequence 0.
-    pub fn build_chained(
-        parent: &Envelope,
-        recipient_pub: NoisePublicKey,
-        author_keypair: &SigningKeypair,
-        payload: Vec<u8>,
-    ) -> Self {
-        Self::build(
-            parent.sequence + 1,
-            vec![parent.hash()],
-            recipient_pub,
-            author_keypair,
-            payload,
-        )
-    }
-
-    /// Verify the author signature using the author_pub extracted from the
-    /// decrypted payload. Called by recipients after decryption — never by the Relay.
-    /// Signing message: domain || version || sequence || parents || recipient_pub || ciphertext.
-    pub fn verify_with(&self, author_pub: [u8; 32]) -> Result<(), EnvelopeError> {
-        let vk =
-            VerifyingKey::from_bytes(&author_pub).map_err(|_| EnvelopeError::InvalidKeyLength)?;
-        let msg = signing_message(
-            self.version,
-            self.sequence,
-            &self.parents,
-            &self.recipient_pub,
-            &self.payload,
-        );
-        let sig = ed25519_dalek::Signature::from_bytes(&self.signature);
-        vk.verify(&msg, &sig)
-            .map_err(|_| EnvelopeError::InvalidSignature)
-    }
-
     /// Encode to Protobuf bytes.
     pub fn encode(&self) -> Vec<u8> {
         let proto = proto::Envelope {
             version: self.version,
-            sequence: self.sequence,
-            parents: self.parents.iter().map(|p| p.to_vec()).collect(),
             recipient_pub: self.recipient_pub.to_vec(),
-            signature: self.signature.to_vec(),
             payload: self.payload.clone(),
         };
         proto.encode_to_vec()
@@ -152,308 +247,299 @@ impl Envelope {
             .recipient_pub
             .try_into()
             .map_err(|_| EnvelopeError::DecodeFailed("recipient_pub must be 32 bytes".into()))?;
-        let signature = proto
-            .signature
-            .try_into()
-            .map_err(|_| EnvelopeError::DecodeFailed("signature must be 64 bytes".into()))?;
-        let parents = proto
-            .parents
-            .iter()
-            .map(|p| {
-                p.as_slice()
-                    .try_into()
-                    .map_err(|_| EnvelopeError::DecodeFailed("parent hash must be 32 bytes".into()))
-            })
-            .collect::<Result<Vec<[u8; 32]>, _>>()?;
 
         Ok(Self {
             // proto3 defaults a missing field to 0 — the reserved version of
             // the refused pre-version format (ADR-0022).
             version: proto.version,
-            sequence: proto.sequence,
-            parents,
             recipient_pub,
-            signature,
             payload: proto.payload,
         })
     }
 }
 
-/// The canonical message bytes that are signed/verified.
-/// domain || version (4 LE) || sequence (8 LE) || each parent (32) || recipient_pub (32) || ciphertext
-/// The domain separator carries the End-to-End Version (ADR-0022), and the
-/// version field is itself signed, so neither can be altered in transit.
+/// The canonical signing input (ADR-0031):
+/// `domain || version (4 LE) || recipient_pub (32) || eph_pub (32) || sealed prefix`.
+/// The domain separator carries the End-to-End Version (ADR-0022) and the
+/// version field is itself signed, so neither can be altered in transit;
+/// the recipient and ephemeral keys are bound, so the blob cannot be
+/// re-addressed or re-keyed; every sealed field is covered.
 fn signing_message(
     e2e_version: u32,
-    sequence: u64,
-    parents: &[[u8; 32]],
     recipient_pub: &[u8; 32],
-    payload: &[u8],
+    eph_pub: &[u8; 32],
+    sealed_prefix: &[u8],
 ) -> Vec<u8> {
     let mut msg = version::envelope_signing_domain();
     msg.extend_from_slice(&e2e_version.to_le_bytes());
-    msg.extend_from_slice(&sequence.to_le_bytes());
-    for p in parents {
-        msg.extend_from_slice(p);
-    }
     msg.extend_from_slice(recipient_pub);
-    msg.extend_from_slice(payload);
+    msg.extend_from_slice(eph_pub);
+    msg.extend_from_slice(sealed_prefix);
     msg
 }
 
 fn sign(
     key: &SigningKey,
     e2e_version: u32,
-    sequence: u64,
-    parents: &[[u8; 32]],
     recipient_pub: &[u8; 32],
-    payload: &[u8],
+    eph_pub: &[u8; 32],
+    sealed_prefix: &[u8],
 ) -> [u8; 64] {
-    let msg = signing_message(e2e_version, sequence, parents, recipient_pub, payload);
+    let msg = signing_message(e2e_version, recipient_pub, eph_pub, sealed_prefix);
     key.sign(&msg).to_bytes()
-}
-
-/// Compute SHA-256 of an Envelope's encoded bytes — used as a parent hash.
-///
-/// # Deprecated
-/// Use `envelope.hash()` instead.
-#[deprecated(since = "0.1.0", note = "Use Envelope::hash() instead")]
-pub fn envelope_hash(encoded: &[u8]) -> [u8; 32] {
-    Sha256::digest(encoded).into()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::keys::NoisePublicKey;
+    use x25519_dalek::{PublicKey, StaticSecret};
 
-    fn make_envelope() -> (Envelope, SigningKeypair) {
-        let author = SigningKeypair::generate();
-        // Use an arbitrary 32-byte value as a fake noise public key for tests
-        let recipient_pub = NoisePublicKey(SigningKeypair::generate().public_key_bytes());
-        let payload = b"hello".to_vec();
-        let env = Envelope::build(1, vec![], recipient_pub, &author, payload);
-        (env, author)
+    fn noise_keypair() -> ([u8; 32], NoisePublicKey) {
+        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let public = PublicKey::from(&secret);
+        (*secret.as_bytes(), NoisePublicKey(*public.as_bytes()))
     }
 
-    /// Tracer bullet: encode → decode produces an identical Envelope.
+    fn make_envelope() -> (Envelope, SigningKeypair, [u8; 32]) {
+        let author = SigningKeypair::generate();
+        let (recv_priv, recv_pub) = noise_keypair();
+        let env = Envelope::build_sealed(1, vec![], recv_pub, &author, 1_700_000_000_000, b"hello");
+        (env, author, recv_priv)
+    }
+
+    /// Round-trip: seal → open recovers every field.
+    #[test]
+    fn sealed_envelope_round_trips() {
+        let author = SigningKeypair::generate();
+        let (recv_priv, recv_pub) = noise_keypair();
+        let parents = vec![[0xAB; 32]];
+        let env = Envelope::build_sealed(
+            7,
+            parents.clone(),
+            recv_pub,
+            &author,
+            1_700_000_000_123,
+            b"payload",
+        );
+        let sc = env.open_sealed(recv_priv).expect("opens");
+        assert_eq!(sc.author_pub, author.public_key_bytes());
+        assert_eq!(sc.sequence, 7);
+        assert_eq!(sc.parents, parents);
+        assert_eq!(sc.sender_timestamp_ms, 1_700_000_000_123);
+        assert_eq!(sc.message, b"payload");
+    }
+
+    /// Encode → decode produces an identical Envelope.
     #[test]
     fn envelope_round_trips() {
-        let (env, _) = make_envelope();
-        let encoded = env.encode();
-        let decoded = Envelope::decode(&encoded).expect("decode should succeed");
+        let (env, _, _) = make_envelope();
+        let decoded = Envelope::decode(&env.encode()).expect("decode should succeed");
         assert_eq!(decoded, env);
     }
-
-    /// A freshly built Envelope has a valid signature.
-    #[test]
-    fn built_envelope_verifies() {
-        let (env, author) = make_envelope();
-        env.verify_with(author.public_key_bytes())
-            .expect("signature should be valid");
-    }
-
-    /// Tampering with any signed field (e.g. sequence) invalidates the signature.
-    #[test]
-    fn tampered_sequence_fails_verification() {
-        let (mut env, author) = make_envelope();
-        env.sequence += 1;
-        assert!(
-            env.verify_with(author.public_key_bytes()).is_err(),
-            "tampered envelope should fail verification"
-        );
-    }
-
-    /// verify_with a wrong key fails — the signature was made by a different key.
-    #[test]
-    fn wrong_author_key_fails_verification() {
-        let (env, _) = make_envelope();
-        let impostor = SigningKeypair::generate();
-        assert!(
-            env.verify_with(impostor.public_key_bytes()).is_err(),
-            "wrong author key should fail verification"
-        );
-    }
-
-    /// Attribution forgery (#49): device B signs an envelope whose ciphertext encodes
-    /// author_pub = A. Recipient decrypts → gets author_pub = A → verifies B's sig
-    /// using A's key → FAILS. The relay cannot fake sender identity.
-    #[test]
-    fn attribution_forgery_is_rejected() {
-        use crate::crypto;
-        use x25519_dalek::{PublicKey, StaticSecret};
-
-        // Device A — the claimed sender
-        let author_a = SigningKeypair::generate();
-
-        // Device B — the actual signer (the forger)
-        let author_b = SigningKeypair::generate();
-
-        // Recipient noise keypair
-        let recv_secret = StaticSecret::random_from_rng(rand::thread_rng());
-        let recv_pub = NoisePublicKey(*PublicKey::from(&recv_secret).as_bytes());
-        let recv_priv = *recv_secret.as_bytes();
-
-        // B encrypts a payload that claims author_pub = A
-        let plaintext = b"forged message";
-        let payload = crypto::encrypt(recv_pub, author_a.public_key_bytes(), plaintext);
-
-        // B builds and signs the envelope over the ciphertext
-        let env = Envelope::build(1, vec![], recv_pub, &author_b, payload);
-
-        // Recipient decrypts → extracts author_pub = A
-        let (extracted_author, _msg) =
-            crypto::decrypt(recv_priv, &env.payload).expect("decryption should succeed");
-        assert_eq!(
-            extracted_author,
-            author_a.public_key_bytes(),
-            "extracted author_pub should be A's key"
-        );
-
-        // Verify using A's key — must FAIL because B signed, not A
-        assert!(
-            env.verify_with(extracted_author).is_err(),
-            "B's signature must not verify under A's key"
-        );
-    }
-
-    /// Decoding garbage bytes returns an error rather than panicking.
-    #[test]
-    fn garbage_bytes_return_error() {
-        let result = Envelope::decode(b"not protobuf");
-        assert!(result.is_err(), "garbage input should return an error");
-    }
-
-    /// Decoding empty bytes returns an error.
-    #[test]
-    fn empty_bytes_return_error() {
-        let result = Envelope::decode(b"");
-        assert!(result.is_err(), "empty input should return an error");
-    }
-
-    /// Tracer bullet for #11: build_chained sets sequence and parent hash correctly.
-    #[test]
-    fn build_chained_links_to_parent() {
-        let author = SigningKeypair::generate();
-        let recipient_pub = NoisePublicKey(SigningKeypair::generate().public_key_bytes());
-
-        let root = Envelope::build(0, vec![], recipient_pub, &author, b"root".to_vec());
-        let child = Envelope::build_chained(&root, recipient_pub, &author, b"child".to_vec());
-
-        assert_eq!(child.sequence, 1, "sequence should be parent.sequence + 1");
-        assert_eq!(child.parents.len(), 1, "child should have one parent");
-        assert_eq!(
-            child.parents[0],
-            root.hash(),
-            "parent hash should match root.hash()"
-        );
-        assert!(
-            child.verify_with(author.public_key_bytes()).is_ok(),
-            "child should have a valid signature"
-        );
-    }
-
-    /// A chain of 3 envelopes built with build_chained has correct sequence numbers.
-    #[test]
-    fn build_chained_three_deep_has_correct_sequences() {
-        let author = SigningKeypair::generate();
-        let recipient_pub = NoisePublicKey(SigningKeypair::generate().public_key_bytes());
-
-        let e0 = Envelope::build(0, vec![], recipient_pub, &author, b"0".to_vec());
-        let e1 = Envelope::build_chained(&e0, recipient_pub, &author, b"1".to_vec());
-        let e2 = Envelope::build_chained(&e1, recipient_pub, &author, b"2".to_vec());
-
-        assert_eq!(e0.sequence, 0);
-        assert_eq!(e1.sequence, 1);
-        assert_eq!(e2.sequence, 2);
-        assert_eq!(e2.parents[0], e1.hash());
-        assert!(e0.verify_with(author.public_key_bytes()).is_ok());
-        assert!(e1.verify_with(author.public_key_bytes()).is_ok());
-        assert!(e2.verify_with(author.public_key_bytes()).is_ok());
-    }
-    #[test]
-    fn parents_accepts_zero_one_and_many() {
-        let author = SigningKeypair::generate();
-        let recipient_pub = NoisePublicKey(SigningKeypair::generate().public_key_bytes());
-
-        // Root: no parents
-        let root = Envelope::build(0, vec![], recipient_pub, &author, vec![]);
-        assert!(root.verify_with(author.public_key_bytes()).is_ok());
-
-        // v0 standard: one parent (use build_chained)
-        let child = Envelope::build_chained(&root, recipient_pub, &author, vec![]);
-        assert!(child.verify_with(author.public_key_bytes()).is_ok());
-
-        // v1 DAG: two parents (merge point) — use build directly
-        let other_hash = child.hash();
-        let merge = Envelope::build(
-            2,
-            vec![root.hash(), other_hash],
-            recipient_pub,
-            &author,
-            vec![],
-        );
-        assert!(merge.verify_with(author.public_key_bytes()).is_ok());
-
-        // All round-trip through encode/decode
-        for env in [&root, &child, &merge] {
-            let decoded = Envelope::decode(&env.encode()).expect("should decode");
-            assert_eq!(&decoded, env);
-        }
-    }
-
-    /// Tampering with the payload invalidates the signature — the relay is zero-trust.
-    #[test]
-    fn tampered_payload_fails_verification() {
-        let (mut env, author) = make_envelope();
-        env.payload = b"swapped payload".to_vec();
-        assert!(
-            env.verify_with(author.public_key_bytes()).is_err(),
-            "tampered payload should fail verification"
-        );
-    }
-
-    // ── SYNC-1: End-to-End Version binding (ADR-0022) ─────────────────────────
 
     /// Every envelope this build creates carries the End-to-End Version.
     #[test]
     fn built_envelope_carries_the_end_to_end_version() {
-        let (env, _) = make_envelope();
+        let (env, _, _) = make_envelope();
         assert_eq!(env.version, crate::version::END_TO_END_VERSION);
-        // ... through encode/decode too.
         let decoded = Envelope::decode(&env.encode()).expect("decode");
         assert_eq!(decoded.version, crate::version::END_TO_END_VERSION);
     }
 
-    /// The version field is signed: tampering with it invalidates the
-    /// signature, so it cannot be altered in transit.
+    /// Re-addressing: swapping the outer recipient_pub fails the signature
+    /// AND the key derivation — the blob opens for nobody.
     #[test]
-    fn tampered_version_fails_verification() {
-        let (mut env, author) = make_envelope();
+    fn readdressed_envelope_fails() {
+        let author = SigningKeypair::generate();
+        let (recv_priv, recv_pub) = noise_keypair();
+        let (other_priv, other_pub) = noise_keypair();
+        let env = Envelope::build_sealed(1, vec![], recv_pub, &author, 1, b"addressed");
+
+        let mut tampered = env.clone();
+        tampered.recipient_pub = other_pub.0;
+        // The swapped-in "recipient" cannot open it (the payload was sealed
+        // to the real recipient's key — wrong DH).
+        assert!(tampered.open_sealed(other_priv).is_err());
+        // The REAL recipient detects the tamper: the payload still opens,
+        // but the signature input names the tampered recipient_pub, so
+        // verification fails.
+        assert!(
+            tampered.open_sealed(recv_priv).is_err(),
+            "re-addressing must be detected by the real recipient"
+        );
+        // Sanity: the untampered envelope opens.
+        assert!(env.open_sealed(recv_priv).is_ok());
+    }
+
+    /// Ephemeral-swap: replacing the ephemeral key bytes fails.
+    #[test]
+    fn ephemeral_swapped_envelope_fails() {
+        let author = SigningKeypair::generate();
+        let (recv_priv, recv_pub) = noise_keypair();
+        let mut env = Envelope::build_sealed(1, vec![], recv_pub, &author, 1, b"body");
+        let other_eph: [u8; 32] = {
+            let s = StaticSecret::random_from_rng(rand::thread_rng());
+            *PublicKey::from(&s).as_bytes()
+        };
+        env.payload[..32].copy_from_slice(&other_eph);
+        assert!(env.open_sealed(recv_priv).is_err());
+    }
+
+    /// Body-swap: the signature covers the sealed prefix, so a ciphertext
+    /// bit-flip fails the AEAD, and any prefix tampering fails verification.
+    #[test]
+    fn tampered_payload_fails() {
+        let (mut env, _, recv_priv) = make_envelope();
+        let last = env.payload.len() - 1;
+        env.payload[last] ^= 0x01;
+        assert!(env.open_sealed(recv_priv).is_err());
+    }
+
+    /// The version is signed: a relabelled version fails verification.
+    #[test]
+    fn tampered_version_fails() {
+        let (mut env, _, recv_priv) = make_envelope();
         env.version += 1;
         assert!(
-            env.verify_with(author.public_key_bytes()).is_err(),
+            env.open_sealed(recv_priv).is_err(),
             "a relabelled version must fail verification"
         );
+    }
+
+    /// Attribution forgery (#49, sealed form): device B seals content whose
+    /// author_pub field claims A, signed by B. open_sealed verifies the
+    /// signature under the CLAIMED author key — B's signature over a prefix
+    /// naming A does not verify under A's key, so the forgery is rejected.
+    #[test]
+    fn attribution_forgery_is_rejected() {
+        use ed25519_dalek::SigningKey;
+        let author_a = SigningKeypair::generate();
+        // Build B from raw bytes so the test can sign with B's key directly.
+        let b_bytes: [u8; 32] = rand::random();
+        let b_signing = SigningKey::from_bytes(&b_bytes);
+        let (recv_priv, recv_pub) = noise_keypair();
+
+        // B hand-builds a sealed blob whose prefix names A as the author.
+        let (eph_secret, eph_pub) = crypto::ephemeral_keypair();
+        let mut prefix = Vec::new();
+        prefix.extend_from_slice(&author_a.public_key_bytes()); // claims A
+        prefix.extend_from_slice(&1u64.to_le_bytes());
+        prefix.extend_from_slice(&0u16.to_le_bytes());
+        prefix.extend_from_slice(&1u64.to_le_bytes());
+        prefix.extend_from_slice(b"forged");
+        let sig = sign(
+            &b_signing,
+            version::END_TO_END_VERSION,
+            &recv_pub.0,
+            &eph_pub,
+            &prefix,
+        );
+        let mut sealed = prefix;
+        sealed.extend_from_slice(&sig);
+        let payload = crypto::encrypt_with_ephemeral(recv_pub, &eph_secret, &sealed);
+        let env = Envelope {
+            version: version::END_TO_END_VERSION,
+            recipient_pub: recv_pub.0,
+            payload,
+        };
+
+        assert!(
+            env.open_sealed(recv_priv).is_err(),
+            "B's signature must not verify under A's claimed key"
+        );
+    }
+
+    /// A zero author key with a zero signature satisfies the naïve
+    /// Ed25519 verification equation — the weak-key forgery. verify_strict
+    /// rejects the small-order key, so the blob does not open.
+    #[test]
+    fn weak_author_key_forgery_fails() {
+        let (recv_priv, recv_pub) = noise_keypair();
+        let mut sealed = Vec::new();
+        sealed.extend_from_slice(&[0u8; 32]); // author_pub: the zero key
+        sealed.extend_from_slice(&1u64.to_le_bytes());
+        sealed.extend_from_slice(&0u16.to_le_bytes());
+        sealed.extend_from_slice(&1_700_000_000_000u64.to_le_bytes());
+        sealed.extend_from_slice(b"forged");
+        sealed.extend_from_slice(&[0u8; 64]); // the zero signature
+        let env = Envelope {
+            version: version::END_TO_END_VERSION,
+            recipient_pub: recv_pub.0,
+            payload: crypto::encrypt(recv_pub, &sealed),
+        };
+        assert!(
+            env.open_sealed(recv_priv).is_err(),
+            "a small-order author key must be rejected (verify_strict)"
+        );
+    }
+
+    /// Garbage sealed content (right shape, no valid signature) fails.
+    #[test]
+    fn garbage_sealed_content_fails() {
+        let (recv_priv, recv_pub) = noise_keypair();
+        let payload = crypto::encrypt(recv_pub, &[0u8; 200]);
+        let env = Envelope {
+            version: version::END_TO_END_VERSION,
+            recipient_pub: recv_pub.0,
+            payload,
+        };
+        assert!(env.open_sealed(recv_priv).is_err());
+    }
+
+    /// Decoding garbage bytes returns an error rather than panicking. An
+    /// empty/fieldless proto fails the recipient_pub length check — and a
+    /// versionless (pre-version) envelope decodes as version 0, the
+    /// reserved refusal (pinned by pre_version_format_decodes_as_version_zero).
+    #[test]
+    fn garbage_bytes_return_error() {
+        assert!(Envelope::decode(b"not protobuf").is_err());
+        assert!(Envelope::decode(b"").is_err());
     }
 
     /// A pre-version-format envelope (no version field on the wire) decodes
     /// with version 0 — the reserved version the receiver refuses.
     #[test]
     fn pre_version_format_decodes_as_version_zero() {
-        // Hand-encode the old shape: same fields, version field absent.
-        // prost omits zero-valued scalar fields, so any envelope whose proto
-        // encoding lacks field 7 decodes with version 0.
-        let (env, _) = make_envelope();
+        let (env, _, _) = make_envelope();
         let mut raw = Vec::new();
-        // sequence (field 1) omitted — defaults to 0, like the old format.
         prost::encoding::bytes::encode(3, &env.recipient_pub.to_vec(), &mut raw);
-        prost::encoding::bytes::encode(5, &env.signature.to_vec(), &mut raw);
         prost::encoding::bytes::encode(6, &env.payload, &mut raw);
-        let decoded = Envelope::decode(&raw).expect("old-format bytes still decode");
-        assert_eq!(
-            decoded.version, 0,
-            "absent version field decodes as 0 (reserved)"
+        let decoded = Envelope::decode(&raw).expect("old-shape bytes still decode");
+        assert_eq!(decoded.version, 0, "absent version field decodes as 0");
+    }
+
+    /// Two sends from one device to the SAME recipient share only the
+    /// version and the recipient key; to DIFFERENT recipients, only the
+    /// version (ADR-0031 Consequences).
+    #[test]
+    fn two_sends_share_only_version_and_recipient() {
+        let author = SigningKeypair::generate();
+        let (_pa, pub_a) = noise_keypair();
+        let (_pb, pub_b) = noise_keypair();
+        let e1 = Envelope::build_sealed(9, vec![], pub_a, &author, 1, b"x");
+        let e2 = Envelope::build_sealed(9, vec![], pub_a, &author, 1, b"x");
+        let e3 = Envelope::build_sealed(9, vec![], pub_b, &author, 1, b"x");
+
+        // Same recipient: version + recipient match, payload differs.
+        assert_eq!(e1.version, e2.version);
+        assert_eq!(e1.recipient_pub, e2.recipient_pub);
+        assert_ne!(e1.payload, e2.payload);
+        // Different recipients: only the version matches.
+        assert_eq!(e1.version, e3.version);
+        assert_ne!(e1.recipient_pub, e3.recipient_pub);
+        assert_ne!(e1.payload, e3.payload);
+    }
+
+    /// is_expired boundary: exactly 60 days is inside, 60 days + 1 ms is out.
+    #[test]
+    fn replay_window_boundary() {
+        let now = 1_800_000_000_000u64;
+        assert!(!is_expired(now - REPLAY_WINDOW_MS, now));
+        assert!(is_expired(now - REPLAY_WINDOW_MS - 1, now));
+        assert!(
+            !is_expired(now + REPLAY_WINDOW_MS, now),
+            "future is accepted"
         );
     }
 }

@@ -88,9 +88,14 @@ impl TwoConnRelay {
         sender: &SigningKeypair,
         seq: u64,
     ) {
-        let plaintext = msg.encode();
-        let payload = crate::crypto::encrypt(recipient, sender.public_key_bytes(), &plaintext);
-        let env = Envelope::build(seq, vec![], recipient, sender, payload);
+        let env = Envelope::build_sealed(
+            seq,
+            vec![],
+            recipient,
+            sender,
+            crate::operation_log::now_secs() * 1000,
+            &msg.encode(),
+        );
         self.deliver_tx
             .send((blob_id, env.encode()))
             .expect("relay alive");

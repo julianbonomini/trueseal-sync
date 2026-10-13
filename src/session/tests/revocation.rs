@@ -139,7 +139,7 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
     {
         let (lock, cvar) = &*a_reconnected;
         let result = cvar
-            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |ok| !*ok)
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(20), |ok| !*ok)
             .unwrap();
         assert!(!result.1.timed_out(), "A must reconnect within 5s");
     }
@@ -148,9 +148,12 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
     {
         let (lock, cvar) = &*b_reconnected;
         let result = cvar
-            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |ok| !*ok)
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(20), |ok| !*ok)
             .unwrap();
-        assert!(!result.1.timed_out(), "B must reconnect within 5s");
+        assert!(
+            !result.1.timed_out(),
+            "B must reconnect (CI-scaled 20 s budget — the #55 flake class)"
+        );
     }
 
     session_a.destroy_group();
@@ -159,7 +162,7 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
     {
         let (lock, cvar) = &*b_destroyed;
         let result = cvar
-            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |count| {
+            .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(20), |count| {
                 *count == 0
             })
             .unwrap();

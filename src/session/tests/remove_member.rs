@@ -162,6 +162,11 @@ fn remove_member_issues_new_manifest_excluding_target() {
     // A removes C.
     session_a.remove_member(c_signing).expect("remove_member");
 
+    // CI-scaled budgets (B9 precedent, 169f422): this test drives three
+    // sessions through one in-memory relay; under full-suite parallel load
+    // a 5 s wait is tight and the test flaked on main (~1 in 6 runs). The
+    // waits react to the actual event, so a longer budget costs nothing
+    // when the machine is fast.
     wait_for(
         || {
             session_b
@@ -172,7 +177,7 @@ fn remove_member_issues_new_manifest_excluding_target() {
                 .map(|m| m.version)
                 == Some(2)
         },
-        Duration::from_secs(5),
+        Duration::from_secs(15),
     );
     // C is DELIBERATELY removed (ADR-0027): the removal manifest is
     // parent-linked to the v1 C held — so the library wipes C's group
@@ -180,11 +185,11 @@ fn remove_member_issues_new_manifest_excluding_target() {
     let c_signing_before = session_c.signing_pub();
     wait_for(
         || session_c.manifest.lock().unwrap().is_none(),
-        Duration::from_secs(5),
+        Duration::from_secs(15),
     );
     wait_for(
         || session_c.signing_pub() != c_signing_before,
-        Duration::from_secs(5),
+        Duration::from_secs(15),
     );
 
     // A's manifest: 2 members.

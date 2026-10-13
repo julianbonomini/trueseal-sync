@@ -43,17 +43,13 @@ fn deliver_body(
         body: body.to_vec(),
     }
     .encode();
-    let payload = crate::crypto::encrypt(
-        device.public_key(),
-        sender.signing_public_key().0,
-        &plaintext,
-    );
-    let env = Envelope::build(
+    let env = Envelope::build_sealed(
         1,
         vec![],
         device.public_key(),
         &sender.signing_keypair(),
-        payload,
+        crate::operation_log::now_secs() * 1000,
+        &plaintext,
     );
     let mut framed = blob_id.to_be_bytes().to_vec();
     framed.extend_from_slice(&env.encode());
@@ -300,17 +296,13 @@ fn newer_manifest_delivered_during_restart_window_is_kept() {
         manifest: v2.clone(),
     }
     .encode();
-    let payload = crate::crypto::encrypt(
-        device_a.public_key(),
-        device_a.signing_public_key().0,
-        &plaintext,
-    );
-    let env = Envelope::build(
+    let env = Envelope::build_sealed(
         1,
         vec![],
         device_a.public_key(),
         &device_a.signing_keypair(),
-        payload,
+        crate::operation_log::now_secs() * 1000,
+        &plaintext,
     );
     let mut body = 1u64.to_be_bytes().to_vec();
     body.extend_from_slice(&env.encode());

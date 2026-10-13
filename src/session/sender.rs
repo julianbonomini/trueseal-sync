@@ -300,12 +300,25 @@ fn sender_loop<T: Read + Write + Send + 'static>(
                         }
                     },
                 };
+                // The Sender Timestamp rule (ADR-0034 §2): a `Sync` entry is
+                // stamped ONCE at send() — its outbox `created_at` — and
+                // keeps that stamp through every re-seal, so every copy of
+                // the message leaves the Replay Window at the same moment
+                // and a replay can never outlive the dedup record. A
+                // control entry is stamped at EACH seal: it never expires
+                // from the outbox, so a long-offline Leave or Revoke must
+                // be fresh when it finally lands.
+                let sender_timestamp_ms = match entry.kind {
+                    OutboxKind::Sync => entry.created_at.saturating_mul(1000),
+                    OutboxKind::Control => crate::operation_log::now_secs().saturating_mul(1000),
+                };
                 let result = build_push_blob(
                     &msg,
                     NoisePublicKey(entry.object_id),
                     entry.sequence,
                     vec![],
                     &signing,
+                    sender_timestamp_ms,
                 )
                 .and_then(|framed| {
                     (push_factory)()

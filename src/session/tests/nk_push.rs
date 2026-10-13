@@ -96,7 +96,7 @@ fn on_message_fires_via_xx_receive_after_nk_push() {
         trueseal_noise::keypair::Keypair::new(device_a.noise.private(), device_a.noise.public_key),
     )
     .expect("A XX connect");
-    client_a.subscribe(move |msg, _, _seq| {
+    client_a.subscribe(move |msg, _, _seq, _ts| {
         rx.lock().unwrap().push(msg);
     });
 
@@ -110,6 +110,7 @@ fn on_message_fires_via_xx_receive_after_nk_push() {
         1,
         vec![],
         &device_b.signing_keypair(),
+        crate::operation_log::now_secs() * 1000,
     )
     .expect("build_push_blob should succeed");
 
@@ -215,6 +216,7 @@ fn push_body_starts_with_recipient_pub() {
         0,
         vec![],
         &signing,
+        crate::operation_log::now_secs() * 1000,
     )
     .expect("build_push_blob should succeed");
 
@@ -332,6 +334,7 @@ fn run_loop_silently_drops_ack_on_receive_session() {
             1,
             vec![],
             &device_b.signing_keypair(),
+            crate::operation_log::now_secs() * 1000,
         )
         .expect("build_push_blob should succeed");
         // Deliver = [blob_id: 8 bytes][proto only] (ADR-0020)
@@ -346,7 +349,7 @@ fn run_loop_silently_drops_ack_on_receive_session() {
         trueseal_noise::keypair::Keypair::new(device_a_noise_priv, device_a_noise_pub),
     )
     .expect("connect");
-    client.subscribe(move |msg, _, _seq| {
+    client.subscribe(move |msg, _, _seq, _ts| {
         rx.lock().unwrap().push(msg);
     });
 
@@ -451,6 +454,7 @@ fn subscribe_callback_receives_sequence() {
             42,
             vec![],
             &device_b.signing_keypair(),
+            crate::operation_log::now_secs() * 1000,
         )
         .expect("build_push_blob");
         // Deliver body: [blob_id: 8 bytes][envelope_proto: blob[5+32..]]
@@ -470,7 +474,7 @@ fn subscribe_callback_receives_sequence() {
     )
     .expect("connect");
 
-    client.subscribe(move |_msg, _author_pub, seq| {
+    client.subscribe(move |_msg, _author_pub, seq, _ts| {
         *seq_clone.lock().unwrap() = Some(seq);
     });
 

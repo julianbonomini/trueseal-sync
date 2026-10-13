@@ -81,7 +81,6 @@ fn two_sessions_can_exchange_sync_message() {
 
 #[test]
 fn push_sync_increments_sequence() {
-    use crate::keys::{NoisePublicKey, SigningPublicKey};
     use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
 
     let relay_kp = make_relay_kp();
@@ -122,9 +121,11 @@ fn push_sync_increments_sequence() {
     let noise = device.public_key();
     let signing = device.signing_public_key();
     let sk = SigningKey::from_bytes(&device.signing.to_bytes());
-    // One peer so push_sync sends one message.
-    let peer_noise = NoisePublicKey([0xCCu8; 32]);
-    let peer_signing = SigningPublicKey([0xDDu8; 32]);
+    // One peer so push_sync sends one message. A real keypair: the sequence
+    // is sealed (ADR-0031), so the test opens the envelope as the peer.
+    let peer = DeviceKeypair::generate();
+    let peer_noise = peer.public_key();
+    let peer_signing = peer.signing_public_key();
     let manifest = GroupManifest::new(
         new_group_id(),
         1,
@@ -157,8 +158,13 @@ fn push_sync_increments_sequence() {
 
     let envs = received_envs.lock().unwrap();
     assert_eq!(envs.len(), 2);
-    assert_eq!(envs[0].sequence, 0);
-    assert_eq!(envs[1].sequence, 1);
+    let seq = |e: &Envelope| {
+        e.open_sealed(peer.noise.private())
+            .expect("sealed to the peer")
+            .sequence
+    };
+    assert_eq!(seq(&envs[0]), 0);
+    assert_eq!(seq(&envs[1]), 1);
 }
 
 /// When A sends a Sync message to B, B's on_message receives A's signing public key.
@@ -347,9 +353,9 @@ fn push_does_not_expose_stable_noise_key_to_relay() {
     use trueseal_noise::keypair::Keypair;
 
     use crate::device::DeviceKeypair;
-    use crate::keys::{NoisePublicKey, SigningPublicKey};
     use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
 
+    use crate::keys::{NoisePublicKey, SigningPublicKey};
     use crate::operation_log::MemLog;
     use crate::relay::{frame, MsgType};
     use crate::session::test_helpers::*;
