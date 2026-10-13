@@ -737,7 +737,11 @@ fn run_loop<T: Severable>(
     // surfacing (B23c, the structural shape of the D1 finding). The
     // guard's later store is idempotent, so the double signal is
     // harmless, and the parked loop still drains its queue in order when
-    // the callback returns. A heartbeat SEND failure is the same verdict:
+    // the callback returns. That drain can overlap the new session's
+    // redelivery — the delivery contract's third duplicate case, with
+    // best-effort (not atomic) dedup in the overlap, accepted because the
+    // precondition is pathological and the alternative is the wedge
+    // (ADR-0026, B23c). A heartbeat SEND failure is the same verdict:
     // a healthy link does not refuse 19 bytes (a WouldBlock under relay
     // backpressure is a wedged link) — flip + sever, costing at most one
     // spurious reconnect, the false-positive price the liveness stamp

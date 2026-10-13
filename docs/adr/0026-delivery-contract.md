@@ -16,6 +16,8 @@ The promise to app developers is:
 
 Two documented exceptions apply. Blobs in a newer End-to-End Version are held unacked on the Relay (ADR-0022) and are handled out of order after an upgrade. A message the sender gave up on leaves a gap.
 
+A third duplicate case exists beyond a crash: a handler parked past the liveness window (75 s, relay ADR-0012). The dead-link watchdog abandons the session — it flips the connection state and severs, the reconnect loop redials, and the abandoned loop's queued drain can overlap the new session's redelivery; dedup suppression in that overlap is best-effort, not atomic (the check and the record happen on two threads). Common interleavings are still suppressed because the Relay redelivers in inbox order, so per-sender order is preserved in practice. The precondition — an app handler parked at least the liveness window — is already pathological per step 4 below, and the alternative, blocking reconnect behind a parked handler, is the permanent silent wedge this design rejects (B23c). Recording the dedup entry before the handler instead would make the overlap atomic, but it would break crash-recovery at-least-once (a crash mid-handler would never be redelivered) — a trade deliberately rejected at the SYNC-15 gate.
+
 We need this because the old contract kept the at-least-once promise only as far as the library. DeliverAck went out before decryption and before the app callback. A crash in the handler lost the message, and so did a Deliver that arrived before `subscribe()`. Failed pushes retried only on reconnect, so they could be overtaken, and a permanently rejected push retried forever. Control-plane messages were fire-and-forget. Apps also had to build durable dedup themselves to be correct, which is the kind of primitive that is easy to get wrong.
 
 ## Guiding rule
@@ -52,7 +54,7 @@ Every primitive must be simple for the app developer: correct defaults, the leas
 1. Nothing is pulled from the inbox until the app registers a message handler. Member events are buffered until their handlers exist. This removes the connect/subscribe race by construction.
 2. Check the End-to-End Version (ADR-0022). A newer version stays unacked, up to about 100 per Device.
 3. Decrypt, verify the signature, and apply the membership and pairing rules (ADR-0023), then look the Message ID up in the dedup table. On any failure, ack and drop the Blob and raise a delivery-issue event. A duplicate is acked silently.
-4. Run the handler, which is async, and wait for it to finish. If it throws, retry in memory with backoff, 5 attempts in total. Then ack and drop, and raise `HandlerGaveUp{messageId, error}`. The library sets no timeout: a handler that never finishes stalls delivery for that session. Apps that want a timeout put one in their handler.
+4. Run the handler, which is async, and wait for it to finish. If it throws, retry in memory with backoff, 5 attempts in total. Then ack and drop, and raise `HandlerGaveUp{messageId, error}`. The library sets no timeout: a handler that never finishes stalls delivery for that session — and one parked at least the liveness window additionally triggers the promise's third exception above. Apps that want a timeout put one in their handler.
 5. Record the Message ID in the dedup table, then send DeliverAck.
 
 Control-plane messages follow the same path, with the library as the handler.
