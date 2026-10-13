@@ -8,7 +8,7 @@ Accepted — gap documented; resolved by ADR-0031 (the Sealed Envelope moved the
 
 ## Context
 
-`Envelope` (defined in `src/envelope.rs`) contains the following unencrypted fields:
+_Historical — describes the pre-ADR-0031 wire format._ `Envelope` (defined in `src/envelope.rs`) contained the following unencrypted fields:
 
 ```
 sequence       u64        — per-device monotonic counter
@@ -21,11 +21,13 @@ payload        Vec<u8>    — encrypted (ChaCha20-Poly1305)
 
 ADR-0001 claims: "the relay learns only recipient public keys." That claim is **false**. Every envelope the relay forwards carries `author_pub` — the sender's Ed25519 signing key, which is the device's long-term identity. The relay observes every (sender_signing_key → recipient_noise_key) pair across time. For a group of N devices exchanging blobs, the relay can reconstruct the full communication graph with precise timestamps.
 
-`author_pub` is unencrypted because signature verification requires the verifying key. In the current design, `author_pub` is in the envelope header so the recipient can verify the signature without first decrypting the payload.
+`author_pub` was unencrypted because signature verification requires the verifying key: it sat in the envelope header so the recipient could verify the signature without first decrypting the payload.
 
 ## Decision
 
-**The gap is accepted and documented.** The fix (moving `author_pub` inside the encrypted payload) is deferred to v1 for the following reasons:
+> **RESOLVED — read the rest as history.** The Developer Preview's clean wire break (ADR-0022) made bundling the fix free, and ADR-0031 implemented it: `author_pub`, the sequence and the Sender Timestamp moved inside the addressed encryption, and the relay reads only the End-to-End Version, the recipient key and the sealed payload (tested, including a raw-wire assertion of exactly which fields are relay-visible). The "deferred to v1" reasoning below is why it was *originally* deferred, not the current state. ADR-0001 was updated in place as the Consequences below require.
+
+**The gap was accepted and documented at the time.** The fix (moving `author_pub` inside the encrypted payload) was deferred for the following reasons:
 
 1. **Breaking wire format change.** Moving `author_pub` into the ciphertext changes the Envelope structure. Any relay or client built against the current format is incompatible. Since the project is pre-launch, there is no migration cost yet — but the fix should be bundled with other v1 breaking changes rather than done in isolation.
 
