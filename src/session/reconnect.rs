@@ -127,6 +127,7 @@ pub(super) fn reconnect_loop<T: crate::relay::Severable>(
             leaving.clone(),
             on_identity_rotated.clone(),
             rotation_pending.clone(),
+            shutdown.clone(),
             on_message.clone(),
         );
         // SYNC-5: receive-path Delivery Issues forward into the session sink
@@ -165,6 +166,15 @@ pub(super) fn reconnect_loop<T: crate::relay::Severable>(
             Err(_) => continue,
         };
 
+        // close() may have landed mid-dial (the version exchange retries
+        // WouldBlock up to its deadline — a wide window). If so, do NOT
+        // install the live client: dropping it severs the transport (the
+        // RelayClient Drop), its threads exit, and the relay's session
+        // dies instead of parking forever as a phantom (SYNC-15 gate F1).
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            drop(new_client);
+            return;
+        }
         *client.lock().unwrap_or_else(|e| e.into_inner()) = new_client;
         backoff = Duration::from_secs(1);
 

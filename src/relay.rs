@@ -370,10 +370,11 @@ impl<T: Severable> RelayClient<T> {
         }
     }
 
-    /// Interrupt the receive side: the Noise session's closed flag makes a
-    /// receive blocked in WouldBlock retry return an error, so the run loop
-    /// (and its receive thread) exits and `is_connected` flips to false via
-    /// the DisconnectGuard. The send thread ends when the client (and its
+    /// Interrupt the receive side: severing the transport makes a receive
+    /// parked in WouldBlock retry return EOF (the noise session's closed
+    /// flag is only checked at send/receive ENTRY, so the flag alone would
+    /// leave the thread parked). The run loop and its receive thread exit,
+    /// and `is_connected` flips to false via the DisconnectGuard. The send thread ends when the client (and its
     /// `push_tx`) drops. Idempotent; a no-op on the disconnected stub.
     ///
     /// Does NOT wait for thread exit — the run loop winds down within one

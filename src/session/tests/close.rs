@@ -114,8 +114,10 @@ fn close_is_idempotent() {
 }
 
 /// close() severs the live receive link: the run loop exits and the
-/// connection drops — proof the receive thread's WouldBlock retry observed
-/// the Noise session's closed flag instead of parking on the socket.
+/// connection drops — proof the sever-induced transport EOF interrupts a
+/// receive parked in WouldBlock retry (the noise closed flag is only
+/// checked at receive entry, so the EOF does the work) instead of the
+/// thread parking on the socket.
 #[test]
 fn close_severs_the_receive_link() {
     let relay_kp = make_relay_kp();
@@ -177,4 +179,104 @@ fn close_severs_the_receive_link() {
         || relay_gone.load(std::sync::atomic::Ordering::Acquire),
         Duration::from_secs(5),
     );
+}
+
+/// close() landing mid-dial must not resurrect a zombie connection
+/// (SYNC-15 gate F1): the version exchange can hold a dial open for
+/// seconds, so the reconnect loop re-checks the shutdown flag after the
+/// handshake completes and drops a client it built for a closed session —
+/// its threads exit and the relay's end dies instead of parking forever.
+#[test]
+fn close_during_dial_installs_no_live_client() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Condvar;
+
+    let relay_kp = make_relay_kp();
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+
+    // The relay holds the handshake open until the test releases it, then
+    // completes the accept and reports when the link dies.
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let relay_eof = Arc::new(AtomicBool::new(false));
+    let relay_done = Arc::new(AtomicBool::new(false));
+    {
+        let release = release.clone();
+        let relay_eof = relay_eof.clone();
+        let relay_done = relay_done.clone();
+        let relay_kp2 =
+            trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+        std::thread::spawn(move || {
+            let (lock, cvar) = &*release;
+            let mut go = lock.lock().unwrap();
+            while !*go {
+                go = cvar.wait(go).unwrap();
+            }
+            drop(go);
+            // The client was closed while its dial waited on this. Complete
+            // the handshake anyway — the client side must drop the result.
+            if let Ok(sess) =
+                crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2)
+            {
+                relay_done.store(true, Ordering::SeqCst);
+                while sess.receive().is_ok() {}
+                relay_eof.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+
+    let dial_attempts = Arc::new(AtomicUsize::new(0));
+    let da = dial_attempts.clone();
+    let pipe_slot: Arc<Mutex<Option<_>>> = Arc::new(Mutex::new(Some(pipe_client)));
+    let session = TruesealSession::<MemPipeSimple>::connect_background(
+        relay_pub(&relay_kp),
+        DeviceKeypair::generate(),
+        |_, _, _| {},
+        Box::new(MemLog::new()),
+        Arc::new(Mutex::new(None)),
+        || {},
+        |_| {},
+        || {},
+        move || {
+            da.fetch_add(1, Ordering::SeqCst);
+            pipe_slot
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| "exhausted".into())
+        },
+        || Err("push factory unused".into()),
+        Some(Duration::from_millis(50)),
+        None,
+    )
+    .expect("connect_background");
+
+    // The dial is in flight once the factory produced the pipe. Give the
+    // exchange a bounded 200 ms of relay silence — far under its 10 s
+    // deadline — so close() lands while the dial is parked in the version
+    // exchange. (A channel recv_timeout as the clock, not a bare sleep.)
+    let start = std::time::Instant::now();
+    while dial_attempts.load(Ordering::SeqCst) == 0 {
+        if start.elapsed() > Duration::from_secs(5) {
+            panic!("factory never called");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let clock = std::sync::mpsc::channel::<()>().1;
+    let _ = clock.recv_timeout(Duration::from_millis(200));
+
+    session.close();
+
+    // Now the relay completes the handshake. Pre-fix, the loop installed
+    // the live client and exited — the relay's session would stay open.
+    {
+        let (lock, cvar) = &*release;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+    wait_for(
+        || relay_done.load(Ordering::SeqCst),
+        Duration::from_secs(15),
+    );
+    wait_for(|| relay_eof.load(Ordering::SeqCst), Duration::from_secs(15));
+    assert!(session.is_closed());
 }

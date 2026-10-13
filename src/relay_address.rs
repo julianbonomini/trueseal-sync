@@ -49,7 +49,7 @@ impl RelayAddress {
 
         // The key is 64 hex chars and contains no '@', so the first '@'
         // separates key from authority. A second '@' inside the authority
-        // is rejected below via the port/host parsing.
+        // is rejected by the host parsing below.
         let (key_hex, authority) = rest
             .split_once('@')
             .ok_or_else(|| err("missing `@` between the relay public key and the host"))?;
@@ -141,11 +141,17 @@ fn hex_val(b: u8) -> Option<u8> {
 
 /// Parse `host[:port]`, with `[v6addr][:port]` support. A second colon in an
 /// unbracketed host means a bare IPv6 address, which is ambiguous with the
-/// port separator — require brackets.
+/// port separator — require brackets. A host never contains `@`: the
+/// key/host separator is the FIRST `@`, so a second one means a garbage
+/// authority like `user@host` — reject it rather than dial a host named
+/// `user@host` (matches the relay's own host validation, byte for byte).
 fn parse_host_port(s: &str) -> Result<(String, u16), RelayAddressError> {
     let err = |msg: &str| RelayAddressError(msg.to_string());
     if s.is_empty() {
         return Err(err("missing host"));
+    }
+    if s.contains('@') {
+        return Err(err("host must not contain `@`"));
     }
     if let Some(after_bracket) = s.strip_prefix('[') {
         let (v6, rest) = after_bracket
@@ -275,6 +281,8 @@ mod tests {
             format!("trueseal://{KEY}@2001:db8::1"),   // unbracketed IPv6
             format!("trueseal://{KEY}@[::1"),          // unterminated bracket
             format!("trueseal://{KEY}@:7700"),         // empty host with port
+            format!("trueseal://{KEY}@user@host"),     // second @ in the authority
+            format!("trueseal://{KEY}@[us@er::1]"),    // @ inside brackets
         ];
         for c in &cases {
             assert!(RelayAddress::parse(c).is_err(), "should reject: {c}");

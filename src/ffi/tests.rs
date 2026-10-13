@@ -35,16 +35,20 @@ fn assert_quiet(cond: impl Fn() -> bool, window: Duration, what: &str) {
 
 // ── TCP relay stub ────────────────────────────────────────────────────────────
 
-/// A minimal relay on loopback TCP: accepts ONE XX receive connection after
-/// the version prefix, records every client frame, and delivers sealed
-/// envelopes on demand. The NK push side is a bare listener whose accepted
-/// sockets are just counted (the handshake is allowed to fail).
+/// A minimal relay on loopback TCP: accepts XX receive connections in a
+/// loop (a reconnect or a reopened session gets a fresh accept), records
+/// every client frame, delivers sealed envelopes on demand — and, like a
+/// real relay, re-delivers every delivered-but-unacked Blob when a new
+/// Receive Session comes up (peek-and-ack, ADR-0020). The NK push side is
+/// a bare listener whose accepted sockets are just counted (the handshake
+/// is allowed to fail).
 struct TcpRelay {
     relay_pub: crate::keys::NoisePublicKey,
     receive_port: u16,
     push_port: u16,
     client_frames: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
     push_connections: Arc<AtomicUsize>,
+    accepts: Arc<AtomicUsize>,
     deliver_tx: mpsc::Sender<(u64, Vec<u8>)>,
 }
 
@@ -81,34 +85,94 @@ impl TcpRelay {
         }
 
         let client_frames = Arc::new(Mutex::new(Vec::<(u8, Vec<u8>)>::new()));
+        let accepts = Arc::new(AtomicUsize::new(0));
+        // Delivered-but-unacked envelopes, in delivery order. Re-sent on
+        // every new Receive Session; removed when a DeliverAck arrives.
+        let unacked: Arc<Mutex<Vec<(u64, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let current: Arc<Mutex<Option<Arc<trueseal_noise::session_xx::Session<TcpStream>>>>> =
+            Arc::new(Mutex::new(None));
         let (deliver_tx, deliver_rx) = mpsc::channel::<(u64, Vec<u8>)>();
+
+        // Writer: new deliveries go to the current session (if any) and
+        // into the unacked list either way.
         {
-            let client_frames = client_frames.clone();
-            let relay_kp =
-                trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+            let current = current.clone();
+            let unacked = unacked.clone();
             std::thread::spawn(move || {
-                let (stream, _) = receive_listener.accept().expect("accept receive");
-                // Non-blocking, like every real peer (B1-fix): a blocking
-                // receive would hold the noise conn mutex for the whole
-                // read syscall and starve the deliver writer's send.
-                stream.set_nonblocking(true).expect("nonblocking");
-                let session = crate::version::testutil::xx_accept_after_prefix(stream, relay_kp)
-                    .expect("relay accept");
-                let session = Arc::new(session);
-                let send_session = session.clone();
-                std::thread::spawn(move || {
-                    for (blob_id, env_bytes) in deliver_rx {
+                for (blob_id, env_bytes) in deliver_rx {
+                    unacked.lock().unwrap().push((blob_id, env_bytes.clone()));
+                    let sess = current.lock().unwrap().clone();
+                    if let Some(sess) = sess {
                         let mut body = blob_id.to_be_bytes().to_vec();
                         body.extend_from_slice(&env_bytes);
-                        if send_session.send(&frame(MsgType::Deliver, &body)).is_err() {
+                        let _ = sess.send(&frame(MsgType::Deliver, &body));
+                    }
+                }
+            });
+        }
+
+        // Accept loop: a fresh XX accept per connection; on each new
+        // session, re-deliver everything unacked (relay redelivery).
+        {
+            let relay_kp =
+                trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
+            let client_frames = client_frames.clone();
+            let accepts = accepts.clone();
+            std::thread::spawn(move || {
+                while let Ok((stream, _)) = receive_listener.accept() {
+                    // Non-blocking, like every real peer (B1-fix): a
+                    // blocking receive would hold the noise conn mutex for
+                    // the whole read syscall and starve the writer's send.
+                    if stream.set_nonblocking(true).is_err() {
+                        continue;
+                    }
+                    let kp = trueseal_noise::keypair::Keypair::new(
+                        relay_kp.private(),
+                        relay_kp.public_key,
+                    );
+                    let session = match crate::version::testutil::xx_accept_after_prefix(stream, kp)
+                    {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let session = Arc::new(session);
+                    accepts.fetch_add(1, Ordering::SeqCst);
+                    // Re-deliver unacked blobs on the new session.
+                    let pending: Vec<(u64, Vec<u8>)> = unacked.lock().unwrap().clone();
+                    for (blob_id, env_bytes) in pending {
+                        let mut body = blob_id.to_be_bytes().to_vec();
+                        body.extend_from_slice(&env_bytes);
+                        if session.send(&frame(MsgType::Deliver, &body)).is_err() {
                             break;
                         }
                     }
-                });
-                while let Ok(raw) = session.receive() {
-                    if let Some((t, body)) = parse(&raw) {
-                        client_frames.lock().unwrap().push((t as u8, body.to_vec()));
-                    }
+                    *current.lock().unwrap() = Some(session.clone());
+                    // Read frames until the link dies; DeliverAcks retire
+                    // the blob.
+                    let client_frames = client_frames.clone();
+                    let unacked = unacked.clone();
+                    let current = current.clone();
+                    let session_for_read = session.clone();
+                    std::thread::spawn(move || {
+                        while let Ok(raw) = session_for_read.receive() {
+                            if let Some((t, body)) = parse(&raw) {
+                                if t == MsgType::DeliverAck {
+                                    if let Ok(id) = <[u8; 8]>::try_from(body) {
+                                        let id = u64::from_be_bytes(id);
+                                        unacked.lock().unwrap().retain(|(bid, _)| *bid != id);
+                                    }
+                                }
+                                client_frames.lock().unwrap().push((t as u8, body.to_vec()));
+                            }
+                        }
+                        // The link died: stop pointing new deliveries at it.
+                        let mut cur = current.lock().unwrap();
+                        if let Some(c) = cur.as_ref() {
+                            if Arc::ptr_eq(c, &session) {
+                                *cur = None;
+                            }
+                        }
+                    });
                 }
             });
         }
@@ -119,6 +183,7 @@ impl TcpRelay {
             push_port,
             client_frames,
             push_connections,
+            accepts,
             deliver_tx,
         }
     }
@@ -778,11 +843,237 @@ fn every_error() -> Vec<TrueSealError> {
 }
 
 #[test]
-fn the_error_enum_is_exactly_the_canonical_14() {
+fn the_ffi_surface_matches_api_surface_json() {
+    let golden: serde_jsonless::Surface = serde_jsonless::load();
+
+    // Errors: 14 canonical cases (ADR-0028 as amended by ADR-0032 and the
+    // SYNC-15 amendment). `error_code` is an exhaustive match — adding a
+    // variant fails compilation until the JSON and this test move together.
     let codes: Vec<&str> = every_error().iter().map(error_code).collect();
     assert_eq!(codes.len(), 14);
-    let golden: serde_jsonless::Surface = serde_jsonless::load();
-    assert_eq!(codes, golden.errors, "docs/api-surface.json drifted");
+    assert_eq!(codes, golden.errors, "api-surface.json: errors drifted");
+
+    // Events.
+    let events: Vec<&str> = every_event().iter().map(event_kind).collect();
+    assert_eq!(events, golden.events, "api-surface.json: events drifted");
+
+    // Group statuses, status reasons, connection states.
+    let statuses: Vec<&str> = every_status().iter().map(status_name).collect();
+    assert_eq!(
+        statuses, golden.statuses,
+        "api-surface.json: statuses drifted"
+    );
+    let reasons: Vec<&str> = every_status_reason()
+        .iter()
+        .map(status_reason_name)
+        .collect();
+    assert_eq!(
+        reasons, golden.status_reasons,
+        "api-surface.json: statusReasons drifted"
+    );
+    let connections: Vec<&str> = every_connection_state()
+        .iter()
+        .map(connection_state_name)
+        .collect();
+    assert_eq!(
+        connections, golden.connection_states,
+        "api-surface.json: connectionStates drifted"
+    );
+
+    // Delivery issues and their reason enums.
+    let issues: Vec<&str> = every_issue().iter().map(issue_kind).collect();
+    assert_eq!(
+        issues, golden.delivery_issues,
+        "api-surface.json: deliveryIssues drifted"
+    );
+    let unreadable: Vec<&str> = every_unreadable_reason()
+        .iter()
+        .map(unreadable_reason_name)
+        .collect();
+    assert_eq!(
+        unreadable, golden.unreadable_reasons,
+        "api-surface.json: unreadableReasons drifted"
+    );
+    let send_failed: Vec<&str> = every_send_failed_reason()
+        .iter()
+        .map(send_failed_reason_name)
+        .collect();
+    assert_eq!(
+        send_failed, golden.send_failed_reasons,
+        "api-surface.json: sendFailedReasons drifted"
+    );
+    let drops: Vec<&str> = vec![admission_drop_reason_name(&AdmissionDropReason::GroupFull)];
+    assert_eq!(
+        drops, golden.admission_drop_reasons,
+        "api-surface.json: admissionDropReasons drifted"
+    );
+
+    // Limits come from the core constants — the single source of truth.
+    assert_eq!(golden.max_payload_bytes, 61_440);
+    assert_eq!(golden.max_payload_bytes, trueseal_max_payload_bytes());
+    assert_eq!(golden.max_group_size, 32);
+    assert_eq!(golden.max_group_size, trueseal_max_group_size());
+}
+
+fn every_event() -> Vec<TrueSealEvent> {
+    vec![
+        TrueSealEvent::StatusChanged {
+            status: GroupStatus::Member,
+            reason: StatusReason::Joined,
+        },
+        TrueSealEvent::MembersChanged { members: vec![] },
+        TrueSealEvent::JoinRequest {
+            request: JoinRequest {
+                id: String::new(),
+                name: String::new(),
+            },
+        },
+        TrueSealEvent::ConnectionChanged {
+            connection: ConnectionState::Connected,
+        },
+        TrueSealEvent::AdmissionDropped {
+            name: String::new(),
+            reason: AdmissionDropReason::GroupFull,
+        },
+    ]
+}
+
+fn event_kind(e: &TrueSealEvent) -> &'static str {
+    match e {
+        TrueSealEvent::StatusChanged { .. } => "statusChanged",
+        TrueSealEvent::MembersChanged { .. } => "membersChanged",
+        TrueSealEvent::JoinRequest { .. } => "joinRequest",
+        TrueSealEvent::ConnectionChanged { .. } => "connectionChanged",
+        TrueSealEvent::AdmissionDropped { .. } => "admissionDropped",
+    }
+}
+
+fn every_status() -> Vec<GroupStatus> {
+    vec![
+        GroupStatus::NotJoined,
+        GroupStatus::PendingJoin,
+        GroupStatus::Member,
+        GroupStatus::Leaving,
+        GroupStatus::Destroying,
+    ]
+}
+
+fn status_name(s: &GroupStatus) -> &'static str {
+    match s {
+        GroupStatus::NotJoined => "notJoined",
+        GroupStatus::PendingJoin => "pendingJoin",
+        GroupStatus::Member => "member",
+        GroupStatus::Leaving => "leaving",
+        GroupStatus::Destroying => "destroying",
+    }
+}
+
+fn every_status_reason() -> Vec<StatusReason> {
+    vec![
+        StatusReason::Created,
+        StatusReason::Joined,
+        StatusReason::Left,
+        StatusReason::Removed,
+        StatusReason::Destroyed,
+        StatusReason::StoreReset,
+    ]
+}
+
+fn status_reason_name(r: &StatusReason) -> &'static str {
+    match r {
+        StatusReason::Created => "created",
+        StatusReason::Joined => "joined",
+        StatusReason::Left => "left",
+        StatusReason::Removed => "removed",
+        StatusReason::Destroyed => "destroyed",
+        StatusReason::StoreReset => "storeReset",
+    }
+}
+
+fn every_connection_state() -> Vec<ConnectionState> {
+    vec![
+        ConnectionState::Connecting,
+        ConnectionState::Connected,
+        ConnectionState::Disconnected,
+        ConnectionState::RelayVersionUnsupported { min: 1, max: 1 },
+    ]
+}
+
+fn connection_state_name(c: &ConnectionState) -> &'static str {
+    match c {
+        ConnectionState::Connecting => "connecting",
+        ConnectionState::Connected => "connected",
+        ConnectionState::Disconnected => "disconnected",
+        ConnectionState::RelayVersionUnsupported { .. } => "relayVersionUnsupported",
+    }
+}
+
+fn every_issue() -> Vec<DeliveryIssue> {
+    vec![
+        DeliveryIssue::Unreadable {
+            reason: UnreadableReason::Malformed,
+        },
+        DeliveryIssue::Unauthorized,
+        DeliveryIssue::HeldForUpgrade { version: 2 },
+        DeliveryIssue::HandlerGaveUp {
+            message_id: String::new(),
+            error: String::new(),
+        },
+        DeliveryIssue::SendFailed {
+            message_id: String::new(),
+            reason: SendFailedReason::Expired,
+        },
+    ]
+}
+
+fn issue_kind(i: &DeliveryIssue) -> &'static str {
+    match i {
+        DeliveryIssue::Unreadable { .. } => "unreadable",
+        DeliveryIssue::Unauthorized => "unauthorized",
+        DeliveryIssue::HeldForUpgrade { .. } => "heldForUpgrade",
+        DeliveryIssue::HandlerGaveUp { .. } => "handlerGaveUp",
+        DeliveryIssue::SendFailed { .. } => "sendFailed",
+    }
+}
+
+fn every_unreadable_reason() -> Vec<UnreadableReason> {
+    vec![
+        UnreadableReason::Malformed,
+        UnreadableReason::SenderOutdated,
+        UnreadableReason::Expired,
+        UnreadableReason::DroppedWhileHeld,
+    ]
+}
+
+fn unreadable_reason_name(r: &UnreadableReason) -> &'static str {
+    match r {
+        UnreadableReason::Malformed => "malformed",
+        UnreadableReason::SenderOutdated => "senderOutdated",
+        UnreadableReason::Expired => "expired",
+        UnreadableReason::DroppedWhileHeld => "droppedWhileHeld",
+    }
+}
+
+fn every_send_failed_reason() -> Vec<SendFailedReason> {
+    vec![
+        SendFailedReason::TooLarge,
+        SendFailedReason::Malformed,
+        SendFailedReason::Expired,
+    ]
+}
+
+fn send_failed_reason_name(r: &SendFailedReason) -> &'static str {
+    match r {
+        SendFailedReason::TooLarge => "tooLarge",
+        SendFailedReason::Malformed => "malformed",
+        SendFailedReason::Expired => "expired",
+    }
+}
+
+fn admission_drop_reason_name(r: &AdmissionDropReason) -> &'static str {
+    match r {
+        AdmissionDropReason::GroupFull => "groupFull",
+    }
 }
 
 // Minimal JSON reader for docs/api-surface.json — no serde dependency in
@@ -790,12 +1081,33 @@ fn the_error_enum_is_exactly_the_canonical_14() {
 mod serde_jsonless {
     pub struct Surface {
         pub errors: Vec<&'static str>,
+        pub events: Vec<&'static str>,
+        pub statuses: Vec<&'static str>,
+        pub status_reasons: Vec<&'static str>,
+        pub connection_states: Vec<&'static str>,
+        pub delivery_issues: Vec<&'static str>,
+        pub unreadable_reasons: Vec<&'static str>,
+        pub send_failed_reasons: Vec<&'static str>,
+        pub admission_drop_reasons: Vec<&'static str>,
+        pub max_payload_bytes: u32,
+        pub max_group_size: u32,
     }
 
     pub fn load() -> Surface {
         let raw = include_str!("../../docs/api-surface.json");
-        let errors = extract_array(raw, "errors");
-        Surface { errors }
+        Surface {
+            errors: extract_array(raw, "errors"),
+            events: extract_array(raw, "events"),
+            statuses: extract_array(raw, "statuses"),
+            status_reasons: extract_array(raw, "statusReasons"),
+            connection_states: extract_array(raw, "connectionStates"),
+            delivery_issues: extract_array(raw, "deliveryIssues"),
+            unreadable_reasons: extract_array(raw, "unreadableReasons"),
+            send_failed_reasons: extract_array(raw, "sendFailedReasons"),
+            admission_drop_reasons: extract_array(raw, "admissionDropReasons"),
+            max_payload_bytes: extract_number(raw, "maxPayloadBytes"),
+            max_group_size: extract_number(raw, "maxGroupSize"),
+        }
     }
 
     fn extract_array(raw: &str, key: &str) -> Vec<&'static str> {
@@ -814,6 +1126,114 @@ mod serde_jsonless {
             .filter(|s| !s.is_empty())
             .collect()
     }
+
+    fn extract_number(raw: &str, key: &str) -> u32 {
+        let needle = format!("\"{key}\"");
+        let start = raw.find(&needle).expect("key present");
+        let rest = &raw[start + needle.len()..];
+        let colon = rest.find(':').expect("colon");
+        let num: String = rest[colon + 1..]
+            .chars()
+            .skip_while(|c| c.is_whitespace())
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        num.parse().expect("number parses")
+    }
+}
+
+/// The pre-listener buffer is bounded (SYNC-15 gate F5): overflow drops
+/// the oldest, so a listener-less app against a flapping relay does not
+/// grow memory forever.
+#[test]
+fn event_buffer_is_bounded_and_drops_oldest() {
+    let bus: ListenerBus<u64> = ListenerBus::new();
+    for i in 0..1100u64 {
+        bus.fire(i);
+    }
+    let got: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(vec![]));
+    let g = got.clone();
+    let _id = bus.subscribe(Arc::new(move |e| g.lock().unwrap().push(e)));
+    let got = got.lock().unwrap();
+    assert_eq!(got.len(), 1024, "buffered events capped");
+    assert_eq!(got[0], 1100 - 1024, "the oldest were dropped");
+    assert_eq!(got[1023], 1099, "the newest survived");
+}
+
+/// A handler that records and returns immediately.
+struct SimpleHandler(Arc<Mutex<Vec<TrueSealMessage>>>);
+#[async_trait::async_trait]
+impl TrueSealMessageHandler for SimpleHandler {
+    async fn on_message(&self, message: TrueSealMessage) -> Result<(), HandlerError> {
+        self.0.lock().unwrap().push(message);
+        Ok(())
+    }
+}
+
+/// SYNC-15 gate F2 (at-least-once across close with no handler): a Blob
+/// delivered while no handler is registered parks the dispatch; closing
+/// there must NOT record the message as handled — the ack never leaves,
+/// the relay re-delivers on the next open(), and the handler then
+/// registered receives it. (Pre-fix, the parked wait returned "success",
+/// the dedup record committed, and the re-delivery was a silent no-op.)
+#[test]
+fn close_during_pre_registration_wait_does_not_lose_the_message() {
+    let relay = TcpRelay::spawn();
+    let dir = tempfile::TempDir::new().unwrap();
+
+    // Phase 1: create the identity. Wait for the link so the close lands
+    // on a live connection — the accept count below is then exact.
+    let first = open_test_session(&dir, &relay.address(), "app");
+    wait_for(
+        || relay.accepts.load(Ordering::SeqCst) == 1,
+        Duration::from_secs(10),
+        "first session accepted",
+    );
+    first.close();
+    let device = load_identity(&dir, "app");
+    let sender = fresh_sender();
+    persist_membership(&dir, "app", &device, &sender);
+
+    // Phase 2: open, NO message handler — the delivered Blob parks the
+    // dispatch (registration-gated receiving, ADR-0026).
+    let session = open_test_session(&dir, &relay.address(), "app");
+    wait_for(
+        || relay.accepts.load(Ordering::SeqCst) == 2,
+        Duration::from_secs(10),
+        "second session accepted",
+    );
+    relay.deliver_from(7, b"do-not-lose-me", device.public_key(), &sender, 0);
+    // It parks unacked (no handler) — then close() mid-wait.
+    assert_quiet(
+        || !relay.deliver_acks().is_empty(),
+        Duration::from_millis(400),
+        "acked with no handler registered",
+    );
+    session.close();
+
+    // Phase 3: reopen the same namespace, register the handler — the relay
+    // re-delivers the unacked Blob on the new session and the handler runs.
+    let received: Arc<Mutex<Vec<TrueSealMessage>>> = Arc::new(Mutex::new(vec![]));
+    let session3 = open_test_session(&dir, &relay.address(), "app");
+    session3
+        .on_message(Box::new(SimpleHandler(received.clone())))
+        .expect("handler registers");
+    wait_for(
+        || relay.accepts.load(Ordering::SeqCst) == 3,
+        Duration::from_secs(10),
+        "third session accepted",
+    );
+    wait_for(
+        || received.lock().unwrap().len() == 1,
+        Duration::from_secs(10),
+        "redelivered message reaches the handler after reopen",
+    );
+    assert_eq!(received.lock().unwrap()[0].body, b"do-not-lose-me");
+    wait_for(
+        || relay.deliver_acks() == vec![7],
+        Duration::from_secs(10),
+        "acked exactly once, on the final session",
+    );
+    session3.close();
 }
 
 // ── The lifecycle rule (ADR-0028) ─────────────────────────────────────────────

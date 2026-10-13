@@ -845,6 +845,7 @@ pub(super) fn build_subscribe_handler(
     leaving: Arc<Mutex<Option<LeavingRecord>>>,
     on_identity_rotated: Arc<dyn Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static>,
     rotation_pending: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
 ) -> impl Fn(Message, [u8; 32], u64, u64) + Send + 'static {
     move |msg, author_signing_pub, sequence, sender_timestamp_ms| {
@@ -1619,6 +1620,17 @@ pub(super) fn build_subscribe_handler(
             }));
             match result {
                 Ok(()) => {
+                    // close() during the handler — or during the FFI's
+                    // pre-registration wait, which returns here too —
+                    // abandons the delivery: do NOT record the Message ID
+                    // (SYNC-15 gate F2). The ack fails on the severed
+                    // session, the relay re-delivers on the next open(),
+                    // and a committed record would turn that re-delivery
+                    // into a silent no-op — at-least-once broken on exactly
+                    // the flow registration-gating creates.
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
                     // Step 5: record the Message ID, THEN return so the
                     // DeliverAck follows. A crash before the record commits
                     // re-delivers and the handler runs again — the only way
@@ -1669,8 +1681,8 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
     /// Close the session (ADR-0028): stop the connection and the handlers
     /// but keep Session State. The reconnect loop and the sender pump exit
     /// (woken immediately, not on the next poll), the receive client is
-    /// severed — its Noise session's closed flag interrupts a receive
-    /// blocked in WouldBlock retry — and every state-changing call fails
+    /// severed — the transport EOF interrupts a receive parked in
+    /// WouldBlock retry — and every state-changing call fails
     /// with [`SessionError::Closed`] from here on. In-flight handlers run
     /// to completion; their Blobs are then handled by the usual dispatch
     /// (the receive loop exits on the next frame at the latest). A Blob
@@ -2043,6 +2055,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
             leaving.clone(),
             on_identity_rotated.clone(),
             rotation_pending.clone(),
+            shutdown.clone(),
             on_message,
         );
         // SYNC-5: the Delivery Issue stream is one channel from the very

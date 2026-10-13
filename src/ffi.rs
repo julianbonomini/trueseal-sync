@@ -452,10 +452,18 @@ struct ListenerBus<T: Clone + Send + 'static> {
     state: Mutex<ListenerBusState<T>>,
 }
 
+/// Cap on buffered pre-listener events (SYNC-15 gate F5): a listener-less
+/// app against a flapping relay would otherwise grow this buffer forever
+/// (~2 connection events per minute, plus membership churn). Overflow drops
+/// the OLDEST buffered events and warns with the running dropped count —
+/// the buffer exists to deliver startup transitions, not to be a log.
+const MAX_BUFFERED_EVENTS: usize = 1024;
+
 struct ListenerBusState<T: Clone + Send + 'static> {
     pending: Vec<T>,
     listeners: Vec<(u64, Arc<dyn Fn(T) + Send + Sync + 'static>)>,
     next_id: u64,
+    dropped: u64,
 }
 
 impl<T: Clone + Send + 'static> ListenerBus<T> {
@@ -465,6 +473,7 @@ impl<T: Clone + Send + 'static> ListenerBus<T> {
                 pending: Vec::new(),
                 listeners: Vec::new(),
                 next_id: 0,
+                dropped: 0,
             }),
         }
     }
@@ -474,6 +483,14 @@ impl<T: Clone + Send + 'static> ListenerBus<T> {
     fn fire(&self, event: T) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.listeners.is_empty() {
+            if st.pending.len() >= MAX_BUFFERED_EVENTS {
+                st.pending.remove(0);
+                st.dropped += 1;
+                log::warn!(
+                    "[trueseal-sync] event buffer full ({MAX_BUFFERED_EVENTS}); dropped the oldest buffered event ({} dropped so far — register a listener to drain)",
+                    st.dropped
+                );
+            }
             st.pending.push(event);
             return;
         }
@@ -535,13 +552,9 @@ pub struct TrueSeal {
     handler_slot: Arc<(Mutex<HandlerSlot>, Condvar)>,
     events: Arc<ListenerBus<TrueSealEvent>>,
     issues: Arc<ListenerBus<DeliveryIssue>>,
-    /// The last status an event was reported for, for the created/joined
-    /// distinction: `on_manifest_changed` fires for both an inbound first
-    /// manifest (Joined) and a local genesis (Created), and only the FFI
-    /// call context tells them apart.
+    /// The last status an event was reported for, so a manifest that
+    /// arrives while already a member raises `membersChanged` only.
     last_status: Arc<Mutex<GroupStatus>>,
-    /// True while `accept()` runs — see `last_status`.
-    accept_in_flight: Arc<AtomicBool>,
     /// Cached connection state for the `connection` getter (starts
     /// `connecting`; updated by the core's connection callback).
     connection: Arc<Mutex<ConnectionState>>,
@@ -700,11 +713,7 @@ impl TrueSeal {
     /// Destroying, or `manifestVersionExhausted` (SYNC-10).
     pub fn accept(&self, request_id: String) -> Result<(), TrueSealError> {
         self.check_open()?;
-        // Mark the local accept so the manifest hook can tell a genesis
-        // (Created) from an inbound first manifest (Joined).
-        self.accept_in_flight.store(true, Ordering::Release);
         let result = self.inner.accept_member(&request_id);
-        self.accept_in_flight.store(false, Ordering::Release);
         match result {
             Ok(true) => {
                 *self.last_status.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -884,7 +893,6 @@ impl TrueSeal {
         let events: Arc<ListenerBus<TrueSealEvent>> = Arc::new(ListenerBus::new());
         let issues: Arc<ListenerBus<DeliveryIssue>> = Arc::new(ListenerBus::new());
         let last_status = Arc::new(Mutex::new(GroupStatus::NotJoined));
-        let accept_in_flight = Arc::new(AtomicBool::new(false));
         let connection: Arc<Mutex<ConnectionState>> =
             Arc::new(Mutex::new(ConnectionState::Connecting));
         let handler_slot = Arc::new((
@@ -949,10 +957,13 @@ impl TrueSeal {
             // hook stays a no-op on the canonical surface.
         };
 
+        // The manifest's issuer tells Created from Joined with no flag and
+        // no race: a genesis (or any manifest) this device issued carries
+        // its own signing key (SYNC-15 gate F7).
+        let self_signing_pub = keypair.signing_public_key();
         let on_manifest_changed = {
             let events = events.clone();
             let last_status = last_status.clone();
-            let accept_in_flight = accept_in_flight.clone();
             move |m: &crate::manifest::GroupManifest| {
                 // Persist first: the store is the crash-recovery record
                 // (SYNC-7); a save failure is logged, not swallowed (B13
@@ -974,7 +985,7 @@ impl TrueSeal {
                     .collect();
                 let mut last = last_status.lock().unwrap_or_else(|e| e.into_inner());
                 if *last != GroupStatus::Member {
-                    let reason = if accept_in_flight.load(Ordering::Acquire) {
+                    let reason = if m.issued_by == self_signing_pub.0 {
                         StatusReason::Created
                     } else {
                         StatusReason::Joined
@@ -1131,7 +1142,6 @@ impl TrueSeal {
             events,
             issues,
             last_status,
-            accept_in_flight,
             connection,
         });
 
