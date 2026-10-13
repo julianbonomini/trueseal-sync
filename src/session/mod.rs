@@ -1568,23 +1568,39 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// authentication.
     pub fn pairing_token(&self) -> String {
         let secret: [u8; 32] = rand::random();
-        *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = Some(PairingWindow { secret });
-        // A new window must not inherit requests raised under a spent
-        // secret — its pending requests live and die with the window.
-        self.pending_members
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        {
+            // Hold the window lock across the clear AND the replace (B8
+            // review F2), in the handler's lock order (pairing →
+            // pending_members). A new window must not inherit requests
+            // raised under a spent secret — its pending requests live and
+            // die with the window — and clearing BEFORE the replace means
+            // a Join Request raised under the NEW window can never be
+            // wiped by this clear. Residual, bounded race: a Pair that
+            // passed the OLD window's secret check just before the replace
+            // can still insert after the clear; the single-use window
+            // bounds this — accepting any request spends the window and
+            // drops every other pending request.
+            let mut window = self.pairing.lock().unwrap_or_else(|e| e.into_inner());
+            self.pending_members
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            *window = Some(PairingWindow { secret });
+        }
         let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         crate::message::pairing_token(&ks.noise_pub.0, &ks.signing_pub.0, &secret)
     }
 
     pub fn cancel_pairing(&self) {
-        *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Same lock order as `pairing_token` and the inbound handler
+        // (pairing → pending_members): the window close and the clear of
+        // its pending requests are one observation.
+        let mut window = self.pairing.lock().unwrap_or_else(|e| e.into_inner());
         self.pending_members
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        *window = None;
     }
 
     /// Admit a device; requires both noise and signing pub keys.
