@@ -4,143 +4,20 @@
 //! single Delivery Issue stream.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::delivery_issue::DeliveryIssue;
 use crate::device::DeviceKeypair;
-use crate::envelope::{Envelope, SigningKeypair};
-use crate::keys::{NoisePublicKey, SigningPublicKey};
+use crate::envelope::SigningKeypair;
 use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
 use crate::member::member_name;
 use crate::message::{message_id, Message};
 use crate::operation_log::MemLog;
-use crate::relay::{frame, parse, MsgType};
 use crate::store::{PersistentLog, Store};
 
 use super::super::test_helpers::*;
 use super::super::TruesealSession;
-
-/// A scripted relay for recipient-contract tests: accepts the XX session,
-/// records every frame the client sends, and delivers envelopes on demand.
-struct ScriptedRelay {
-    client_frames: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
-    deliver_tx: mpsc::Sender<(u64, Vec<u8>)>,
-}
-
-impl ScriptedRelay {
-    fn spawn(pipe: MemPipe, relay_kp: &trueseal_noise::keypair::Keypair) -> Self {
-        let client_frames = Arc::new(Mutex::new(Vec::<(u8, Vec<u8>)>::new()));
-        let (deliver_tx, deliver_rx) = mpsc::channel::<(u64, Vec<u8>)>();
-        let frames_clone = client_frames.clone();
-        let relay_kp2 =
-            trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-        std::thread::spawn(move || {
-            let session = crate::version::testutil::xx_accept_after_prefix(pipe, relay_kp2)
-                .expect("relay accept");
-            let session = Arc::new(session);
-            let send_session = session.clone();
-            std::thread::spawn(move || {
-                for (blob_id, env_bytes) in deliver_rx {
-                    let mut body = blob_id.to_be_bytes().to_vec();
-                    body.extend_from_slice(&env_bytes);
-                    if send_session.send(&frame(MsgType::Deliver, &body)).is_err() {
-                        break;
-                    }
-                }
-            });
-            while let Ok(raw) = session.receive() {
-                if let Some((t, body)) = parse(&raw) {
-                    frames_clone.lock().unwrap().push((t as u8, body.to_vec()));
-                }
-            }
-        });
-        ScriptedRelay {
-            client_frames,
-            deliver_tx,
-        }
-    }
-
-    /// Deliver an envelope built from `msg`, addressed to `recipient` and
-    /// signed by `sender` with Envelope sequence `seq`.
-    fn deliver(
-        &self,
-        blob_id: u64,
-        msg: &Message,
-        recipient: NoisePublicKey,
-        sender: &SigningKeypair,
-        seq: u64,
-    ) {
-        let plaintext = msg.encode();
-        let payload = crate::crypto::encrypt(recipient, sender.public_key_bytes(), &plaintext);
-        let env = Envelope::build(seq, vec![], recipient, sender, payload);
-        self.deliver_raw(blob_id, env.encode());
-    }
-
-    fn deliver_raw(&self, blob_id: u64, envelope_bytes: Vec<u8>) {
-        self.deliver_tx
-            .send((blob_id, envelope_bytes))
-            .expect("relay alive");
-    }
-
-    /// Blob ids the client acked, in order.
-    fn deliver_acks(&self) -> Vec<u64> {
-        self.client_frames
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(t, _)| *t == MsgType::DeliverAck as u8)
-            .filter_map(|(_, b)| b.as_slice().try_into().ok().map(u64::from_be_bytes))
-            .collect()
-    }
-}
-
-/// Rebuild a SigningKeypair from raw bytes (SigningKeypair is not Clone).
-fn signing_keypair(bytes: &[u8; 32]) -> SigningKeypair {
-    SigningKeypair::from_signing_key(ed25519_dalek::SigningKey::from_bytes(bytes))
-}
-
-fn pub_of(bytes: &[u8; 32]) -> [u8; 32] {
-    ed25519_dalek::SigningKey::from_bytes(bytes)
-        .verifying_key()
-        .to_bytes()
-}
-
-fn signing_member(signing_bytes: &[u8; 32], noise: [u8; 32]) -> ManifestMember {
-    let sp = SigningPublicKey(pub_of(signing_bytes));
-    ManifestMember {
-        noise_pub: NoisePublicKey(noise),
-        signing_pub: sp,
-        name: member_name(&sp),
-    }
-}
-
-/// ADR-0023: a manifestless device drops every Sync. Build the two-member
-/// genesis (device + scripted sender) so these delivery-contract tests run
-/// as group members — they exercise dedup/retries/acks, not pairing.
-/// `set_manifest` bypasses the first-manifest gate on purpose.
-fn membership(device: &DeviceKeypair, sender: &SigningKeypair) -> GroupManifest {
-    let sk = ed25519_dalek::SigningKey::from_bytes(&device.signing.to_bytes());
-    let self_sp = device.signing_public_key();
-    let sender_sp = sender.public_key();
-    GroupManifest::new(
-        new_group_id(),
-        1,
-        vec![
-            ManifestMember {
-                noise_pub: device.public_key(),
-                signing_pub: self_sp,
-                name: member_name(&self_sp),
-            },
-            ManifestMember {
-                noise_pub: NoisePublicKey([9u8; 32]),
-                signing_pub: SigningPublicKey(sender.public_key_bytes()),
-                name: member_name(&sender_sp),
-            },
-        ],
-        &sk,
-    )
-}
 
 /// A duplicate delivery (same Envelope, new blob id) is acked silently and
 /// the handler runs once. This is the crash-between-dedup-and-ack recovery
