@@ -575,6 +575,14 @@ pub fn build_push_blob(
         sender_timestamp_ms,
         &message.encode(),
     );
+    push_frame_for_envelope(&envelope)
+}
+
+/// Frame an already-sealed Envelope as a Push blob: the size backstop plus
+/// the routing-prefix body assembly of [`build_push_blob`]. Shared with the
+/// SYNC-2 test vectors so the wire bytes the vectors pin come from the same
+/// code that production pushes use.
+pub(crate) fn push_frame_for_envelope(envelope: &Envelope) -> Result<Vec<u8>, RelayError> {
     let envelope_bytes = envelope.encode();
     if envelope_bytes.len() > MAX_ENVELOPE_BYTES {
         return Err(RelayError::EnvelopeTooLarge);
@@ -582,7 +590,7 @@ pub fn build_push_blob(
     // Push body layout (ADR-0019): [recipient_pub: 32 bytes][envelope_proto: variable].
     // Relay reads body[0..32] as inbox routing key without proto decode.
     let mut body = Vec::with_capacity(32 + envelope_bytes.len());
-    body.extend_from_slice(&recipient_pub.0);
+    body.extend_from_slice(&envelope.recipient_pub);
     body.extend_from_slice(&envelope_bytes);
     Ok(frame(MsgType::Push, &body))
 }

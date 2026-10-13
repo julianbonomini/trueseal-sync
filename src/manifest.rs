@@ -102,7 +102,10 @@ fn signing_message(
 /// [`signing_message`] under an explicit domain. The migration re-seal
 /// (ADR-0034 §1, SYNC-13) re-signs queued manifests under the End-to-End
 /// Version being migrated to.
-fn signing_message_for(
+///
+/// `pub(crate)` so the SYNC-2 test vectors pin the exact bytes the code
+/// signs rather than a re-implementation of the layout.
+pub(crate) fn signing_message_for(
     domain: &[u8],
     group_id: &[u8; 32],
     version: u64,

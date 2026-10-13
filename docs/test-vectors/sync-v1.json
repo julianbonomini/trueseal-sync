@@ -1,0 +1,277 @@
+{
+  "format": "trueseal-sync-vectors",
+  "formatVersion": 1,
+  "description": "Sync JSON test vectors (ADR-0022, gate G5). Generated from the trueseal-sync code paths with fixed test-only inputs — never hand-written. Consumers verify they reproduce or accept exactly these bytes. See README.md in this directory.",
+  "regenerate": "cargo test --lib vectors -- --ignored   (rewrites this file; do so only on a deliberate protocol change — the drift test fails CI otherwise)",
+  "protocol": {
+    "transportVersion": 1,
+    "endToEndVersion": 1,
+    "storeVersion": 1,
+    "protocolSizeLimit": 61440,
+    "maxEnvelopeBytes": 65482,
+    "noiseFramePlaintextMax": 65519,
+    "maxGroupSize": 32,
+    "maxManifestVersionJump": 1024,
+    "maxHeldBlobs": 100,
+    "replayWindowMs": 5184000000
+  },
+  "keys": {
+    "note": "test-only fixed inputs; none of this key material is valid on any live network. Seeds are 32-byte ramps (seed, seed+1, …, seed+31).",
+    "authorSigningSecret": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+    "authorSigningPub": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+    "member2SigningPub": "e7f162a10bec559afea195e4dce84b69568d5d2cb0963eb446c0685e2b17f2f0",
+    "recipientNoiseSecret": "a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0",
+    "recipientNoisePub": "ad438bfae31f6c093d61d4339255ea798092c9fadd07b97827f4b0ae9dee7c1c",
+    "member2NoisePub": "3a553d74792d727efa9b9a4cde3da1ad93f1a2d0c09cb639b1a3c0fda14cbe24",
+    "ephemeralSealPub": "0233f006ef4bed144ea0a5bb46c7067c7c2acec5f8cc811f3df59fdcd5ac7614",
+    "ephemeralEncPub": "d214723afdfe2cddbdc929b18a5e43017e44445fc5d6c8fcf88b1868c53f395c",
+    "groupId": "e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+    "pairingSecret": "3132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50"
+  },
+  "domains": {
+    "hkdfInfo": "trueseal-sync addressed encryption v1",
+    "aeadAad": "trueseal-sync addressed encryption aad v1",
+    "hkdfInfoLayout": "hkdfInfo || ephemeral_pub(32) || recipient_pub(32)",
+    "aeadAadLayout": "aeadAad || ephemeral_pub(32) || recipient_pub(32)",
+    "envelopeSigningDomainHex": "747275657365616c2d73796e6320656e76656c6f706520763100",
+    "manifestSigningDomainHex": "747275657365616c2d73796e63206d616e696665737420763100",
+    "note": "the signing domains end in a NUL byte (0x00)"
+  },
+  "transportVersionPrefix": {
+    "layout": "client→relay: \"TSP\" || version:u16 BE (5 bytes, plaintext); relay→client: 0x01 (supported — the 5 prefix bytes become the Noise prologue) | \"unsupported <min>..<max>\\n\" (refused — then close)",
+    "clientPrefixHex": "5453500001",
+    "acceptReplyHex": "01",
+    "refusalExample": {
+      "line": "unsupported 2..4\n",
+      "min": 2,
+      "max": 4,
+      "surfacesAs": "connectionState relayVersionUnsupported"
+    },
+    "preVersionRelay": "a relay speaking the pre-version format never replies; the exchange times out (10 s deadline) and surfaces as a connection failure — that format is refused by design (ADR-0022)"
+  },
+  "signing": {
+    "envelope": {
+      "layout": "envelopeSigningDomain || version(4 LE) || recipient_pub(32) || ephemeral_pub(32) || sealedPrefix  (ADR-0031)",
+      "signingMessageHex": "747275657365616c2d73796e6320656e76656c6f70652076310001000000ad438bfae31f6c093d61d4339255ea798092c9fadd07b97827f4b0ae9dee7c1c0233f006ef4bed144ea0a5bb46c7067c7c2acec5f8cc811f3df59fdcd5ac761479b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad04966407000000000000000100eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee24f85610a30100000268656c6c6f20766563746f7273",
+      "signatureHex": "d0073bb2ba0d50dddd9d69273beabda4cfff1d95458a6eb2c9468c10bea75b8cfa3caca9a1bd86c87ee08043812719c984a5ce0346fb474c4ed8e465ad02b30c",
+      "signerPub": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664"
+    },
+    "manifestGenesis": {
+      "layout": "manifestSigningDomain || group_id(32) || version(8 LE) || per-member [noise_pub(32) || signing_pub(32) || name || 0x00] || parentFlag(0x00 = genesis)  (ADR-0022/0027)",
+      "signingMessageHex": "747275657365616c2d73796e63206d616e696665737420763100e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff0100000000000000883186b800b41d5cf0429695da9b3cc4f328ebcd184a6e482fa578c103f06c7779b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664566563746f72416c7068610000",
+      "signatureHex": "c9534cdca8e9851551fc38492c4de9c89d5cb024daf806aa25785a7df2460c57c19535d3e8e93ca3efff1354334a4f4a6f110080a9748b1fe29c8b97e4936207",
+      "manifestProtoHex": "0a20e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff10011a510a20883186b800b41d5cf0429695da9b3cc4f328ebcd184a6e482fa578c103f06c77122079b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad0496641a0b566563746f72416c706861222079b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad0496642a40c9534cdca8e9851551fc38492c4de9c89d5cb024daf806aa25785a7df2460c57c19535d3e8e93ca3efff1354334a4f4a6f110080a9748b1fe29c8b97e4936207",
+      "hashHex": "c55241ac78dbbc0b6a0b66bacca9adc10d1d9b4cc3a16d7395047260e86d5796",
+      "hashNote": "SHA-256 over the canonical protobuf encoding"
+    },
+    "manifestUpdate": {
+      "layout": "as genesis, but parentFlag 0x01 || parentHash(32) — the parent is covered by the signature (ADR-0027)",
+      "signingMessageHex": "747275657365616c2d73796e63206d616e696665737420763100e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff0200000000000000883186b800b41d5cf0429695da9b3cc4f328ebcd184a6e482fa578c103f06c7779b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664566563746f72416c706861003a553d74792d727efa9b9a4cde3da1ad93f1a2d0c09cb639b1a3c0fda14cbe24e7f162a10bec559afea195e4dce84b69568d5d2cb0963eb446c0685e2b17f2f0566563746f72426574610001c55241ac78dbbc0b6a0b66bacca9adc10d1d9b4cc3a16d7395047260e86d5796",
+      "signatureHex": "32a58acccb26955b46817970926fa64ee015318715ce40c78676b0256309e5f4e6f5eeaa625bb47792e835e18cbb5365be2a9571f56ba1e2a9caa44172ee5302",
+      "manifestProtoHex": "0a20e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff10021a510a20883186b800b41d5cf0429695da9b3cc4f328ebcd184a6e482fa578c103f06c77122079b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad0496641a0b566563746f72416c7068611a500a203a553d74792d727efa9b9a4cde3da1ad93f1a2d0c09cb639b1a3c0fda14cbe241220e7f162a10bec559afea195e4dce84b69568d5d2cb0963eb446c0685e2b17f2f01a0a566563746f7242657461222079b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad0496642a4032a58acccb26955b46817970926fa64ee015318715ce40c78676b0256309e5f4e6f5eeaa625bb47792e835e18cbb5365be2a9571f56ba1e2a9caa44172ee53023220c55241ac78dbbc0b6a0b66bacca9adc10d1d9b4cc3a16d7395047260e86d5796",
+      "hashHex": "b64aaf33a1d7f347a4f4e864fcbd48dfd0641aa97a0d5756da09feba3ad8d882",
+      "parentHex": "c55241ac78dbbc0b6a0b66bacca9adc10d1d9b4cc3a16d7395047260e86d5796",
+      "versionJumpBound": 1024
+    }
+  },
+  "addressedEncryption": {
+    "layout": "ephemeral_pub(32) || nonce(12, all zero) || ciphertext+tag — X25519 DH → HKDF-SHA256 (no salt) → ChaCha20-Poly1305 with the versioned info/AAD above (ADR-0031)",
+    "plaintextHex": "61646472657373656420656e6372797074696f6e20766563746f7220706c61696e74657874",
+    "blobHex": "d214723afdfe2cddbdc929b18a5e43017e44445fc5d6c8fcf88b1868c53f395c000000000000000000000000d29fc084a2760adabd87c687b4e8a82345488b032ce9efad0acf694528ac5ddac5771189b1f25ca7af14c31d576cdbac4825c9051b",
+    "recipientNoisePub": "ad438bfae31f6c093d61d4339255ea798092c9fadd07b97827f4b0ae9dee7c1c",
+    "ephemeralPub": "d214723afdfe2cddbdc929b18a5e43017e44445fc5d6c8fcf88b1868c53f395c"
+  },
+  "messageId": {
+    "derivation": "tsm1_ || base64url(SHA-256(\"trueseal-message-id-v1\\0\" || author_signing_pub(32) || sequence:u64 BE))",
+    "authorSigningPub": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+    "sequence": 7,
+    "id": "tsm1_ori18CDjUVPi022PVJwLYBFMXCHQfrZjE1ts5E1Lwjs"
+  },
+  "messages": {
+    "layout": "1-byte type tag + body; the tag lives inside the addressed encryption, the relay never sees it. Pair body = noise_pub(32) || signing_pub(32) || secret(32) — exactly 97 bytes total (ADR-0023)",
+    "pair": {
+      "tag": 1,
+      "bytesHex": "013a553d74792d727efa9b9a4cde3da1ad93f1a2d0c09cb639b1a3c0fda14cbe24e7f162a10bec559afea195e4dce84b69568d5d2cb0963eb446c0685e2b17f2f03132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f50"
+    },
+    "sync": {
+      "tag": 2,
+      "bodyUtf8": "hello vectors",
+      "bytesHex": "0268656c6c6f20766563746f7273"
+    },
+    "revoke": {
+      "tag": 3,
+      "bytesHex": "03"
+    },
+    "groupManifest": {
+      "tag": 4,
+      "bytesHex": "040a20e0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff10011a510a20883186b800b41d5cf0429695da9b3cc4f328ebcd184a6e482fa578c103f06c77122079b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad0496641a0b566563746f72416c706861222079b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad0496642a40c9534cdca8e9851551fc38492c4de9c89d5cb024daf806aa25785a7df2460c57c19535d3e8e93ca3efff1354334a4f4a6f110080a9748b1fe29c8b97e4936207"
+    }
+  },
+  "sealedEnvelope": {
+    "sealedContentLayout": "author_pub(32) || sequence(8 LE) || parents_len(2 LE) || parents(32*n) || sender_timestamp_ms(8 LE) || message || signature(64)  (ADR-0031)",
+    "envelopeProtoLayout": "protobuf Envelope { version: field 7 (signed plaintext), recipient_pub: field 3, payload: field 6 } — the relay reads only these three",
+    "inputs": {
+      "sequence": 7,
+      "parentsHex": [
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      ],
+      "senderTimestampMs": 1799865432100,
+      "messageHex": "0268656c6c6f20766563746f7273",
+      "recipientNoisePub": "ad438bfae31f6c093d61d4339255ea798092c9fadd07b97827f4b0ae9dee7c1c",
+      "authorSigningPub": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad049664",
+      "ephemeralPub": "0233f006ef4bed144ea0a5bb46c7067c7c2acec5f8cc811f3df59fdcd5ac7614"
+    },
+    "sealedPrefixHex": "79b5562e8fe654f94078b112e8a98ba7901f853ae695bed7e0e3910bad04966407000000000000000100eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee24f85610a30100000268656c6c6f20766563746f7273",
+    "payloadHex": "0233f006ef4bed144ea0a5bb46c7067c7c2acec5f8cc811f3df59fdcd5ac7614000000000000000000000000b342810a1e1b1a578e12ddac38f58d63b5ccc3516844b5d2433284d423cef43a5658c411536da0eb834180f6982cb5a7c3e3df9d603eb6cf64d2d4d55ae7f3598ade2ace4c5c76b6612965f802e7d5eb32f155e57b52d17f61ff0c988f927259f1ca7503d97105862cca79de2ceee507bbb0944e0f7f674d53d562b67c8136d3a83bffc80a93b7c5bb53ecbfdc3c4451b651f15414c878a2e0c2f8a61261afa2b98ef59e1d68dbd2eded0062fafa3b6e",
+    "envelopeProtoHex": "1a20ad438bfae31f6c093d61d4339255ea798092c9fadd07b97827f4b0ae9dee7c1c32dc010233f006ef4bed144ea0a5bb46c7067c7c2acec5f8cc811f3df59fdcd5ac7614000000000000000000000000b342810a1e1b1a578e12ddac38f58d63b5ccc3516844b5d2433284d423cef43a5658c411536da0eb834180f6982cb5a7c3e3df9d603eb6cf64d2d4d55ae7f3598ade2ace4c5c76b6612965f802e7d5eb32f155e57b52d17f61ff0c988f927259f1ca7503d97105862cca79de2ceee507bbb0944e0f7f674d53d562b67c8136d3a83bffc80a93b7c5bb53ecbfdc3c4451b651f15414c878a2e0c2f8a61261afa2b98ef59e1d68dbd2eded0062fafa3b6e3801",
+    "envelopeHashHex": "f46eb8092136bcbd62038bed63fad4352fa2e9f9c283778451e55b8309000ffe",
+    "hashNote": "SHA-256 over envelopeProto — the parents[] entries of later envelopes"
+  },
+  "frames": {
+    "layout": "[msg_type:u8][len:u32 BE][body] inside one Noise transport frame",
+    "push": {
+      "type": 1,
+      "bodyLayout": "recipient_pub(32, the routing prefix) || envelope_proto",
+      "frameHex": "0100000123ad438bfae31f6c093d61d4339255ea798092c9fadd07b97827f4b0ae9dee7c1c1a20ad438bfae31f6c093d61d4339255ea798092c9fadd07b97827f4b0ae9dee7c1c32dc010233f006ef4bed144ea0a5bb46c7067c7c2acec5f8cc811f3df59fdcd5ac7614000000000000000000000000b342810a1e1b1a578e12ddac38f58d63b5ccc3516844b5d2433284d423cef43a5658c411536da0eb834180f6982cb5a7c3e3df9d603eb6cf64d2d4d55ae7f3598ade2ace4c5c76b6612965f802e7d5eb32f155e57b52d17f61ff0c988f927259f1ca7503d97105862cca79de2ceee507bbb0944e0f7f674d53d562b67c8136d3a83bffc80a93b7c5bb53ecbfdc3c4451b651f15414c878a2e0c2f8a61261afa2b98ef59e1d68dbd2eded0062fafa3b6e3801"
+    },
+    "deliver": {
+      "type": 2,
+      "bodyLayout": "blob_id(8, opaque, relay-assigned) || envelope_proto",
+      "blobIdHex": "000000000000002a",
+      "frameHex": "020000010b000000000000002a1a20ad438bfae31f6c093d61d4339255ea798092c9fadd07b97827f4b0ae9dee7c1c32dc010233f006ef4bed144ea0a5bb46c7067c7c2acec5f8cc811f3df59fdcd5ac7614000000000000000000000000b342810a1e1b1a578e12ddac38f58d63b5ccc3516844b5d2433284d423cef43a5658c411536da0eb834180f6982cb5a7c3e3df9d603eb6cf64d2d4d55ae7f3598ade2ace4c5c76b6612965f802e7d5eb32f155e57b52d17f61ff0c988f927259f1ca7503d97105862cca79de2ceee507bbb0944e0f7f674d53d562b67c8136d3a83bffc80a93b7c5bb53ecbfdc3c4451b651f15414c878a2e0c2f8a61261afa2b98ef59e1d68dbd2eded0062fafa3b6e3801"
+    },
+    "heartbeat": {
+      "type": 3,
+      "bodyLayout": "empty",
+      "frameHex": "0300000000"
+    },
+    "ack": {
+      "type": 4,
+      "bodyLayout": "empty",
+      "frameHex": "0400000000"
+    },
+    "error": {
+      "type": 5,
+      "bodyLayout": "empty",
+      "frameHex": "0500000000"
+    },
+    "deliverAck": {
+      "type": 6,
+      "bodyLayout": "blob_id(8) — echoes the Deliver's id verbatim",
+      "frameHex": "0600000008000000000000002a"
+    }
+  },
+  "rejections": [
+    {
+      "layer": "transport",
+      "case": "unsupportedTransportVersion",
+      "input": {
+        "replyLine": "unsupported 2..4\n"
+      },
+      "expect": {
+        "kind": "connectionState",
+        "name": "relayVersionUnsupported",
+        "min": 2,
+        "max": 4,
+        "detail": "ADR-0028: surfaces as a Connection State, not an Error — the object stays usable with a relay that speaks its version"
+      }
+    },
+    {
+      "layer": "transport",
+      "case": "preVersionRelaySilent",
+      "input": {
+        "replyBytes": "<none — the relay never replies>"
+      },
+      "expect": {
+        "kind": "connectionFailure",
+        "detail": "the version exchange times out (10 s deadline); the pre-version format is refused by design"
+      }
+    },
+    {
+      "layer": "envelope",
+      "case": "badSignature",
+      "input": {
+        "envelopeProtoHex": "1a20ad438bfae31f6c093d61d4339255ea798092c9fadd07b97827f4b0ae9dee7c1c32dc010233f006ef4bed144ea0a5bb46c7067c7c2acec5f8cc811f3df59fdcd5ac7614000000000000000000000000b342810a1e1b1a578e12ddac38f58d63b5ccc3516844b5d2433284d423cef43a5658c411536da0eb834180f6982cb5a7c3e3df9d603eb6cf64d2d4d55ae7f3598ade2ace4c5c76b6612965f802e7d5eb32f155e57b52d17f61ff0c988f927259f1ca7503d97105862cca79de2ceee507bbb0944e0f7f674d53d562b67c8136d3a83bffc80a93b7c5bb53ecbfdc3c4451b651f15414c878a2e0c2f8a61261afa2b98ef59e1d68dbd2eded0062fafa3b6f3801",
+        "recipientNoiseSecret": "a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0"
+      },
+      "expect": {
+        "kind": "deliveryIssue",
+        "name": "unreadable",
+        "reason": "malformed",
+        "acked": true,
+        "reachesHandler": false
+      }
+    },
+    {
+      "layer": "size",
+      "case": "bodyOverProtocolLimit",
+      "input": {
+        "bodyLen": 61441,
+        "limit": 61440
+      },
+      "expect": {
+        "kind": "typedError",
+        "name": "payloadTooLarge",
+        "max": 61440,
+        "detail": "refused synchronously in send(); never enters the outbox (ADR-0025). The relay enforces the same ceiling and may only be configured lower."
+      }
+    },
+    {
+      "layer": "endToEndVersion",
+      "case": "newerVersionHeld",
+      "input": {
+        "envelopeProtoHex": "1a20ad438bfae31f6c093d61d4339255ea798092c9fadd07b97827f4b0ae9dee7c1c32dc010233f006ef4bed144ea0a5bb46c7067c7c2acec5f8cc811f3df59fdcd5ac7614000000000000000000000000b342810a1e1b1a578e12ddac38f58d63b5ccc3516844b5d2433284d423cef43a5658c411536da0eb834180f6982cb5a7c3e3df9d603eb6cf64d2d4d55ae7f3598ade2ace4c5c76b6612965f802e7d5eb32f155e57b52d17f61ff0c988f927259f1ca7503d97105862cca79de2ceee507bbb0944e0f7f674d53d562b67c8136d3a83bffc80a93b7c5bb53ecbfdc3c4451b651f15414c878a2e0c2f8a61261afa2b98ef59e1d68dbd2eded0062fafa3b6e3802"
+      },
+      "expect": {
+        "kind": "deliveryIssue",
+        "name": "heldForUpgrade",
+        "version": 2,
+        "acked": false,
+        "detail": "held unacked up to maxHeldBlobs per device so an upgrade recovers it; cap overflow acks and drops the oldest with unreadable(droppedWhileHeld)"
+      }
+    },
+    {
+      "layer": "endToEndVersion",
+      "case": "olderVersionDropped",
+      "input": {
+        "envelopeProtoHex": "1a20ad438bfae31f6c093d61d4339255ea798092c9fadd07b97827f4b0ae9dee7c1c32dc010233f006ef4bed144ea0a5bb46c7067c7c2acec5f8cc811f3df59fdcd5ac7614000000000000000000000000b342810a1e1b1a578e12ddac38f58d63b5ccc3516844b5d2433284d423cef43a5658c411536da0eb834180f6982cb5a7c3e3df9d603eb6cf64d2d4d55ae7f3598ade2ace4c5c76b6612965f802e7d5eb32f155e57b52d17f61ff0c988f927259f1ca7503d97105862cca79de2ceee507bbb0944e0f7f674d53d562b67c8136d3a83bffc80a93b7c5bb53ecbfdc3c4451b651f15414c878a2e0c2f8a61261afa2b98ef59e1d68dbd2eded0062fafa3b6e"
+      },
+      "expect": {
+        "kind": "deliveryIssue",
+        "name": "unreadable",
+        "reason": "senderOutdated",
+        "acked": true,
+        "reachesHandler": false,
+        "detail": "version 0 is the reserved pre-version format"
+      }
+    },
+    {
+      "layer": "replay",
+      "case": "expiredSenderTimestamp",
+      "input": {
+        "senderTimestampMs": 1794815999000,
+        "nowMs": 1800000000000,
+        "replayWindowMs": 5184000000
+      },
+      "expect": {
+        "kind": "deliveryIssue",
+        "name": "unreadable",
+        "reason": "expired",
+        "acked": true
+      }
+    },
+    {
+      "layer": "message",
+      "case": "unknownMessageTag",
+      "input": {
+        "messageHex": "7f"
+      },
+      "expect": {
+        "kind": "deliveryIssue",
+        "name": "unreadable",
+        "reason": "malformed",
+        "acked": true
+      }
+    }
+  ]
+}

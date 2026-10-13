@@ -127,7 +127,36 @@ impl Envelope {
         sender_timestamp_ms: u64,
         message: &[u8],
     ) -> Self {
-        let (eph_secret, eph_pub) = crypto::ephemeral_keypair();
+        let (eph_secret, _) = crypto::ephemeral_keypair();
+        Self::build_sealed_with_ephemeral(
+            sequence,
+            parents,
+            recipient_pub,
+            author_keypair,
+            sender_timestamp_ms,
+            message,
+            &eph_secret,
+        )
+    }
+
+    /// [`build_sealed`] with a caller-supplied ephemeral key — the seam the
+    /// SYNC-2 test vectors use to produce byte-deterministic sealed
+    /// envelopes. Ed25519 and the AEAD are deterministic, so fixed inputs
+    /// plus a fixed ephemeral key give fixed wire bytes.
+    ///
+    /// SINGLE-USE: one ephemeral key, one seal, ever (see
+    /// [`crypto::ephemeral_keypair`]). Production callers use
+    /// [`build_sealed`], which mints a fresh ephemeral per seal.
+    pub(crate) fn build_sealed_with_ephemeral(
+        sequence: u64,
+        parents: Vec<[u8; 32]>,
+        recipient_pub: NoisePublicKey,
+        author_keypair: &SigningKeypair,
+        sender_timestamp_ms: u64,
+        message: &[u8],
+        eph_secret: &x25519_dalek::StaticSecret,
+    ) -> Self {
+        let eph_pub = *x25519_dalek::PublicKey::from(eph_secret).as_bytes();
         let author_pub = author_keypair.public_key_bytes();
 
         let mut prefix = Vec::with_capacity(PREFIX_FIXED_LEN + parents.len() * 32 + message.len());
@@ -151,7 +180,7 @@ impl Envelope {
         let mut sealed = prefix;
         sealed.extend_from_slice(&sig);
 
-        let payload = crypto::encrypt_with_ephemeral(recipient_pub, &eph_secret, &sealed);
+        let payload = crypto::encrypt_with_ephemeral(recipient_pub, eph_secret, &sealed);
         Self {
             version: version::END_TO_END_VERSION,
             recipient_pub: recipient_pub.0,
@@ -264,7 +293,10 @@ impl Envelope {
 /// version field is itself signed, so neither can be altered in transit;
 /// the recipient and ephemeral keys are bound, so the blob cannot be
 /// re-addressed or re-keyed; every sealed field is covered.
-fn signing_message(
+///
+/// `pub(crate)` so the SYNC-2 test vectors pin the exact bytes the code
+/// signs rather than a re-implementation of the layout.
+pub(crate) fn signing_message(
     e2e_version: u32,
     recipient_pub: &[u8; 32],
     eph_pub: &[u8; 32],
