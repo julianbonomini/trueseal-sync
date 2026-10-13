@@ -47,7 +47,7 @@ fn pairing_ceremony_creates_manifest_with_new_member() {
     )
     .expect("session B");
 
-    let admitted = session_a.accept_pair(device_b_noise_pub, device_b_signing_pub);
+    let admitted = session_a.accept_pair(device_b_noise_pub, device_b_signing_pub).expect("accept");
     assert!(admitted, "accept_pair must return true when window is open");
 
     let manifest = session_a.manifest.lock().unwrap();
@@ -85,12 +85,12 @@ fn accept_pair_outside_window_is_noop() {
     let dummy = NoisePublicKey(make_relay_kp().public_key);
     let dummy_signing = crate::keys::SigningPublicKey([0u8; 32]);
     // No window open — should be a noop.
-    session.accept_pair(dummy, dummy_signing);
+    session.accept_pair(dummy, dummy_signing).expect("accept");
 
     let _ = session.pairing_token();
     session.cancel_pairing();
     // Window cancelled — accept_pair should return false.
-    assert!(!session.accept_pair(dummy, dummy_signing));
+    assert!(!session.accept_pair(dummy, dummy_signing).expect("accept"));
 }
 
 /// Window stays open until cancelled — no auto-expiry (ADR-0021).
@@ -121,7 +121,7 @@ fn accept_pair_window_stays_open_until_cancelled() {
     let dummy = NoisePublicKey(make_relay_kp().public_key);
     let dummy_signing = crate::keys::SigningPublicKey([0u8; 32]);
     assert!(
-        session.accept_pair(dummy, dummy_signing),
+        session.accept_pair(dummy, dummy_signing).expect("accept"),
         "window must still be open after delay — no auto-expiry"
     );
 }
@@ -151,24 +151,24 @@ fn accept_pair_returns_bool_reflecting_window_state() {
     let dummy_signing = crate::keys::SigningPublicKey([0u8; 32]);
 
     assert!(
-        !session.accept_pair(dummy, dummy_signing),
+        !session.accept_pair(dummy, dummy_signing).expect("accept"),
         "no window: should return false"
     );
 
     let _token = session.pairing_token();
     assert!(
-        session.accept_pair(dummy, dummy_signing),
+        session.accept_pair(dummy, dummy_signing).expect("accept"),
         "open window: should return true"
     );
     assert!(
-        !session.accept_pair(dummy, dummy_signing),
+        !session.accept_pair(dummy, dummy_signing).expect("accept"),
         "window consumed: should return false"
     );
 
     let _token = session.pairing_token();
     session.cancel_pairing();
     assert!(
-        !session.accept_pair(dummy, dummy_signing),
+        !session.accept_pair(dummy, dummy_signing).expect("accept"),
         "cancelled window: should return false"
     );
 }
@@ -203,7 +203,7 @@ fn no_callback_fired_when_window_closed() {
     let dummy_signing = crate::keys::SigningPublicKey([0u8; 32]);
 
     // No window — no callback.
-    let admitted = session.accept_pair(dummy, dummy_signing);
+    let admitted = session.accept_pair(dummy, dummy_signing).expect("accept");
     assert!(!admitted);
     assert!(!*fired.lock().unwrap());
 }

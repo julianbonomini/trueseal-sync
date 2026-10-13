@@ -52,7 +52,7 @@ fn accept_pair_creates_genesis_manifest() {
 
     // A opens a pairing window then accepts B.
     let _token = session_a.pairing_token();
-    let admitted = session_a.accept_pair(b_noise, b_signing);
+    let admitted = session_a.accept_pair(b_noise, b_signing).expect("accept");
     assert!(admitted, "accept_pair must return true when window is open");
 
     // accept_pair creates manifest locally — no relay needed, no wait required.
@@ -151,7 +151,7 @@ fn accept_pair_without_window_returns_false() {
     let dummy_noise = crate::keys::NoisePublicKey([0xAA; 32]);
     let dummy_signing = crate::keys::SigningPublicKey([0xBB; 32]);
 
-    let result = session.accept_pair(dummy_noise, dummy_signing);
+    let result = session.accept_pair(dummy_noise, dummy_signing).expect("accept");
     assert!(!result, "no window → must return false");
     assert!(
         session.manifest.lock().unwrap().is_none(),

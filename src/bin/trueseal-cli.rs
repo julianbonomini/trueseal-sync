@@ -180,6 +180,10 @@ fn main() {
             print!("> ");
             io::stdout().flush().ok();
         },
+        // on_identity_rotated (ADR-0027): the CLI keeps no persistent
+        // identity of its own — the rotation is already reflected in the
+        // session; nothing to persist here.
+        |_| {},
         // transport_factory — opens the XX receive session.
         // Non-blocking mode is required: with a blocking TcpStream the conn
         // Mutex would be held for the entire duration of each read() syscall,
@@ -304,10 +308,10 @@ fn main() {
                     println!("usage: accept <token>");
                     continue;
                 }
-                if session.accept_member(rest) {
-                    println!("accepted");
-                } else {
-                    println!("no pending request with that token");
+                match session.accept_member(rest) {
+                    Ok(true) => println!("accepted"),
+                    Ok(false) => println!("no pending request with that token"),
+                    Err(e) => println!("accept failed: {e}"),
                 }
             }
 

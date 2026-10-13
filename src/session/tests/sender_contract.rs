@@ -260,6 +260,9 @@ fn reconnect_clears_backoff_and_retries_immediately() {
             poll: Duration::from_millis(20),
             ..SenderConfig::default()
         },
+        Arc::new(Mutex::new(None)),
+        Arc::new(AtomicBool::new(false)),
+        Box::new(|| {}),
     );
 
     // Queue one entry and kick the pump: the first attempt fails (no ack)
@@ -1009,7 +1012,7 @@ fn accept_pair_offline_queues_manifest_and_delivers_on_reconnect() {
 
     // Offline admission: window opens, accept_pair persists + queues.
     let _token = session_a.pairing_token();
-    assert!(session_a.accept_pair(b_noise, b_signing));
+    assert!(session_a.accept_pair(b_noise, b_signing).expect("accept"));
     {
         let entries = session_a
             .op_log

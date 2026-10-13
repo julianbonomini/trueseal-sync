@@ -58,10 +58,15 @@ pub enum SessionError {
     /// in-memory state changed. The caller may retry.
     #[error("store write failed: {msg}")]
     StoreFailed { msg: String },
+    /// The admission would exceed the Maximum Group Size (32, ADR-0027;
+    /// `groupFull{max}` in ADR-0028's error list). The Pairing Window
+    /// stays open.
+    #[error("group is full: maximum {max} members")]
+    GroupFull { max: u32 },
 }
 
 /// Where the local Device stands in its namespace's Sync Group (ADR-0023,
-/// ADR-0028). `Leaving` arrives with membership convergence (SYNC-9).
+/// ADR-0027, ADR-0028).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum GroupStatus {
     /// No Group Manifest and no Pending Join.
@@ -70,6 +75,10 @@ pub enum GroupStatus {
     PendingJoin,
     /// Holds a Group Manifest.
     Member,
+    /// Issued a Leave and waiting for the Relay to accept every push of
+    /// it; then the device wipes, rotates its identity and returns to
+    /// `NotJoined` (ADR-0027).
+    Leaving,
 }
 
 impl From<crate::session::GroupStatus> for GroupStatus {
@@ -78,6 +87,7 @@ impl From<crate::session::GroupStatus> for GroupStatus {
             crate::session::GroupStatus::NotJoined => GroupStatus::NotJoined,
             crate::session::GroupStatus::PendingJoin => GroupStatus::PendingJoin,
             crate::session::GroupStatus::Member => GroupStatus::Member,
+            crate::session::GroupStatus::Leaving => GroupStatus::Leaving,
         }
     }
 }
@@ -102,6 +112,7 @@ impl From<CoreSessionError> for SessionError {
             CoreSessionError::ManifestVersionExhausted => SessionError::ManifestVersionExhausted,
             CoreSessionError::AlreadyInGroup => SessionError::AlreadyInGroup,
             CoreSessionError::Store(msg) => SessionError::StoreFailed { msg },
+            CoreSessionError::GroupFull { max } => SessionError::GroupFull { max },
         }
     }
 }
@@ -276,8 +287,17 @@ impl TruesealFfiSession {
             })?,
         ));
 
-        // Open a fourth store handle for wiping on group destroy.
+        // Open a fourth store handle for wiping on group destroy, and a
+        // fifth for the wipe + rotate on deliberate removal / completed
+        // Leave (ADR-0027).
         let wipe_store = Arc::new(Mutex::new(
+            Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
+                SessionError::InvalidNamespace {
+                    msg: format!("store: {e}"),
+                }
+            })?,
+        ));
+        let rotate_store = Arc::new(Mutex::new(
             Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
                 SessionError::InvalidNamespace {
                     msg: format!("store: {e}"),
@@ -288,7 +308,7 @@ impl TruesealFfiSession {
         let receive_addr = format!("{}:7700", relay_host);
         let push_addr = format!("{}:7701", relay_host);
         let relay_addr_factory = receive_addr.clone();
-        let inner = TruesealSession::connect_background(
+        let inner = TruesealSession::connect_background_rotating(
             relay_pub_key,
             keypair,
             move |msg, author_signing_pub, sequence| {
@@ -318,6 +338,16 @@ impl TruesealFfiSession {
             move || {
                 let _ = wipe_store.lock().unwrap_or_else(|e| e.into_inner()).wipe();
                 on_group_destroyed.on_group_destroyed();
+            },
+            // ADR-0027: on deliberate removal or a completed Leave the core
+            // has already rotated the in-memory identity; here the
+            // namespace's store is wiped (manifest, identity, outbox, dedup,
+            // pending records — one transaction) and the fresh keypair is
+            // persisted, so a restart opens as the rotated device.
+            move |fresh: DeviceKeypair| {
+                let store = rotate_store.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = store.wipe();
+                let _ = store.save_keypair(&fresh);
             },
             move || {
                 let s = TcpStream::connect(&relay_addr_factory).map_err(|e| e.to_string())?;
@@ -392,9 +422,12 @@ impl TruesealFfiSession {
 
     /// Admit a pending member identified by their opaque `token` from `onMemberRequest`.
     ///
-    /// Returns `true` if admitted, `false` if the token is unknown or the pairing window closed.
-    pub fn accept_member(&self, token: String) -> bool {
-        self.inner.accept_member(&token)
+    /// Returns `Ok(true)` if admitted, `Ok(false)` if the token is unknown or the
+    /// pairing window closed. Errors: `GroupFull` when the admission would exceed
+    /// the Maximum Group Size of 32 (ADR-0027), `StoreFailed` if the durable
+    /// commit failed (nothing changed — retry is safe).
+    pub fn accept_member(&self, token: String) -> Result<bool, SessionError> {
+        self.inner.accept_member(&token).map_err(SessionError::from)
     }
 
     /// Register the callback fired when a new member joins the group.
@@ -468,6 +501,16 @@ impl TruesealFfiSession {
     /// Returns `SessionError::NotInGroup` if the session has no manifest yet.
     pub fn send(&self, blob: Vec<u8>) -> Result<(), SessionError> {
         self.inner.push_sync(blob).map_err(SessionError::from)
+    }
+
+    /// Leave the Sync Group (ADR-0027): issue a manifest excluding this
+    /// device and enter `GroupStatus::Leaving`. The device stops sending and
+    /// handling `Sync`, stays connected until the Relay has accepted every
+    /// Leave push, then wipes its group state, rotates its identity and
+    /// returns to `NotJoined`. Survives restarts; idempotent while a Leave
+    /// is in flight.
+    pub fn leave_group(&self) -> Result<(), SessionError> {
+        self.inner.leave_group().map_err(SessionError::from)
     }
 
     /// Destroy the group: push Revoke to all members, wipe local state, fire on_group_destroyed.

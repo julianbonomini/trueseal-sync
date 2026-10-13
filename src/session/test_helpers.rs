@@ -441,7 +441,7 @@ pub(super) fn run_pairing_ceremony<T, U>(
     );
     let t = req.lock().unwrap().clone().expect("a Join Request arrived");
     assert!(
-        admitter.accept_member(&t),
+        admitter.accept_member(&t).expect("accept"),
         "accept_member admits the waiting joiner"
     );
 }

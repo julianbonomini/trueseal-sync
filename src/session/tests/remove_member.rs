@@ -174,16 +174,16 @@ fn remove_member_issues_new_manifest_excluding_target() {
         },
         Duration::from_secs(5),
     );
+    // C is DELIBERATELY removed (ADR-0027): the removal manifest is
+    // parent-linked to the v1 C held — so the library wipes C's group
+    // state (its manifest slot empties) and rotates its identity.
+    let c_signing_before = session_c.signing_pub();
     wait_for(
-        || {
-            session_c
-                .manifest
-                .lock()
-                .unwrap()
-                .as_ref()
-                .map(|m| m.version)
-                == Some(2)
-        },
+        || session_c.manifest.lock().unwrap().is_none(),
+        Duration::from_secs(5),
+    );
+    wait_for(
+        || session_c.signing_pub() != c_signing_before,
         Duration::from_secs(5),
     );
 
@@ -207,14 +207,12 @@ fn remove_member_issues_new_manifest_excluding_target() {
     assert_eq!(b_m.as_ref().unwrap().version, 2, "B: version 2");
     drop(b_m);
 
-    // C's manifest: should receive the new manifest (which excludes C).
-    let c_m = session_c.manifest.lock().unwrap();
-    assert!(c_m.is_some(), "C: received updated manifest");
-    assert_eq!(c_m.as_ref().unwrap().version, 2, "C: version 2");
+    // C received the removal manifest — and it was deliberate, so C
+    // wiped: the slot is empty and C is back to NotJoined (asserted above).
     assert_eq!(
-        c_m.as_ref().unwrap().members.len(),
-        2,
-        "C: sees 2-member manifest"
+        session_c.group_status(),
+        crate::session::GroupStatus::NotJoined,
+        "C: deliberate removal wipes and returns to NotJoined"
     );
 }
 

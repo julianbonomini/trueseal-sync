@@ -188,7 +188,7 @@ fn matched_pair_still_raises_join_request_and_admits() {
 
     let token = requests.lock().unwrap()[0].clone();
     assert!(
-        session_a.accept_member(&token),
+        session_a.accept_member(&token).expect("accept"),
         "accept_member must succeed for a matched Pair"
     );
     let manifest = session_a.manifest.lock().unwrap();

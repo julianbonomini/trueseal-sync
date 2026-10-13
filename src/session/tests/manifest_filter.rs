@@ -322,16 +322,19 @@ fn on_removed_from_group_fires_when_excluded_from_manifest() {
     let rf = removed_fired.clone();
 
     // Relay accepts src (b) first — connect b before a.
-    let v2_excl_a = GroupManifest::new(
-        group_id,
-        2,
+    // ADR-0027: the removal manifest is parent-linked to v1 — a device
+    // counts itself removed only when the excluding manifest builds on a
+    // manifest it held that included it (deliberate removal).
+    let v2_excl_a = GroupManifest::update(
+        &v1,
         vec![ManifestMember {
             noise_pub: b_noise,
             signing_pub: b_signing,
             name: "B".into(),
         }],
         &b_sk,
-    );
+    )
+    .expect("update");
     let session_b = TruesealSession::connect(
         pipe_b_client,
         relay_pub,
@@ -595,8 +598,8 @@ fn concurrent_manifest_conflict_last_version_wins() {
     )
     .expect("C");
 
-    session_a.set_manifest(v1_a);
-    session_b.set_manifest(v1_b);
+    session_a.set_manifest(v1_a.clone());
+    session_b.set_manifest(v1_b.clone());
     session_c.set_manifest(v1_c);
     // Reset counter after set_manifest calls (on_manifest_changed not called by set_manifest).
 
@@ -605,9 +608,8 @@ fn concurrent_manifest_conflict_last_version_wins() {
     let device_d = DeviceKeypair::generate();
     let d_noise = device_d.public_key();
     let d_signing = device_d.signing_public_key();
-    let v2_a = GroupManifest::new(
-        group_id,
-        2,
+    let v2_a = GroupManifest::update(
+        &v1_a,
         vec![
             ManifestMember {
                 noise_pub: a_noise,
@@ -631,10 +633,10 @@ fn concurrent_manifest_conflict_last_version_wins() {
             },
         ],
         &a_sk,
-    );
-    let v2_b = GroupManifest::new(
-        group_id,
-        2,
+    )
+    .expect("v2_a update");
+    let v2_b = GroupManifest::update(
+        &v1_b,
         vec![
             ManifestMember {
                 noise_pub: a_noise,
@@ -653,23 +655,30 @@ fn concurrent_manifest_conflict_last_version_wins() {
             },
         ],
         &b_sk,
-    );
+    )
+    .expect("v2_b update");
 
     // Push both v2 manifests to C simultaneously.
     session_a
         .push_message(
-            &crate::message::Message::GroupManifest { manifest: v2_a },
+            &crate::message::Message::GroupManifest {
+                manifest: v2_a.clone(),
+            },
             c_noise,
         )
         .expect("A push v2");
     session_b
         .push_message(
-            &crate::message::Message::GroupManifest { manifest: v2_b },
+            &crate::message::Message::GroupManifest {
+                manifest: v2_b.clone(),
+            },
             c_noise,
         )
         .expect("B push v2");
 
-    // Wait for C to process at least one manifest update.
+    // ADR-0027: the equal-version tie resolves by (version, hash) — the
+    // LOWER hash wins, identically on every device, regardless of arrival
+    // order. If the winner arrives second, C accepts it too (two fires).
     let (lock, cvar) = &*c_manifest_changed;
     let result = cvar
         .wait_timeout_while(lock.lock().unwrap(), Duration::from_secs(5), |n| *n == 0)
@@ -678,21 +687,38 @@ fn concurrent_manifest_conflict_last_version_wins() {
         !result.1.timed_out(),
         "C must receive at least one v2 manifest"
     );
-    let _fires = *result.0;
     drop(result);
 
-    // Short additional wait to ensure the second manifest (if any) is processed.
-    std::thread::sleep(Duration::from_millis(100));
-    let final_fires = *c_manifest_changed.0.lock().unwrap();
+    let expected_winner = if v2_a.hash() < v2_b.hash() {
+        v2_a.clone()
+    } else {
+        v2_b.clone()
+    };
+    crate::session::test_helpers::wait_for(
+        || {
+            session_c
+                .manifest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.hash() == expected_winner.hash())
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    );
 
-    // C's manifest must be version 2 (whichever arrived first or last wins).
+    let final_fires = *c_manifest_changed.0.lock().unwrap();
     let c_m = session_c.manifest.lock().unwrap();
     let m = c_m.as_ref().expect("C has a manifest");
     assert_eq!(m.version, 2, "C's manifest is version 2");
     assert_eq!(m.group_id, group_id, "same group_id");
-    // on_manifest_changed fired exactly once (second v2 is same version — rejected as not higher).
     assert_eq!(
-        final_fires, 1,
-        "on_manifest_changed fires exactly once (same-version duplicate rejected)"
+        m.hash(),
+        expected_winner.hash(),
+        "the lower-hash manifest wins the equal-version tie"
+    );
+    assert!(
+        final_fires >= 1 && final_fires <= 2,
+        "one fire if the winner arrived first, two if it unseated the loser — got {final_fires}"
     );
 }
