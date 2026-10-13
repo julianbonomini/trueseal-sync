@@ -31,6 +31,10 @@ There is no timeout. A timeout would quietly break the promise at exactly the mo
 
 A valid Revoke moves a `member` or `leaving` device into Destroying. That device queues a Revoke to every member in its *own* view except the author, following the same rules as the initiator. The ack is sent after Destroying commits (ADR-0026). Forwarding reaches members that were admitted concurrently and are missing from the initiator's view. Each device forwards at most once, because a device that is already in Destroying or `notJoined` ignores further Revokes. The worst case at the Maximum Group Size is about 32 × 31 Revoke blobs.
 
+### Pairing while Destroying (added by SYNC-15)
+
+A Destroying device admits no one: `startPairing()` fails typed (`notMember{destroying}` on the canonical surface, ADR-0028) and `accept()` fails the same way; `destroyGroup()` closes any open Pairing Window. A device that is ending the group must not strand a joiner inside a group that is about to be wiped. Inbound Pairs arriving during Destroying are dropped like manifests (the residual race is a Pair that passed the secret check just as Destroying committed).
+
 ### State transitions (one Device, one namespace)
 
 | State | Local `destroyGroup()` | Incoming valid Revoke |

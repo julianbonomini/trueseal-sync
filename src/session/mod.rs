@@ -862,10 +862,11 @@ pub(super) fn build_subscribe_handler(
         } = &msg
         {
             // ADR-0029: a Destroying device is ending the group — inbound
-            // Pairs are dropped like manifests. No window can be OPEN while
-            // Destroying (pairing_token refuses and destroy_group() closes
-            // any open window); this guards the residual race where a Pair
-            // passed the secret check just as destroy_group() committed.
+            // Pairs are dropped like manifests. Pairing's CONSUMERS are
+            // gated while Destroying (pairing_token() refuses,
+            // destroy_group() closes any open window, accept_pair errors);
+            // this drop guards the residual race where a Pair passed the
+            // secret check just as destroy_group() committed.
             if destroying
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
