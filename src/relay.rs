@@ -2530,10 +2530,7 @@ mod tests {
     /// A real-TCP relay stand-in: version exchange + XX accept, then echo
     /// heartbeats exactly like the real relay until `kill_rx` fires, then die
     /// per `mode`. Returns (addr, kill switch).
-    fn spawn_tcp_relay(
-        relay_kp: Keypair,
-        mode: KillMode,
-    ) -> (String, std::sync::mpsc::Sender<()>) {
+    fn spawn_tcp_relay(relay_kp: Keypair, mode: KillMode) -> (String, std::sync::mpsc::Sender<()>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind relay");
         let addr = listener.local_addr().expect("addr").to_string();
         let (kill_tx, kill_rx) = std::sync::mpsc::channel::<()>();

@@ -125,7 +125,10 @@ fn relay_clean_kill_surfaces_disconnected_through_the_full_stack() {
 
     let events = Arc::new(Mutex::new(Vec::new()));
     let _session = tcp_session(&addr, &relay_kp, events.clone());
-    wait_for(|| saw(&events, ConnectionChange::Connected), Duration::from_secs(5));
+    wait_for(
+        || saw(&events, ConnectionChange::Connected),
+        Duration::from_secs(5),
+    );
 
     kill.send(()).expect("kill");
     wait_for(
@@ -144,7 +147,10 @@ fn relay_blackhole_kill_surfaces_disconnected_through_the_full_stack() {
 
     let events = Arc::new(Mutex::new(Vec::new()));
     let _session = tcp_session(&addr, &relay_kp, events.clone());
-    wait_for(|| saw(&events, ConnectionChange::Connected), Duration::from_secs(5));
+    wait_for(
+        || saw(&events, ConnectionChange::Connected),
+        Duration::from_secs(5),
+    );
 
     kill.send(()).expect("kill");
     wait_for(
