@@ -484,7 +484,7 @@ impl Store {
     ///    its own transaction.
     /// 5. **End-to-End Version bump** (independent of Store Version): re-seal
     ///    every queued outbox entry in one transaction (ADR-0034 §1).
-    fn open_inner(
+    pub(crate) fn open_inner(
         base_dir: &Path,
         namespace: &str,
         target_store_version: u32,
