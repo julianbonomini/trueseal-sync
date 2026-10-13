@@ -1619,6 +1619,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "hkdf",
+ "libc",
  "log",
  "prost",
  "prost-build",

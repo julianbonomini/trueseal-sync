@@ -29,6 +29,7 @@ The SDKs wrap the compiled native library via UniFFI — no Rust toolchain requi
 - **Encrypted fan-out** — one envelope per recipient. ECDH + ChaCha20-Poly1305. The relay sees `recipient_pub` + ciphertext; sender identity is inside the ciphertext.
 - **At-least-once transport** — the sender outbox survives crashes and relay disconnects. Recipients get an opaque message ID for durable deduplication.
 - **Auto-generated device names** — deterministic two-word name (`AmberFalcon`, `SwiftHorizon`) derived from the device's public key. No configuration needed.
+- **Data at rest** — protected only by the OS sandbox, so the library keeps the footprint small: on iOS/macOS the store files are marked excluded from device/cloud backups at open (`store_is_excluded_from_backup`; Android and Node exclusion is SDK-side work tracked under SYNC-14 / the SDK-1 tasks — **not yet shipped**), and a sealed outbox body is deleted — zeroed and WAL-truncated — the moment the Relay accepts it (`accepted_outbox_entry_leaves_no_body_bytes_on_disk`, `unaccepted_entries_replay_after_restart`, `secure_delete_pragma_is_on`).
 
 **You're responsible for:** what the bytes mean, conflict resolution, persisting received message IDs with application state, and bootstrapping new members with historical state.
 

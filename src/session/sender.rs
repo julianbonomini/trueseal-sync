@@ -246,6 +246,10 @@ fn sender_loop<T: crate::relay::Severable>(
         // capped at 30 days, ADR-0034 §2) — fail it permanently. Control
         // entries never expire.
         let now = now_secs();
+        // SYNC-14 (#106): any pass that removes rows (acceptance, expiry,
+        // permanent refusal, undecodable control) truncates the WAL
+        // afterwards, so the removed bodies stop existing on disk promptly.
+        let mut removed_any = false;
         let mut pending: Vec<LogEntry> = Vec::with_capacity(entries.len());
         for entry in entries {
             let expired = entry.kind == OutboxKind::Sync
@@ -255,6 +259,7 @@ fn sender_loop<T: crate::relay::Severable>(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&entry.object_id, entry.sequence);
+                removed_any = true;
                 issue_sink.lock().unwrap_or_else(|e| e.into_inner()).fire(
                     DeliveryIssue::SendFailed {
                         message_id: message_id(&local_signing_pub, entry.sequence),
@@ -308,6 +313,7 @@ fn sender_loop<T: crate::relay::Severable>(
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner())
                                 .remove(&entry.object_id, entry.sequence);
+                            removed_any = true;
                             issue_sink.lock().unwrap_or_else(|e| e.into_inner()).fire(
                                 DeliveryIssue::SendFailed {
                                     message_id: message_id(&local_signing_pub, entry.sequence),
@@ -351,6 +357,7 @@ fn sender_loop<T: crate::relay::Severable>(
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .remove(&entry.object_id, entry.sequence);
+                        removed_any = true;
                         backoffs.remove(&recipient);
                     }
                     Err(e) => {
@@ -371,6 +378,7 @@ fn sender_loop<T: crate::relay::Severable>(
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner())
                                     .remove(&entry.object_id, entry.sequence);
+                                removed_any = true;
                                 issue_sink.lock().unwrap_or_else(|e| e.into_inner()).fire(
                                     DeliveryIssue::SendFailed {
                                         message_id: message_id(&local_signing_pub, entry.sequence),
@@ -404,6 +412,15 @@ fn sender_loop<T: crate::relay::Severable>(
                     }
                 }
             }
+        }
+
+        if removed_any {
+            // Best-effort (logged on failure): rows are already deleted
+            // logically; this only hurries the physical erasure.
+            op_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .checkpoint_wal();
         }
 
         kick.wait(config.poll);

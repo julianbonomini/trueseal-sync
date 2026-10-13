@@ -280,9 +280,6 @@ fn destroy_group_commit_failure_changes_nothing() {
         fn append_entry(&mut self, entry: LogEntry) {
             self.inner.append_entry(entry);
         }
-        fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64) {
-            self.inner.mark_delivered(object_id, sequence);
-        }
         fn remove(&mut self, object_id: &[u8; 32], sequence: u64) {
             self.inner.remove(object_id, sequence);
         }
@@ -1177,7 +1174,9 @@ fn destroy_partially_drained_restart_resumes_and_completes_once() {
             ],
         })
         .expect("stage destroying");
-        log.mark_delivered(&o1.public_key().0, 7);
+        // o1's Revoke was relay-accepted before the crash: acceptance
+        // DELETES the row (SYNC-14, #106), it is never flagged-kept.
+        log.remove(&o1.public_key().0, 7);
     }
 
     // Restart over the same store with a working relay that Acks pushes.

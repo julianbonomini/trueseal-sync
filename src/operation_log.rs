@@ -97,8 +97,11 @@ pub struct LogEntry {
 ///   conflict resolution is the caller's concern, not the log's).
 /// - `entries_from` returns all entries for an Object with sequence >= the given
 ///   value, in ascending sequence order.
-/// - `mark_delivered` marks an entry as confirmed delivered to the Relay.
-///   Entries start as undelivered. The session calls this after a successful push.
+/// - Relay acceptance DELETES the entry (`remove`) — there is no
+///   "delivered but kept" state. A mark-delivered operation existed before
+///   SYNC-14 (#106) and was removed so no caller can leave an accepted
+///   entry's body retained under a flag; the `delivered` column/field is
+///   vestigial, kept only to avoid a schema migration.
 /// - `undelivered_entries` returns all entries not yet confirmed delivered,
 ///   sorted by global sequence ascending — the correct replay order for the outbox.
 /// - v0 uses an in-memory backend (`MemLog`).
@@ -128,11 +131,13 @@ pub trait OperationLog: Send {
             blob: encoded_message,
         });
     }
-    fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64);
-    /// Permanently delete one entry. Used to drop entries that can never be
-    /// delivered (e.g. over the Protocol Size Limit, ADR-0025) — unlike
-    /// `mark_delivered`, the entry is gone, not just confirmed.
+    /// Permanently delete one entry. This is what relay acceptance does
+    /// (ADR-0026), and it also drops entries that can never be delivered
+    /// (e.g. over the Protocol Size Limit, ADR-0025).
     fn remove(&mut self, object_id: &[u8; 32], sequence: u64);
+    /// Persisted backends hurry the physical erasure of removed rows
+    /// (WAL truncate, SYNC-14 #106). In-memory backends have nothing to do.
+    fn checkpoint_wal(&self) {}
     /// Returns undelivered entries sorted by global sequence ascending.
     fn undelivered_entries(&self) -> Vec<LogEntry>;
     fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<LogEntry>;
@@ -331,14 +336,6 @@ impl OperationLog for MemLog {
             });
     }
 
-    fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64) {
-        if let Some(map) = self.inner.get_mut(object_id) {
-            if let Some(entry) = map.get_mut(&sequence) {
-                entry.delivered = true;
-            }
-        }
-    }
-
     fn remove(&mut self, object_id: &[u8; 32], sequence: u64) {
         if let Some(map) = self.inner.get_mut(object_id) {
             map.remove(&sequence);
@@ -518,6 +515,17 @@ impl OperationLog for MemLog {
 mod tests {
     use super::*;
 
+    /// Production never sets the delivered flag anymore — relay acceptance
+    /// DELETES the row (SYNC-14, #106). Tests that exercise the vestigial
+    /// flag's filtering set it directly.
+    fn mark_delivered_raw(log: &mut MemLog, object_id: &[u8; 32], sequence: u64) {
+        if let Some(map) = log.inner.get_mut(object_id) {
+            if let Some(entry) = map.get_mut(&sequence) {
+                entry.delivered = true;
+            }
+        }
+    }
+
     fn oid(b: u8) -> [u8; 32] {
         [b; 32]
     }
@@ -634,22 +642,22 @@ mod tests {
         assert_eq!(undelivered[0].blob, b"hello");
     }
 
-    /// mark_delivered removes an entry from undelivered_entries.
+    /// A delivered-flag entry is excluded from undelivered_entries.
     #[test]
-    fn mark_delivered_clears_from_outbox() {
+    fn delivered_flag_clears_from_outbox() {
         let mut log = MemLog::new();
         log.append(&oid(1), 0, b"hello".to_vec());
-        log.mark_delivered(&oid(1), 0);
+        mark_delivered_raw(&mut log, &oid(1), 0);
 
         assert!(log.undelivered_entries().is_empty());
     }
 
-    /// mark_delivered does not affect entries_from — delivery status is orthogonal.
+    /// The delivered flag does not affect entries_from — delivery status is orthogonal.
     #[test]
-    fn mark_delivered_does_not_affect_entries_from() {
+    fn delivered_flag_does_not_affect_entries_from() {
         let mut log = MemLog::new();
         log.append(&oid(1), 0, b"hello".to_vec());
-        log.mark_delivered(&oid(1), 0);
+        mark_delivered_raw(&mut log, &oid(1), 0);
 
         let entries = log.entries_from(&oid(1), 0);
         assert_eq!(entries.len(), 1);
@@ -663,7 +671,7 @@ mod tests {
         log.append(&oid(1), 0, b"a".to_vec());
         log.append(&oid(2), 0, b"b".to_vec());
         log.append(&oid(1), 1, b"c".to_vec());
-        log.mark_delivered(&oid(1), 0);
+        mark_delivered_raw(&mut log, &oid(1), 0);
 
         let undelivered = log.undelivered_entries();
         assert_eq!(undelivered.len(), 2);
@@ -689,14 +697,6 @@ mod tests {
         let undelivered = log.undelivered_entries();
         let seqs: Vec<u64> = undelivered.iter().map(|e| e.sequence).collect();
         assert_eq!(seqs, vec![0, 1, 2, 3], "must be sorted by global sequence");
-    }
-
-    /// mark_delivered on unknown (object_id, sequence) is a no-op.
-    #[test]
-    fn mark_delivered_unknown_entry_is_noop() {
-        let mut log = MemLog::new();
-        log.mark_delivered(&oid(99), 42);
-        assert!(log.undelivered_entries().is_empty());
     }
 
     /// The high-water mark survives deletion of the row that consumed the
@@ -787,7 +787,7 @@ mod tests {
         log.append(&oid(1), 5, b"c".to_vec());
         assert_eq!(log.max_sequence(), Some(7));
 
-        log.mark_delivered(&oid(2), 7);
+        mark_delivered_raw(&mut log, &oid(2), 7);
         // Delivered entries still count toward max_sequence.
         assert_eq!(log.max_sequence(), Some(7));
     }

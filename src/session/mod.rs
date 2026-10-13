@@ -641,6 +641,11 @@ fn drop_oversize_outbox_entries(
         for (sequence, object_id) in &oversized {
             log.remove(object_id, *sequence);
         }
+        if !oversized.is_empty() {
+            // SYNC-14 (#106): oversize bodies were just deleted; truncate
+            // the WAL so they stop existing on disk promptly. Best-effort.
+            log.checkpoint_wal();
+        }
         oversized
     };
     if oversized.is_empty() {

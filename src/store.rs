@@ -28,6 +28,52 @@ fn kind_from_db(v: i64) -> OutboxKind {
     }
 }
 
+/// Exclude a store file from platform backups (SYNC-14, #106).
+///
+/// iOS/macOS: `NSURLIsExcludedFromBackupKey` is persisted as exactly this
+/// xattr; writing it directly keeps the core free of an Objective-C
+/// dependency and covers every SDK that routes its store through `open`.
+/// Android and Node are NOT yet covered: the Kotlin SDK's no-backup
+/// storage + backup rules and the TS README guidance are tracked for the
+/// SDK phase (SYNC-14 / SDK-1 tasks) — as of this change the Kotlin SDK
+/// stores under `filesDir`, which Android Auto Backup includes. Do not
+/// claim their exclusion until those land.
+/// Best-effort by contract: callers never fail an open over this.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn exclude_from_backup(path: &Path) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    const NAME: &[u8] = b"com.apple.metadata:com_apple_backup_excludeItem\0";
+    const VALUE: &[u8] = b"com.apple.backup";
+
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        return; // a path with an interior NUL cannot be excluded; not fatal
+    };
+    // SAFETY: c_path and NAME are valid NUL-terminated strings, VALUE points
+    // at VALUE.len() readable bytes, position 0 and flags 0 are plain set.
+    let rc = unsafe {
+        libc::setxattr(
+            c_path.as_ptr(),
+            NAME.as_ptr().cast::<libc::c_char>(),
+            VALUE.as_ptr().cast::<libc::c_void>(),
+            VALUE.len(),
+            0,
+            0,
+        )
+    };
+    if rc != 0 {
+        warn!(
+            "[trueseal-sync] could not exclude {} from backups: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn exclude_from_backup(_path: &Path) {}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlite error: {0}")]
@@ -300,11 +346,14 @@ fn run_migrations(
 ///   them), and to the held-manifest history rows. Ed25519 is
 ///   deterministic, so the stored copy re-signs to identical bytes.
 ///
-/// Only UNDELIVERED rows are re-signed: a delivered row's hash may already
-/// be installed at peers. (A crash between relay-accept and the delivered
-/// flag can leave an accepted row flagged undelivered; re-signing it costs
-/// a duplicate-hash race the (version, hash) tie-break and the issuer's
-/// bounded re-application converge — accepted edge.)
+/// Only UNDELIVERED rows are re-signed. Relay acceptance DELETES the row
+/// (ADR-0026), so a delivered row's hash is already installed at peers and
+/// its bytes are gone locally. (A crash between relay-accept and the row
+/// delete can leave an accepted row still flagged undelivered; re-signing
+/// it costs a duplicate-hash race the (version, hash) tie-break and the
+/// issuer's bounded re-application converge — accepted edge. The
+/// `delivered` column is vestigial since SYNC-5 — kept only so no schema
+/// migration is needed — and the filter below keeps any such row pinned.)
 ///
 /// Pending Membership Change carriers are deliberately NOT remapped: their
 /// encoding is session-owned, and a stale carrier costs at worst one
@@ -566,7 +615,10 @@ impl Store {
 
         // ── 2. Read-write open; every change below is transactional. ───────
         let mut conn = rusqlite::Connection::open(&path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+        // WAL for crash safety; secure_delete so a removed outbox row's
+        // bytes are zeroed on the freed pages instead of lingering in the
+        // database file (SYNC-14, #106 — data-at-rest hygiene).
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA secure_delete=ON;")?;
 
         match decision {
             Decision::Fresh => {
@@ -615,7 +667,27 @@ impl Store {
             reseal_outbox_for_e2e_bump(&mut conn, current_e2e)?;
         }
 
+        // SYNC-14 (#106): the store holds identity secrets — keep it out of
+        // platform backups. Best-effort and never fatal: a backup attribute
+        // must not be able to break an open.
+        exclude_from_backup(&path);
+        for sidecar in [path.with_extension("db-wal"), path.with_extension("db-shm")] {
+            if sidecar.exists() {
+                exclude_from_backup(&sidecar);
+            }
+        }
+
         Ok((Self { conn }, outcome))
+    }
+
+    /// Truncate the WAL after outbox rows were removed (SYNC-14, #106), so
+    /// the accepted entries' sealed bodies stop existing on disk promptly
+    /// instead of waiting for the automatic checkpoint. Best-effort: a busy
+    /// checkpoint (another connection reading) is retried on the next pass.
+    pub fn checkpoint_wal(&self) {
+        if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+            warn!("[trueseal-sync] wal checkpoint after outbox removal failed: {e}");
+        }
     }
 
     /// Wipe all data from all tables.
@@ -631,6 +703,9 @@ impl Store {
         // sequence high-water mark included, goes.
         self.conn
             .execute_batch(&format!("BEGIN; {WIPE_DATA_SQL} COMMIT;"))?;
+        // SYNC-14 (#106): outbox bodies were just deleted; truncate the
+        // WAL so they stop existing on disk promptly. Best-effort.
+        self.checkpoint_wal();
         Ok(())
     }
 
@@ -798,15 +873,11 @@ impl OperationLog for PersistentLog {
         }
     }
 
-    fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64) {
-        if let Err(e) = self.store.conn.execute(
-            "UPDATE outbox SET delivered = 1
-             WHERE object_id = ?1 AND sequence = ?2",
-            rusqlite::params![object_id.as_slice(), sequence as i64],
-        ) {
-            warn!("[trueseal-sync] outbox mark_delivered failed (seq={sequence}): {e}");
-        }
-    }
+    // There is deliberately no mark_delivered: relay acceptance DELETES the
+    // outbox row (ADR-0026, SYNC-5), so no code path may leave an accepted
+    // entry's sealed body on disk under a delivered flag (SYNC-14, #106).
+    // Tests that need a delivered-flag row (e.g. for the re-seal filter)
+    // set it with raw SQL.
 
     fn remove(&mut self, object_id: &[u8; 32], sequence: u64) {
         if let Err(e) = self.store.conn.execute(
@@ -815,6 +886,10 @@ impl OperationLog for PersistentLog {
         ) {
             warn!("[trueseal-sync] outbox remove failed (seq={sequence}): {e}");
         }
+    }
+
+    fn checkpoint_wal(&self) {
+        self.store.checkpoint_wal();
     }
 
     fn undelivered_entries(&self) -> Vec<LogEntry> {
@@ -1094,7 +1169,13 @@ impl OperationLog for PersistentLog {
             }
             tx.commit()
         })();
-        result.map_err(|e| format!("commit_membership failed: {e}"))
+        let result = result.map_err(|e| format!("commit_membership failed: {e}"));
+        if result.is_ok() && drop_sync_outbox {
+            // SYNC-14 (#106): the destroy-flow Sync-delete removed bodies;
+            // truncate the WAL so they stop existing on disk promptly.
+            self.store.checkpoint_wal();
+        }
+        result
     }
 
     fn pending_membership_changes(&self) -> Option<Vec<u8>> {
@@ -1166,7 +1247,11 @@ impl OperationLog for PersistentLog {
              COMMIT;",
         ) {
             warn!("[trueseal-sync] wipe_group_state failed: {e}");
+            return;
         }
+        // SYNC-14 (#106): outbox bodies were just deleted; truncate the WAL
+        // so they stop existing on disk promptly. Best-effort.
+        self.store.checkpoint_wal();
     }
 }
 
@@ -1301,7 +1386,7 @@ mod tests {
         assert_eq!(entries[2].blob, b"third");
     }
 
-    /// Marking an entry delivered removes it from undelivered but keeps it in entries_from.
+    /// A delivered-flag entry is excluded from undelivered_entries but kept in entries_from.
     #[test]
     fn remove_outbox_entry_leaves_others() {
         let dir = tmp_dir();
@@ -1309,7 +1394,7 @@ mod tests {
         let mut log = PersistentLog::new(s);
         log.append(&[1u8; 32], 0, b"keep".to_vec());
         log.append(&[1u8; 32], 1, b"deliver".to_vec());
-        log.mark_delivered(&[1u8; 32], 1);
+        set_delivered(&log, &[1u8; 32], 1);
         let undelivered = log.undelivered_entries();
         assert_eq!(undelivered.len(), 1);
         assert_eq!(undelivered[0].blob, b"keep");
@@ -1330,6 +1415,20 @@ mod tests {
     // ── PersistentLog tests ────────────────────────────────────────────────────
 
     use crate::operation_log::OperationLog;
+
+    /// Production never sets the delivered flag anymore — relay acceptance
+    /// DELETES the row (SYNC-14, #106). Tests that exercise the vestigial
+    /// flag (it still gates the re-seal filter) set it with raw SQL.
+    fn set_delivered(log: &PersistentLog, object_id: &[u8; 32], sequence: u64) {
+        log.store
+            .conn
+            .execute(
+                "UPDATE outbox SET delivered = 1
+                 WHERE object_id = ?1 AND sequence = ?2",
+                rusqlite::params![object_id.as_slice(), sequence as i64],
+            )
+            .expect("set delivered");
+    }
 
     fn oid(b: u8) -> [u8; 32] {
         [b; 32]
@@ -1391,25 +1490,25 @@ mod tests {
         assert_eq!(seqs, vec![1, 2, 3]);
     }
 
-    /// mark_delivered removes an entry from undelivered_entries.
+    /// A delivered-flag entry is excluded from undelivered_entries.
     #[test]
-    fn persistent_log_mark_delivered_clears_from_outbox() {
+    fn persistent_log_delivered_flag_clears_from_outbox() {
         let dir = tmp_dir();
         let s = Store::open(dir.path(), "ns").expect("open");
         let mut log = PersistentLog::new(s);
         log.append(&oid(1), 0, b"msg".to_vec());
-        log.mark_delivered(&oid(1), 0);
+        set_delivered(&log, &oid(1), 0);
         assert!(log.undelivered_entries().is_empty());
     }
 
-    /// mark_delivered does not remove entry from entries_from.
+    /// The delivered flag does not remove an entry from entries_from.
     #[test]
-    fn persistent_log_mark_delivered_does_not_affect_entries_from() {
+    fn persistent_log_delivered_flag_does_not_affect_entries_from() {
         let dir = tmp_dir();
         let s = Store::open(dir.path(), "ns").expect("open");
         let mut log = PersistentLog::new(s);
         log.append(&oid(1), 0, b"msg".to_vec());
-        log.mark_delivered(&oid(1), 0);
+        set_delivered(&log, &oid(1), 0);
         let entries = log.entries_from(&oid(1), 0);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].blob, b"msg");
@@ -1976,7 +2075,7 @@ mod tests {
             created_at: now_secs(),
             blob: b"sync-delivered".to_vec(),
         });
-        log.mark_delivered(&oid(1), 2);
+        set_delivered(&log, &oid(1), 2);
         log.commit_membership(MembershipCommit {
             manifest: b"m1".to_vec(),
             held: vec![([1u8; 32], true)],
@@ -2077,9 +2176,123 @@ mod tests {
         // Max across all objects, delivered or not
         assert_eq!(log.max_sequence(), Some(7));
 
-        log.mark_delivered(&oid(2), 7);
-        // Still 7 even after marking delivered
+        set_delivered(&log, &oid(2), 7);
+        // Still 7 even with the delivered flag set
         assert_eq!(log.max_sequence(), Some(7));
+    }
+
+    // ── SYNC-14 (#106): data at rest ─────────────────────────────────────
+
+    /// The database zeroes freed content (secure_delete), so a removed
+    /// outbox row's sealed body stops existing on the freed pages.
+    #[test]
+    fn secure_delete_pragma_is_on() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let v: i64 = s
+            .conn
+            .query_row("PRAGMA secure_delete", [], |r| r.get(0))
+            .expect("pragma");
+        assert_eq!(v, 1, "secure_delete must be ON (SYNC-14, #106)");
+    }
+
+    /// Completion criterion (#106): after the Relay accepts a push the row
+    /// is deleted (what the pump does on Ok), and after the WAL checkpoint
+    /// the sealed body's bytes exist in NO store file.
+    #[test]
+    fn accepted_outbox_entry_leaves_no_body_bytes_on_disk() {
+        fn assert_no_store_file_contains(dir: &Path, marker: &[u8], phase: &str) {
+            let mut scanned = 0;
+            for entry in std::fs::read_dir(dir).expect("read dir") {
+                let path = entry.expect("entry").path();
+                let bytes = std::fs::read(&path).expect("read file");
+                scanned += 1;
+                assert!(
+                    !bytes.windows(marker.len()).any(|w| w == marker),
+                    "accepted body bytes must not linger in {} ({})",
+                    path.display(),
+                    phase
+                );
+            }
+            assert!(scanned > 0, "the store directory was scanned ({phase})");
+        }
+
+        let dir = tmp_dir();
+        // Long and distinctive: cannot occur in schema, bookkeeping or the
+        // other rows, and spans any partial-write window.
+        let marker: Vec<u8> = b"SYNC14-BODY-MARKER-7f3a9c1e-unique-bytes!!".repeat(4);
+        {
+            let s = Store::open(dir.path(), "ns").expect("open");
+            let mut log = PersistentLog::new(s);
+            log.append(&oid(7), 1, marker.clone());
+            assert_eq!(log.undelivered_entries()[0].blob, marker, "body stored");
+            // Relay acceptance, exactly what the pump does on Ok.
+            log.remove(&oid(7), 1);
+            assert!(log.undelivered_entries().is_empty());
+            // What the pump does at the end of a pass that removed rows.
+            log.checkpoint_wal();
+            // Scan WHILE THE STORE IS STILL OPEN: the truncated-but-present
+            // -wal file is exercised — a regression that stops truncating
+            // leaves the marker in it and fails here, rather than being
+            // vacuously passed after a clean close removes the file.
+            assert_no_store_file_contains(dir.path(), &marker, "store open");
+        }
+        // And after a clean close, for good measure.
+        assert_no_store_file_contains(dir.path(), &marker, "store closed");
+    }
+
+    /// Completion criterion (#106): entries the Relay has NOT accepted
+    /// still replay after a restart.
+    #[test]
+    fn unaccepted_entries_replay_after_restart() {
+        let dir = tmp_dir();
+        {
+            let s = Store::open(dir.path(), "ns").expect("open");
+            let mut log = PersistentLog::new(s);
+            log.append(&oid(1), 1, b"accepted".to_vec());
+            log.append(&oid(2), 2, b"not-yet-accepted".to_vec());
+            log.remove(&oid(1), 1); // the first was relay-accepted
+        }
+        let s = Store::open(dir.path(), "ns").expect("reopen");
+        let log = PersistentLog::new(s);
+        let entries = log.undelivered_entries();
+        assert_eq!(
+            entries.len(),
+            1,
+            "the unaccepted entry survives the restart"
+        );
+        assert_eq!(entries[0].blob, b"not-yet-accepted");
+    }
+
+    /// Completion criterion (#106): on Apple platforms the store file is
+    /// marked excluded from iCloud/iTunes backups at open. (Android and
+    /// Node exclusion is SDK-side, tracked for the SDK phase — not yet
+    /// shipped, so this criterion's remaining half lives in the SDK tasks.)
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[test]
+    fn store_is_excluded_from_backup() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = tmp_dir();
+        let _s = Store::open(dir.path(), "ns").expect("open");
+        let path = dir.path().join("trueseal_ns.db");
+        let c_path = CString::new(path.as_os_str().as_bytes()).expect("cstring");
+        let name = b"com.apple.metadata:com_apple_backup_excludeItem\0";
+        let mut buf = [0u8; 64];
+        // SAFETY: valid NUL-terminated pointers; buf is 64 writable bytes.
+        let n = unsafe {
+            libc::getxattr(
+                c_path.as_ptr(),
+                name.as_ptr().cast::<libc::c_char>(),
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+                0,
+                0,
+            )
+        };
+        assert!(n > 0, "backup-exclusion xattr must be set (SYNC-14, #106)");
+        assert_eq!(&buf[..n as usize], b"com.apple.backup");
     }
 }
 
