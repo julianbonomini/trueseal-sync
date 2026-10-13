@@ -1,0 +1,43 @@
+{
+  "description": "The canonical TrueSeal FFI surface (ADR-0028, amended by ADR-0032 and ADR-0034). Generated from src/ffi.rs and kept in lockstep by ffi::tests::the_error_enum_is_exactly_the_canonical_14. The G12 parity check compares errors/events/issues across the three SDKs against this file; SYNC-21 (Shared Facts) will generate it from the core.",
+  "errors": [
+    "invalidRelayAddress",
+    "invalidNamespace",
+    "storage",
+    "closed",
+    "notMember",
+    "alreadyInGroup",
+    "invalidPairingToken",
+    "pairingClosed",
+    "groupFull",
+    "memberNotFound",
+    "payloadTooLarge",
+    "messageHandlerAlreadySet",
+    "storeTooNew",
+    "manifestVersionExhausted"
+  ],
+  "events": [
+    "statusChanged",
+    "membersChanged",
+    "joinRequest",
+    "connectionChanged",
+    "admissionDropped"
+  ],
+  "statusReasons": ["created", "joined", "left", "removed", "destroyed", "storeReset"],
+  "statuses": ["notJoined", "pendingJoin", "member", "leaving", "destroying"],
+  "connectionStates": ["connecting", "connected", "disconnected", "relayVersionUnsupported"],
+  "deliveryIssues": [
+    "unreadable",
+    "unauthorized",
+    "heldForUpgrade",
+    "handlerGaveUp",
+    "sendFailed"
+  ],
+  "unreadableReasons": ["malformed", "senderOutdated", "expired", "droppedWhileHeld"],
+  "sendFailedReasons": ["tooLarge", "malformed", "expired"],
+  "admissionDropReasons": ["groupFull"],
+  "limits": {
+    "maxPayloadBytes": 61440,
+    "maxGroupSize": 32
+  }
+}

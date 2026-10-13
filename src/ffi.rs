@@ -1,74 +1,127 @@
 // FFI surface for Swift and Kotlin via UniFFI (proc-macro mode).
 //
-// Exposes a single `TruesealFfiSession` object over TCP transport.
-// All key material crosses the boundary as `Vec<u8>`; wrong-length inputs
-// return `SessionError` — no silent failures.
+// The canonical TrueSeal API (ADR-0028, amended by ADR-0032 and ADR-0034):
+// one `TrueSeal` entry type, one awaited async message handler, one event
+// listener, one delivery-issue listener, the 14 typed errors, `close()`,
+// Relay Address parsing, and the version/limits constants. Every SDK is a
+// thin wrapper over this surface — behaviour lives in the core, not here.
 
 use std::net::TcpStream;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use crate::device::DeviceKeypair;
-use crate::keys::NoisePublicKey;
 use crate::member::{member_id, member_name};
 use crate::message::Message;
-use crate::session::{SessionError as CoreSessionError, TruesealSession};
+use crate::relay_address::RelayAddress as ParsedRelayAddress;
+use crate::session::{
+    ConnectionChange, ExitReason, GroupStatus as CoreGroupStatus, SessionError as CoreSessionError,
+    TruesealSession,
+};
 use crate::store::{PersistentLog, Store};
 
-// ── Error ─────────────────────────────────────────────────────────────────────
+// ── Errors ─────────────────────────────────────────────────────────────────────
 
+/// The canonical error set (ADR-0028 as amended by ADR-0032 and SYNC-15):
+/// exactly these 14 cases cross the FFI. There is no catch-all; a store
+/// failure is never reported as `invalidNamespace`.
+///
+/// All 14 cases are named in `docs/api-surface.json` for the G12 parity
+/// check, with a test keeping that file in lockstep with this enum.
 #[derive(Debug, thiserror::Error, uniffi::Error)]
-pub enum SessionError {
-    #[error("invalid key length: expected {expected} bytes, got {got}")]
-    InvalidKeyLength { expected: u32, got: u32 },
-    #[error("invalid relay public key")]
-    InvalidRelayPublicKey,
+pub enum TrueSealError {
+    /// The Relay Address string is malformed (ADR-0028). Nothing was dialed.
+    #[error("invalid relay address: {msg}")]
+    InvalidRelayAddress { msg: String },
+    /// The namespace is empty or outside `[a-zA-Z0-9_-]+`.
     #[error("invalid namespace: {msg}")]
     InvalidNamespace { msg: String },
-    #[error("push failed: {msg}")]
-    PushFailed { msg: String },
-    #[error("invalid pairing token")]
-    InvalidToken,
-    #[error("not in any group")]
-    NotInGroup,
-    #[error("member not found")]
-    MemberNotFound,
-    #[error("group has been destroyed")]
-    GroupDestroyed,
-    /// The relay refused our Transport Version and reported the range it
-    /// supports (ADR-0022). Outbox entries stay queued.
-    #[error("relay supports Transport Version {min}..={max}")]
-    RelayVersionUnsupported { min: u32, max: u32 },
-    /// The `Sync` body exceeds the payload limit — at most the Protocol
-    /// Size Limit of 61,440 bytes (ADR-0025; `payloadTooLarge{max}` in
-    /// ADR-0028's error list). The body was never queued. Permanent — a
-    /// retry with the same body fails the same way.
-    #[error("payload too large: maximum {max} bytes")]
-    PayloadTooLarge { max: u32 },
-    /// The current manifest's version cannot be incremented — issuing would
-    /// produce `u64::MAX`, which receivers reject (SYNC-10, ADR-0027).
-    /// Membership is exhausted; the group's Devices must pair again.
-    #[error("manifest version exhausted: cannot issue a new version")]
-    ManifestVersionExhausted,
-    /// `joinGroup` while already holding a Group Manifest — one Sync Group
-    /// per namespace (ADR-0023; `alreadyInGroup` in ADR-0028's error list).
-    #[error("already in a group")]
-    AlreadyInGroup,
     /// A durable write failed — the operation did not commit and no
     /// in-memory state changed. The caller may retry.
-    #[error("store write failed: {msg}")]
-    StoreFailed { msg: String },
-    /// The admission would exceed the Maximum Group Size (32, ADR-0027;
-    /// `groupFull{max}` in ADR-0028's error list). The Pairing Window
-    /// stays open.
+    #[error("storage failure: {msg}")]
+    Storage { msg: String },
+    /// The object was closed (`close()`, ADR-0028). Every call after
+    /// `close()` fails with this; Session State is kept on disk.
+    #[error("closed")]
+    Closed,
+    /// The operation needs group membership the device does not currently
+    /// hold — sending while `notJoined`, `pendingJoin`, `leaving` or
+    /// `destroying`, for example (ADR-0026/0027/0029). Carries the status
+    /// the call saw.
+    #[error("not a member (status: {status:?})")]
+    NotMember { status: GroupStatus },
+    /// `join()` while this device already holds a Group Manifest — one
+    /// Sync Group per namespace (ADR-0023).
+    #[error("already in a group")]
+    AlreadyInGroup,
+    /// The Pairing Token is malformed or predates the Pairing Secret
+    /// (ADR-0023).
+    #[error("invalid pairing token")]
+    InvalidPairingToken,
+    /// The Pairing Window is closed, or the Join Request ID is unknown
+    /// (an unaccepted request disappears when the window closes,
+    /// ADR-0023). Also: admission attempted while `leaving` or from a
+    /// view that excludes the local device.
+    #[error("pairing window is closed")]
+    PairingClosed,
+    /// The admission would exceed the Maximum Group Size (ADR-0027).
+    /// The Pairing Window stays open.
     #[error("group is full: maximum {max} members")]
     GroupFull { max: u32 },
+    /// No member with that ID in the current manifest.
+    #[error("member not found")]
+    MemberNotFound,
+    /// The `Sync` body exceeds the payload limit (ADR-0025). The body was
+    /// never queued and no Sequence was consumed. Permanent — a retry
+    /// with the same body fails the same way.
+    #[error("payload too large: maximum {max} bytes")]
+    PayloadTooLarge { max: u32 },
+    /// A second `onMessage` registration (ADR-0026: one handler).
+    #[error("message handler already set")]
+    MessageHandlerAlreadySet,
     /// The store was written by a newer release (a rollback) and is
-    /// refused, unmodified — upgrade the SDK (ADR-0032; the 13th error
-    /// case `storeTooNew` in ADR-0028's list).
+    /// refused, unmodified — upgrade the SDK (ADR-0032).
     #[error("store was written by a newer release (store version {found}; this build supports up to {supported})")]
     StoreTooNew { found: u32, supported: u32 },
+    /// The group's manifest version space is exhausted (the next version
+    /// could never be accepted — ADR-0027, SYNC-10). The group's Devices
+    /// must pair again. (14th case, added by SYNC-15 with the ADR-0028
+    /// amendment — the ADR's list predates SYNC-10.)
+    #[error("manifest version exhausted: the group must re-pair")]
+    ManifestVersionExhausted,
 }
+
+/// Map a core error onto the canonical taxonomy. `status` is the Group
+/// Status the caller observed, for the `notMember{status}` cases.
+fn map_core_error(e: CoreSessionError, status: GroupStatus) -> TrueSealError {
+    match e {
+        CoreSessionError::InvalidToken => TrueSealError::InvalidPairingToken,
+        CoreSessionError::AlreadyInGroup => TrueSealError::AlreadyInGroup,
+        CoreSessionError::MemberNotFound => TrueSealError::MemberNotFound,
+        CoreSessionError::GroupFull { max } => TrueSealError::GroupFull { max },
+        CoreSessionError::PayloadTooLarge { max } => TrueSealError::PayloadTooLarge { max },
+        CoreSessionError::ManifestVersionExhausted => TrueSealError::ManifestVersionExhausted,
+        CoreSessionError::Closed => TrueSealError::Closed,
+        CoreSessionError::NotInGroup => TrueSealError::NotMember { status },
+        CoreSessionError::GroupDestroyed => TrueSealError::NotMember { status },
+        CoreSessionError::Store(msg) => TrueSealError::Storage { msg },
+        // Unreachable from the canonical surface: keypair bytes never cross
+        // the FFI, and since the delivery contract (SYNC-5) every send is a
+        // durable queue write — the background pump owns dialing, so
+        // connection/push failures and the Transport Version refusal reach
+        // the app as connection events and delivery issues, never here.
+        other => {
+            log::error!("[trueseal-sync] unexpected core error on the FFI surface: {other}");
+            TrueSealError::Storage {
+                msg: format!("internal: {other}"),
+            }
+        }
+    }
+}
+
+// ── State enums ───────────────────────────────────────────────────────────────
 
 /// Where the local Device stands in its namespace's Sync Group (ADR-0023,
 /// ADR-0027, ADR-0028).
@@ -80,64 +133,123 @@ pub enum GroupStatus {
     PendingJoin,
     /// Holds a Group Manifest.
     Member,
-    /// Issued a Leave and waiting for the Relay to accept every push of
-    /// it; then the device wipes, rotates its identity and returns to
-    /// `NotJoined` (ADR-0027).
+    /// Issued a Leave; waiting for the Relay to accept every push of it
+    /// (ADR-0027).
     Leaving,
-    /// Started or received Destroy Group and waiting for the Relay to
-    /// accept every queued Revoke; then the device wipes, rotates its
-    /// identity and returns to `NotJoined` (ADR-0029).
+    /// Started or received Destroy Group; waiting for the Relay to accept
+    /// every queued Revoke (ADR-0029).
     Destroying,
 }
 
-impl From<crate::session::GroupStatus> for GroupStatus {
-    fn from(s: crate::session::GroupStatus) -> Self {
+impl From<CoreGroupStatus> for GroupStatus {
+    fn from(s: CoreGroupStatus) -> Self {
         match s {
-            crate::session::GroupStatus::NotJoined => GroupStatus::NotJoined,
-            crate::session::GroupStatus::PendingJoin => GroupStatus::PendingJoin,
-            crate::session::GroupStatus::Member => GroupStatus::Member,
-            crate::session::GroupStatus::Leaving => GroupStatus::Leaving,
-            crate::session::GroupStatus::Destroying => GroupStatus::Destroying,
+            CoreGroupStatus::NotJoined => GroupStatus::NotJoined,
+            CoreGroupStatus::PendingJoin => GroupStatus::PendingJoin,
+            CoreGroupStatus::Member => GroupStatus::Member,
+            CoreGroupStatus::Leaving => GroupStatus::Leaving,
+            CoreGroupStatus::Destroying => GroupStatus::Destroying,
         }
     }
 }
 
-impl From<CoreSessionError> for SessionError {
-    fn from(e: CoreSessionError) -> Self {
-        match e {
-            CoreSessionError::ConnectionFailed(msg) => SessionError::PushFailed { msg },
-            CoreSessionError::PushFailed(msg) => SessionError::PushFailed { msg },
-            CoreSessionError::NotInGroup => SessionError::NotInGroup,
-            CoreSessionError::InvalidKeypairBytes => SessionError::InvalidKeyLength {
-                expected: 64,
-                got: 0,
-            },
-            CoreSessionError::InvalidToken => SessionError::InvalidToken,
-            CoreSessionError::MemberNotFound => SessionError::MemberNotFound,
-            CoreSessionError::GroupDestroyed => SessionError::GroupDestroyed,
-            CoreSessionError::RelayVersionUnsupported { min, max } => {
-                SessionError::RelayVersionUnsupported { min, max }
+/// Why the status changed (ADR-0028). `statusChanged` fires only for the
+/// asynchronous transitions — the ones the caller could not otherwise
+/// observe; the synchronous ones (`join` → `pendingJoin`, `leave` →
+/// `leaving`, `destroyGroup` → `destroying`) are knowable from the call
+/// itself and the `status` getter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum StatusReason {
+    /// This device created the group (its admission produced the genesis
+    /// manifest).
+    Created,
+    /// This device was admitted — its Pending Join's first manifest
+    /// arrived (ADR-0023).
+    Joined,
+    /// The device's own Leave completed (ADR-0027).
+    Left,
+    /// Another member removed this device (ADR-0027).
+    Removed,
+    /// Destroy Group completed (ADR-0029).
+    Destroyed,
+    /// The store was unmigratable and automatically reset (ADR-0032).
+    StoreReset,
+}
+
+/// The relay link state (ADR-0028 `connection`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ConnectionState {
+    /// Never connected since `open()`. The library connects in the
+    /// background; this is the initial value of the `connection` getter,
+    /// never an event.
+    Connecting,
+    /// The Receive Session is up.
+    Connected,
+    /// The Receive Session dropped; the library reconnects automatically.
+    Disconnected,
+    /// The Relay refused our Transport Version and reported the range it
+    /// supports (ADR-0022). The outbox stays queued and the library keeps
+    /// retrying in case the Relay is upgraded.
+    RelayVersionUnsupported { min: u32, max: u32 },
+}
+
+impl From<ConnectionChange> for ConnectionState {
+    fn from(c: ConnectionChange) -> Self {
+        match c {
+            ConnectionChange::Connected => ConnectionState::Connected,
+            ConnectionChange::Disconnected => ConnectionState::Disconnected,
+            ConnectionChange::RelayVersionUnsupported { min, max } => {
+                ConnectionState::RelayVersionUnsupported { min, max }
             }
-            CoreSessionError::PayloadTooLarge { max } => SessionError::PayloadTooLarge { max },
-            CoreSessionError::ManifestVersionExhausted => SessionError::ManifestVersionExhausted,
-            CoreSessionError::AlreadyInGroup => SessionError::AlreadyInGroup,
-            CoreSessionError::Store(msg) => SessionError::StoreFailed { msg },
-            CoreSessionError::GroupFull { max } => SessionError::GroupFull { max },
-            // The canonical reshape (SYNC-15) makes `closed` a first-class
-            // typed case; until the new surface lands, map it honestly
-            // rather than into the PushFailed catch-all.
-            CoreSessionError::Closed => SessionError::PushFailed {
-                msg: "session is closed".into(),
-            },
         }
     }
 }
 
-// ── Version info ──────────────────────────────────────────────────────────────
+// ── Value types ───────────────────────────────────────────────────────────────
 
-/// Version triple reported by every TrueSeal SDK (ADR-0022, ADR-0030 §Reporting).
-/// `transport_version` and `end_to_end_version` come from the core constants —
-/// the single source of truth. `sdk_version` is this crate's package version.
+/// A group member (ADR-0028). `id` is stable and opaque, derived from the
+/// member's signing public key; `name` is auto-generated from the key.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct Member {
+    pub id: String,
+    pub name: String,
+}
+
+/// A delivered `Sync` message (ADR-0026, ADR-0031).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TrueSealMessage {
+    /// Stable, opaque, derived from the author's signing key and the
+    /// Envelope Sequence. The same across relay re-delivery; a caller sees
+    /// it twice only if it crashed while handling the message.
+    pub id: String,
+    /// The sending member. `from.id` is the same identifier as in
+    /// `members` (ADR-0028).
+    pub from: Member,
+    /// The raw application payload.
+    pub body: Vec<u8>,
+}
+
+/// The admitter's view of a Pair that proved knowledge of the Pairing
+/// Secret (ADR-0023). Pass `id` back to `accept()` to admit the device.
+/// An unaccepted request disappears when the Pairing Window closes.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct JoinRequest {
+    pub id: String,
+    pub name: String,
+}
+
+/// The typed form of a Relay Address (ADR-0028). `open()` accepts either
+/// this or the string form.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RelayAddress {
+    pub host: String,
+    /// The relay's 32-byte X25519 public key.
+    pub public_key: Vec<u8>,
+    pub receive_port: u16,
+    pub push_port: u16,
+}
+
+/// Version triple reported by every TrueSeal SDK (ADR-0022, ADR-0030).
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct TruesealInfo {
     pub sdk_version: String,
@@ -145,8 +257,891 @@ pub struct TruesealInfo {
     pub end_to_end_version: u32,
 }
 
-/// The version triple for this build. Package versions imply nothing about
-/// wire compatibility — the two protocol versions are the authority.
+// ── Events ────────────────────────────────────────────────────────────────────
+
+/// Why an admission was dropped during membership convergence (ADR-0027).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum AdmissionDropReason {
+    /// Re-applying the admission would exceed the Maximum Group Size.
+    GroupFull,
+}
+
+/// The single event sum type (ADR-0028, as amended by ADR-0032). Delivered
+/// to every registered `onEvent` listener; events raised before the first
+/// listener registers are buffered and flushed to it.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum TrueSealEvent {
+    /// An asynchronous group-status transition (see [`StatusReason`] for
+    /// why synchronous transitions raise no event).
+    StatusChanged {
+        status: GroupStatus,
+        reason: StatusReason,
+    },
+    /// The whole current member list, not a delta (ADR-0027: membership
+    /// events can flicker while concurrent changes settle).
+    MembersChanged { members: Vec<Member> },
+    /// A device requested to join inside the open Pairing Window
+    /// (ADR-0023).
+    JoinRequest { request: JoinRequest },
+    /// The relay link transitioned.
+    ConnectionChanged { connection: ConnectionState },
+    /// A Pending Membership Change re-application was dropped
+    /// (ADR-0027). The joiner stays in Pending Join.
+    AdmissionDropped {
+        name: String,
+        reason: AdmissionDropReason,
+    },
+}
+
+// ── Delivery issues ───────────────────────────────────────────────────────────
+
+/// Why an incoming Blob was rejected as unreadable (ADR-0034 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum UnreadableReason {
+    /// Undecodable or unauthenticated bytes — including the refused
+    /// pre-version format.
+    Malformed,
+    /// The Blob carries an older End-to-End Version than this build
+    /// supports — the one reason an app can act on ("a device needs an
+    /// update").
+    SenderOutdated,
+    /// The message is older than the Replay Window.
+    Expired,
+    /// The oldest held newer-version Blob, dropped when the hold cap
+    /// overflowed (ADR-0022).
+    DroppedWhileHeld,
+}
+
+/// Why the library gave up sending an outgoing message (ADR-0034 §3).
+/// Every reason is permanent — the message is never retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum SendFailedReason {
+    /// The entry exceeds the Protocol Size Limit (ADR-0025).
+    TooLarge,
+    /// The Relay permanently refused the push (ADR-0026).
+    Malformed,
+    /// A `Sync` entry still undelivered 30 days after `send()`.
+    Expired,
+}
+
+/// A typed, device-local report that the library could not deliver or
+/// handle a message (ADR-0026/0034). Never sent to the other Device or the
+/// Relay. Observing issues is optional; the library already does the right
+/// thing. There is deliberately no `undeliverableAfterUpgrade` case
+/// (withdrawn by ADR-0034 — an upgrade re-seals the outbox instead).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum DeliveryIssue {
+    /// An incoming Blob was rejected and will never reach a handler.
+    Unreadable { reason: UnreadableReason },
+    /// An authenticated-but-unacceptable control message (an over-bound
+    /// manifest jump, an unknown issuer, ...). Acked and dropped
+    /// (ADR-0034 §3).
+    Unauthorized,
+    /// A Blob carries a newer End-to-End Version than this build supports;
+    /// it is held unacked on the Relay (up to the cap) so an upgrade
+    /// recovers it (ADR-0022).
+    HeldForUpgrade { version: u32 },
+    /// The app's message handler failed on all 5 attempts; the Blob was
+    /// acked and dropped (ADR-0026).
+    HandlerGaveUp { message_id: String, error: String },
+    /// An outgoing message was dropped without delivery. `message_id` is
+    /// the ID `send()` returned.
+    SendFailed {
+        message_id: String,
+        reason: SendFailedReason,
+    },
+}
+
+impl DeliveryIssue {
+    /// Route a core issue onto the canonical surface: `admissionDropped`
+    /// is an EVENT in ADR-0028's list, so it never reaches this stream.
+    fn from_core(issue: crate::delivery_issue::DeliveryIssue) -> Option<Self> {
+        use crate::delivery_issue as core;
+        match issue {
+            core::DeliveryIssue::Unreadable(reason) => Some(DeliveryIssue::Unreadable {
+                reason: match reason {
+                    core::UnreadableReason::Malformed => UnreadableReason::Malformed,
+                    core::UnreadableReason::SenderOutdated => UnreadableReason::SenderOutdated,
+                    core::UnreadableReason::Expired => UnreadableReason::Expired,
+                    core::UnreadableReason::DroppedWhileHeld => UnreadableReason::DroppedWhileHeld,
+                },
+            }),
+            core::DeliveryIssue::Unauthorized => Some(DeliveryIssue::Unauthorized),
+            core::DeliveryIssue::HeldForUpgrade(v) => {
+                Some(DeliveryIssue::HeldForUpgrade { version: v })
+            }
+            core::DeliveryIssue::HandlerGaveUp { message_id, error } => {
+                Some(DeliveryIssue::HandlerGaveUp { message_id, error })
+            }
+            core::DeliveryIssue::SendFailed { message_id, reason } => {
+                Some(DeliveryIssue::SendFailed {
+                    message_id,
+                    reason: match reason {
+                        core::SendFailedReason::TooLarge => SendFailedReason::TooLarge,
+                        core::SendFailedReason::Malformed => SendFailedReason::Malformed,
+                        core::SendFailedReason::Expired => SendFailedReason::Expired,
+                    },
+                })
+            }
+            // Routed to the event stream by the caller — never delivered here.
+            core::DeliveryIssue::AdmissionDropped { .. } => None,
+        }
+    }
+}
+
+// ── Callback interfaces ───────────────────────────────────────────────────────
+
+/// Thrown by the message handler to mark a delivery attempt failed
+/// (ADR-0026): the library retries 5 times with backoff, then acks, drops
+/// and reports `handlerGaveUp`. The Blob is acked only after the handler
+/// completes successfully.
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum HandlerError {
+    #[error("message handler failed: {msg}")]
+    Failed { msg: String },
+}
+
+/// THE message handler (ADR-0026/0028): one per object; registering it
+/// starts receiving. Async and awaited — the DeliverAck leaves the device
+/// only after it completes.
+#[uniffi::export(callback_interface)]
+#[async_trait::async_trait]
+pub trait TrueSealMessageHandler: Send + Sync {
+    async fn on_message(&self, message: TrueSealMessage) -> Result<(), HandlerError>;
+}
+
+/// Receives [`TrueSealEvent`]s (ADR-0028). Any number of listeners.
+#[uniffi::export(callback_interface)]
+pub trait TrueSealEventListener: Send + Sync {
+    fn on_event(&self, event: TrueSealEvent);
+}
+
+/// Receives [`DeliveryIssue`]s (ADR-0026). Any number of listeners;
+/// optional — the library already does the right thing.
+#[uniffi::export(callback_interface)]
+pub trait TrueSealIssueListener: Send + Sync {
+    fn on_delivery_issue(&self, issue: DeliveryIssue);
+}
+
+// ── Subscription ──────────────────────────────────────────────────────────────
+
+/// The cancel handle returned by every `on…` registration (ADR-0028).
+/// `cancel()` unregisters the listener; idempotent.
+#[derive(uniffi::Object)]
+pub struct Subscription {
+    cancel: Mutex<Option<Box<dyn Fn() + Send + Sync + 'static>>>,
+}
+
+#[uniffi::export]
+impl Subscription {
+    pub fn cancel(&self) {
+        let f = self.cancel.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(f) = f {
+            f();
+        }
+    }
+}
+
+// ── Listener bus ──────────────────────────────────────────────────────────────
+
+/// A buffered multi-listener bus (ADR-0028: "Events raised before the
+/// first listener is registered are buffered"). The buffer is one-shot: it
+/// flushes to the FIRST listener, so a report reaches the app exactly once
+/// even across reloads (same semantics as the core's issue sink, SYNC-5).
+struct ListenerBus<T: Clone + Send + 'static> {
+    state: Mutex<ListenerBusState<T>>,
+}
+
+struct ListenerBusState<T: Clone + Send + 'static> {
+    pending: Vec<T>,
+    listeners: Vec<(u64, Arc<dyn Fn(T) + Send + Sync + 'static>)>,
+    next_id: u64,
+}
+
+impl<T: Clone + Send + 'static> ListenerBus<T> {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ListenerBusState {
+                pending: Vec::new(),
+                listeners: Vec::new(),
+                next_id: 0,
+            }),
+        }
+    }
+
+    /// Fire an event: to every listener, or into the buffer when none are
+    /// registered yet. Listeners fire under the lock and must not re-enter.
+    fn fire(&self, event: T) {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.listeners.is_empty() {
+            st.pending.push(event);
+            return;
+        }
+        for (_, listener) in &st.listeners {
+            listener(event.clone());
+        }
+    }
+
+    /// Register a listener; buffered events flush to the first one.
+    /// Returns the subscription id.
+    fn subscribe(&self, listener: Arc<dyn Fn(T) + Send + Sync + 'static>) -> u64 {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.listeners.is_empty() {
+            for event in st.pending.drain(..) {
+                listener(event);
+            }
+        }
+        let id = st.next_id;
+        st.next_id += 1;
+        st.listeners.push((id, listener));
+        id
+    }
+
+    fn unsubscribe(&self, id: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .listeners
+            .retain(|(lid, _)| *lid != id);
+    }
+}
+
+// ── Message handler gating ────────────────────────────────────────────────────
+
+/// Registration-gated handler slot (ADR-0026: "receiving starts when a
+/// handler is registered"). Until a handler exists, the receive-side
+/// closure WAITS — the Blob is not acked, not dropped, and the relay
+/// re-delivers on reconnect, exactly as with a hung handler (accepted and
+/// documented in ADR-0026). The wait is interruptible by `close()`.
+struct HandlerSlot {
+    handler: Option<Arc<dyn TrueSealMessageHandler>>,
+    registered_once: bool,
+    closed: bool,
+}
+
+// ── TrueSeal ──────────────────────────────────────────────────────────────────
+
+/// The canonical TrueSeal object (ADR-0028). One per namespace. Created
+/// via `TrueSeal.open(...)`; connects in the background; `send()` works
+/// immediately (durably queued, ADR-0026). The object outlives group
+/// membership: after removal, leave or Destroy Group it reports
+/// `notJoined` with the reason and can pair again.
+#[derive(uniffi::Object)]
+pub struct TrueSeal {
+    inner: TruesealSession<TcpStream>,
+    /// Mirrors `inner.is_closed()`; gates every FFI call with `closed` and
+    /// releases a parked handler wait.
+    closed: Arc<AtomicBool>,
+    handler_slot: Arc<(Mutex<HandlerSlot>, Condvar)>,
+    events: Arc<ListenerBus<TrueSealEvent>>,
+    issues: Arc<ListenerBus<DeliveryIssue>>,
+    /// The last status an event was reported for, for the created/joined
+    /// distinction: `on_manifest_changed` fires for both an inbound first
+    /// manifest (Joined) and a local genesis (Created), and only the FFI
+    /// call context tells them apart.
+    last_status: Arc<Mutex<GroupStatus>>,
+    /// True while `accept()` runs — see `last_status`.
+    accept_in_flight: Arc<AtomicBool>,
+    /// Cached connection state for the `connection` getter (starts
+    /// `connecting`; updated by the core's connection callback).
+    connection: Arc<Mutex<ConnectionState>>,
+}
+
+#[uniffi::export]
+impl TrueSeal {
+    /// Open a session on `namespace` (default `"default"`) with state under
+    /// `base_dir`, connecting to the relay named by `relay` — a Relay
+    /// Address string, `trueseal://<relay public key hex>@host[:port][?push=port]`
+    /// (ADR-0028; use [`TrueSeal::open_with_address`] for the typed form).
+    ///
+    /// Returns before the connection is up; the relay connects in the
+    /// background and the outbox delivers as soon as it does. `send()`
+    /// works immediately.
+    ///
+    /// `max_payload_bytes` lowers the payload limit (e.g. to match a
+    /// stricter relay); it can never exceed the Protocol Size Limit
+    /// (ADR-0025). The option is creation-time by design: the limit is a
+    /// property of how the app deploys, not something to mutate mid-flight.
+    #[uniffi::constructor]
+    pub fn open(
+        relay: String,
+        base_dir: String,
+        namespace: Option<String>,
+        max_payload_bytes: Option<u32>,
+    ) -> Result<Arc<Self>, TrueSealError> {
+        let address = ParsedRelayAddress::parse(&relay)
+            .map_err(|e| TrueSealError::InvalidRelayAddress { msg: e.0 })?;
+        Self::open_parsed(address, base_dir, namespace, max_payload_bytes)
+    }
+
+    /// [`Self::open`] with the typed Relay Address form (ADR-0028).
+    #[uniffi::constructor]
+    pub fn open_with_address(
+        relay: RelayAddress,
+        base_dir: String,
+        namespace: Option<String>,
+        max_payload_bytes: Option<u32>,
+    ) -> Result<Arc<Self>, TrueSealError> {
+        let key: [u8; 32] = relay.public_key.as_slice().try_into().map_err(|_| {
+            TrueSealError::InvalidRelayAddress {
+                msg: format!(
+                    "relay public key must be 32 bytes, got {}",
+                    relay.public_key.len()
+                ),
+            }
+        })?;
+        let address = ParsedRelayAddress {
+            host: relay.host,
+            public_key: crate::keys::NoisePublicKey(key),
+            receive_port: relay.receive_port,
+            push_port: relay.push_port,
+        };
+        Self::open_parsed(address, base_dir, namespace, max_payload_bytes)
+    }
+
+    /// The group status (ADR-0028 `status`).
+    pub fn status(&self) -> Result<GroupStatus, TrueSealError> {
+        self.check_open()?;
+        Ok(self.inner.group_status().into())
+    }
+
+    /// This device as a `Member` (ADR-0028 `me`) — the same `id` and
+    /// `name` other members see.
+    pub fn me(&self) -> Result<Member, TrueSealError> {
+        self.check_open()?;
+        let signing = self.inner.signing_pub();
+        Ok(Member {
+            id: member_id(&signing),
+            name: member_name(&signing),
+        })
+    }
+
+    /// Every other current member (ADR-0028 `members`). Empty when not in
+    /// a group.
+    pub fn members(&self) -> Result<Vec<Member>, TrueSealError> {
+        self.check_open()?;
+        Ok(self
+            .inner
+            .members()
+            .into_iter()
+            .map(|m| Member {
+                id: m.id,
+                name: m.name,
+            })
+            .collect())
+    }
+
+    /// The relay link state (ADR-0028 `connection`).
+    pub fn connection(&self) -> Result<ConnectionState, TrueSealError> {
+        self.check_open()?;
+        Ok(*self.connection.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Register THE message handler; registration starts receiving
+    /// (ADR-0026). The handler is async and awaited — a Blob is acked only
+    /// after it completes. A second registration fails with
+    /// `messageHandlerAlreadySet`; cancelling the returned Subscription
+    /// unregisters the handler (receiving waits again).
+    pub fn on_message(
+        &self,
+        handler: Box<dyn TrueSealMessageHandler>,
+    ) -> Result<Arc<Subscription>, TrueSealError> {
+        self.check_open()?;
+        let (lock, cvar) = &*self.handler_slot;
+        {
+            let mut slot = lock.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.registered_once {
+                return Err(TrueSealError::MessageHandlerAlreadySet);
+            }
+            slot.handler = Some(Arc::from(handler));
+            slot.registered_once = true;
+        }
+        cvar.notify_all();
+        let slot = self.handler_slot.clone();
+        Ok(Arc::new(Subscription {
+            cancel: Mutex::new(Some(Box::new(move || {
+                let (lock, cvar) = &*slot;
+                lock.lock().unwrap_or_else(|e| e.into_inner()).handler = None;
+                // Wake the waiter so it re-parks on the empty slot instead
+                // of holding a stale handler.
+                cvar.notify_all();
+            }))),
+        }))
+    }
+
+    /// Queue `body` for fan-out to every group member (ADR-0026). Returns
+    /// the Message ID once the message is durably in the outbox — delivery
+    /// continues in the background; a permanent failure arrives as a
+    /// `sendFailed` delivery issue carrying the same ID.
+    ///
+    /// Fails immediately with `payloadTooLarge{max}` (ADR-0025) or
+    /// `notMember{status}`.
+    pub fn send(&self, body: Vec<u8>) -> Result<String, TrueSealError> {
+        self.check_open()?;
+        self.inner
+            .push_sync(body)
+            .map_err(|e| map_core_error(e, self.status_now()))
+    }
+
+    /// Open a Pairing Window and return the Pairing Token (ADR-0023).
+    /// Requests arrive as `joinRequest` events; the window closes on the
+    /// first `accept()`, on `cancelPairing()`, or on process end. Fails
+    /// `notMember{destroying}` while Destroying (ADR-0029).
+    pub fn start_pairing(&self) -> Result<String, TrueSealError> {
+        self.check_open()?;
+        self.inner
+            .pairing_token()
+            .map_err(|e| map_core_error(e, self.status_now()))
+    }
+
+    /// Admit the device behind a `joinRequest` event (ADR-0023). Fails
+    /// with `pairingClosed` (window closed or unknown request),
+    /// `groupFull{max}` (ADR-0027), `notMember{status}` while Leaving /
+    /// Destroying, or `manifestVersionExhausted` (SYNC-10).
+    pub fn accept(&self, request_id: String) -> Result<(), TrueSealError> {
+        self.check_open()?;
+        // Mark the local accept so the manifest hook can tell a genesis
+        // (Created) from an inbound first manifest (Joined).
+        self.accept_in_flight.store(true, Ordering::Release);
+        let result = self.inner.accept_member(&request_id);
+        self.accept_in_flight.store(false, Ordering::Release);
+        match result {
+            Ok(true) => {
+                *self.last_status.lock().unwrap_or_else(|e| e.into_inner()) =
+                    self.inner.group_status().into();
+                Ok(())
+            }
+            // The request is gone (window closed, unknown id) or this
+            // device's state admits no one (leaving; a view that excludes
+            // it) — ADR-0023 sends no decline, so the typed answer is
+            // `pairingClosed` for the former and `notMember` for the rest.
+            Ok(false) => match self.inner.group_status() {
+                CoreGroupStatus::Leaving | CoreGroupStatus::Destroying => {
+                    Err(TrueSealError::NotMember {
+                        status: self.status_now(),
+                    })
+                }
+                _ => Err(TrueSealError::PairingClosed),
+            },
+            Err(e) => Err(map_core_error(e, self.status_now())),
+        }
+    }
+
+    /// Close the Pairing Window without admitting anyone.
+    pub fn cancel_pairing(&self) -> Result<(), TrueSealError> {
+        self.check_open()?;
+        self.inner.cancel_pairing();
+        Ok(())
+    }
+
+    /// Join the group a Pairing Token names (ADR-0023): moves to
+    /// `pendingJoin` and durably queues the Pair. Fails with
+    /// `invalidPairingToken` or `alreadyInGroup`.
+    pub fn join(&self, token: String) -> Result<(), TrueSealError> {
+        self.check_open()?;
+        self.inner
+            .join_group(&token)
+            .map_err(|e| map_core_error(e, self.status_now()))?;
+        *self.last_status.lock().unwrap_or_else(|e| e.into_inner()) = GroupStatus::PendingJoin;
+        Ok(())
+    }
+
+    /// Abandon a Pending Join (ADR-0023).
+    pub fn cancel_join(&self) -> Result<(), TrueSealError> {
+        self.check_open()?;
+        self.inner.cancel_join();
+        *self.last_status.lock().unwrap_or_else(|e| e.into_inner()) = GroupStatus::NotJoined;
+        Ok(())
+    }
+
+    /// Remove a member by their `Member.id` (Soft Removal, ADR-0027).
+    pub fn remove(&self, member_id: String) -> Result<(), TrueSealError> {
+        self.check_open()?;
+        self.inner
+            .remove_member_by_id(&member_id)
+            .map_err(|e| map_core_error(e, self.status_now()))
+    }
+
+    /// Leave the Sync Group (ADR-0027): moves to `leaving`; when the Relay
+    /// has accepted every push of the excluding manifest, the device wipes
+    /// and rotates and reports `statusChanged(notJoined, left)`.
+    pub fn leave(&self) -> Result<(), TrueSealError> {
+        self.check_open()?;
+        self.inner
+            .leave_group()
+            .map_err(|e| map_core_error(e, self.status_now()))?;
+        *self.last_status.lock().unwrap_or_else(|e| e.into_inner()) = GroupStatus::Leaving;
+        Ok(())
+    }
+
+    /// Destroy the group (ADR-0029): durable, forwarded Revoke; the device
+    /// stays `destroying` until the Relay has accepted every Revoke, then
+    /// wipes, rotates and reports `statusChanged(notJoined, destroyed)`.
+    /// No-op while already Destroying.
+    pub fn destroy_group(&self) -> Result<(), TrueSealError> {
+        self.check_open()?;
+        self.inner
+            .destroy_group()
+            .map_err(|e| map_core_error(e, self.status_now()))?;
+        *self.last_status.lock().unwrap_or_else(|e| e.into_inner()) = GroupStatus::Destroying;
+        Ok(())
+    }
+
+    /// Register an event listener (ADR-0028). Any number; events raised
+    /// before the first listener registers are buffered and flushed to it.
+    pub fn on_event(
+        &self,
+        listener: Box<dyn TrueSealEventListener>,
+    ) -> Result<Arc<Subscription>, TrueSealError> {
+        self.check_open()?;
+        let listener: Arc<dyn TrueSealEventListener> = Arc::from(listener);
+        let id = self
+            .events
+            .subscribe(Arc::new(move |e| listener.on_event(e)));
+        let bus = self.events.clone();
+        Ok(Arc::new(Subscription {
+            cancel: Mutex::new(Some(Box::new(move || bus.unsubscribe(id)))),
+        }))
+    }
+
+    /// Register a delivery-issue listener (ADR-0026). Optional.
+    pub fn on_delivery_issue(
+        &self,
+        listener: Box<dyn TrueSealIssueListener>,
+    ) -> Result<Arc<Subscription>, TrueSealError> {
+        self.check_open()?;
+        let listener: Arc<dyn TrueSealIssueListener> = Arc::from(listener);
+        let id = self
+            .issues
+            .subscribe(Arc::new(move |i| listener.on_delivery_issue(i)));
+        let bus = self.issues.clone();
+        Ok(Arc::new(Subscription {
+            cancel: Mutex::new(Some(Box::new(move || bus.unsubscribe(id)))),
+        }))
+    }
+
+    /// Stop the connection and the handlers; keep Session State
+    /// (ADR-0028). After `close()`, every call fails with `closed` —
+    /// except `close()` itself, which is idempotent. In-flight handlers
+    /// run to completion; their Blobs stay unacked and are re-delivered on
+    /// the next `open()` (at-least-once, ADR-0026).
+    pub fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Release a handler wait parked on "no handler registered" first,
+        // then stop the core: loops exit, the receive link is severed.
+        {
+            let (lock, cvar) = &*self.handler_slot;
+            lock.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+            cvar.notify_all();
+        }
+        self.inner.close();
+    }
+}
+
+/// The internal constructor both `open` entry points share.
+impl TrueSeal {
+    fn open_parsed(
+        address: ParsedRelayAddress,
+        base_dir: String,
+        namespace: Option<String>,
+        max_payload_bytes: Option<u32>,
+    ) -> Result<Arc<Self>, TrueSealError> {
+        let namespace = namespace.unwrap_or_else(|| "default".to_string());
+        if namespace.is_empty()
+            || !namespace
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(TrueSealError::InvalidNamespace {
+                msg: format!("namespace must match [a-zA-Z0-9_-]+ (got {namespace:?})"),
+            });
+        }
+
+        let (store, open_outcome) =
+            Store::open_with_outcome(Path::new(&base_dir), &namespace).map_err(map_store_error)?;
+        let keypair = load_or_generate_keypair(&store)?;
+
+        // SYNC-7 (#99): the manifest slot is created and seeded from the
+        // store BEFORE the session (and its reconnect loop) starts, so the
+        // receive path never observes a transient `None`.
+        let manifest: Arc<Mutex<Option<crate::manifest::GroupManifest>>> =
+            Arc::new(Mutex::new(store.load_group_manifest().ok().flatten()));
+
+        let log_store = Store::open(Path::new(&base_dir), &namespace).map_err(map_store_error)?;
+        let manifest_store = Arc::new(Mutex::new(
+            Store::open(Path::new(&base_dir), &namespace).map_err(map_store_error)?,
+        ));
+        let rotate_store = Arc::new(Mutex::new(
+            Store::open(Path::new(&base_dir), &namespace).map_err(map_store_error)?,
+        ));
+
+        let events: Arc<ListenerBus<TrueSealEvent>> = Arc::new(ListenerBus::new());
+        let issues: Arc<ListenerBus<DeliveryIssue>> = Arc::new(ListenerBus::new());
+        let last_status = Arc::new(Mutex::new(GroupStatus::NotJoined));
+        let accept_in_flight = Arc::new(AtomicBool::new(false));
+        let connection: Arc<Mutex<ConnectionState>> =
+            Arc::new(Mutex::new(ConnectionState::Connecting));
+        let handler_slot = Arc::new((
+            Mutex::new(HandlerSlot {
+                handler: None,
+                registered_once: false,
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        let closed = Arc::new(AtomicBool::new(false));
+
+        // The core message hook: control messages are handled inside the
+        // core; only `Sync` bodies reach here. The closure WAITS for a
+        // registered handler (ADR-0026: receiving starts on registration)
+        // and converts a foreign-side failure into a failed handler
+        // attempt (the core's 5-attempts-then-handlerGaveUp loop catches
+        // the panic). The wait releases on close().
+        let on_message = {
+            let handler_slot = handler_slot.clone();
+            move |msg: Message, author_signing_pub: [u8; 32], sequence: u64| {
+                let Message::Sync { body } = msg else {
+                    return;
+                };
+
+                let message = TrueSealMessage {
+                    id: crate::message::message_id(&author_signing_pub, sequence),
+                    from: Member {
+                        id: member_id(&crate::keys::SigningPublicKey(author_signing_pub)),
+                        name: member_name(&crate::keys::SigningPublicKey(author_signing_pub)),
+                    },
+                    body,
+                };
+                let (lock, cvar) = &*handler_slot;
+                let handler = loop {
+                    let mut slot = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(h) = &slot.handler {
+                        break h.clone();
+                    }
+                    if slot.closed {
+                        // Closed while waiting: abandon the Blob unacked —
+                        // the relay re-delivers on the next open (ADR-0026).
+                        return;
+                    }
+                    let (guard, _timeout) = cvar
+                        .wait_timeout(slot, Duration::from_millis(50))
+                        .unwrap_or_else(|e| e.into_inner());
+                    slot = guard;
+                };
+                if let Err(e) = futures::executor::block_on(handler.on_message(message)) {
+                    // A failed handler attempt (ADR-0026 step 4): the core
+                    // retries with backoff and eventually reports
+                    // handlerGaveUp with this message.
+                    panic!("message handler failed: {e}");
+                }
+            }
+        };
+
+        let on_removed_from_group = || {
+            // The statusChanged(notJoined, removed) event is emitted by the
+            // identity-rotation hook below, which carries the reason; this
+            // hook stays a no-op on the canonical surface.
+        };
+
+        let on_manifest_changed = {
+            let events = events.clone();
+            let last_status = last_status.clone();
+            let accept_in_flight = accept_in_flight.clone();
+            move |m: &crate::manifest::GroupManifest| {
+                // Persist first: the store is the crash-recovery record
+                // (SYNC-7); a save failure is logged, not swallowed (B13
+                // review note) — the in-memory manifest still advances.
+                if let Err(e) = manifest_store
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .save_group_manifest(m)
+                {
+                    log::error!("[trueseal-sync] failed to persist the group manifest: {e}");
+                }
+                let members: Vec<Member> = m
+                    .members
+                    .iter()
+                    .map(|mm| Member {
+                        id: member_id(&mm.signing_pub),
+                        name: member_name(&mm.signing_pub),
+                    })
+                    .collect();
+                let mut last = last_status.lock().unwrap_or_else(|e| e.into_inner());
+                if *last != GroupStatus::Member {
+                    let reason = if accept_in_flight.load(Ordering::Acquire) {
+                        StatusReason::Created
+                    } else {
+                        StatusReason::Joined
+                    };
+                    *last = GroupStatus::Member;
+                    events.fire(TrueSealEvent::StatusChanged {
+                        status: GroupStatus::Member,
+                        reason,
+                    });
+                }
+                events.fire(TrueSealEvent::MembersChanged { members });
+            }
+        };
+
+        let on_group_destroyed = || {
+            // Covered by the identity-rotation hook (reason Destroyed).
+        };
+
+        let on_identity_rotated = {
+            let events = events.clone();
+            let last_status = last_status.clone();
+            move |fresh: DeviceKeypair, reason: ExitReason| {
+                // The namespace's store is wiped (manifest, identity,
+                // outbox, dedup, pending records) and the fresh keypair
+                // persisted, so a restart opens as the rotated device.
+                // Failures are logged loudly, never swallowed (B13 review
+                // note): the durable Leaving/Destroying record survives a
+                // failed wipe, so the next open retries the completion.
+                let store = rotate_store.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = store.wipe() {
+                    log::error!("[trueseal-sync] store wipe during identity rotation failed: {e}");
+                }
+                if let Err(e) = store.save_keypair(&fresh) {
+                    log::error!("[trueseal-sync] persisting the rotated identity failed: {e}");
+                }
+                *last_status.lock().unwrap_or_else(|e| e.into_inner()) = GroupStatus::NotJoined;
+                events.fire(TrueSealEvent::MembersChanged { members: vec![] });
+                events.fire(TrueSealEvent::StatusChanged {
+                    status: GroupStatus::NotJoined,
+                    reason: match reason {
+                        ExitReason::Removed => StatusReason::Removed,
+                        ExitReason::Left => StatusReason::Left,
+                        ExitReason::Destroyed => StatusReason::Destroyed,
+                    },
+                });
+            }
+        };
+
+        let receive_addr = address.receive_addr();
+        let push_addr = address.push_addr();
+        let receive_factory = {
+            let receive_addr = receive_addr.clone();
+            move || {
+                let s = TcpStream::connect(&receive_addr).map_err(|e| e.to_string())?;
+                s.set_nonblocking(true).map_err(|e| e.to_string())?;
+                Ok(s)
+            }
+        };
+        let push_factory = move || {
+            let s = TcpStream::connect(&push_addr).map_err(|e| e.to_string())?;
+            s.set_nonblocking(true).map_err(|e| e.to_string())?;
+            Ok(s)
+        };
+
+        let on_connection_changed = {
+            let events = events.clone();
+            let connection = connection.clone();
+            move |change: ConnectionChange| {
+                let state = ConnectionState::from(change);
+                *connection.lock().unwrap_or_else(|e| e.into_inner()) = state;
+                events.fire(TrueSealEvent::ConnectionChanged { connection: state });
+            }
+        };
+
+        let inner = TruesealSession::connect_background_rotating(
+            address.public_key,
+            keypair,
+            on_message,
+            Box::new(PersistentLog::new(log_store)),
+            manifest,
+            on_removed_from_group,
+            on_manifest_changed,
+            on_group_destroyed,
+            on_identity_rotated,
+            receive_factory,
+            push_factory,
+            None, // default 30-second reconnect cap
+            Some(Box::new(on_connection_changed)),
+        )
+        .map_err(|e| map_core_error(e, GroupStatus::NotJoined))?;
+
+        // Receive-path and session Delivery Issues forward into the FFI
+        // issue bus — except `admissionDropped`, which ADR-0028 lists as an
+        // EVENT, so it routes to the event bus here.
+        {
+            let issues = issues.clone();
+            let events = events.clone();
+            inner.subscribe_delivery_issues(move |issue| {
+                if let crate::delivery_issue::DeliveryIssue::AdmissionDropped { name, .. } = &issue
+                {
+                    events.fire(TrueSealEvent::AdmissionDropped {
+                        name: name.clone(),
+                        reason: AdmissionDropReason::GroupFull,
+                    });
+                    return;
+                }
+                if let Some(mapped) = DeliveryIssue::from_core(issue) {
+                    issues.fire(mapped);
+                }
+            });
+        }
+        // Join Requests arrive through the core's buffered member-request
+        // sink; they are events on the canonical surface.
+        {
+            let events = events.clone();
+            inner.set_on_member_request(move |token, name| {
+                events.fire(TrueSealEvent::JoinRequest {
+                    request: JoinRequest { id: token, name },
+                });
+            });
+        }
+
+        *last_status.lock().unwrap_or_else(|e| e.into_inner()) = inner.group_status().into();
+
+        if let Some(max) = max_payload_bytes {
+            // Clamped at the Protocol Size Limit inside the core (ADR-0025).
+            inner.set_max_payload_bytes(max as usize);
+        }
+
+        let session = Arc::new(Self {
+            inner,
+            closed,
+            handler_slot,
+            events,
+            issues,
+            last_status,
+            accept_in_flight,
+            connection,
+        });
+
+        // ADR-0032: report the automatic Store Reset as
+        // `statusChanged(notJoined, storeReset)` once the object exists.
+        // Events are buffered until the first listener registers, so the
+        // app cannot miss it by registering after open().
+        if open_outcome.reset {
+            session.events.fire(TrueSealEvent::StatusChanged {
+                status: GroupStatus::NotJoined,
+                reason: StatusReason::StoreReset,
+            });
+        }
+
+        Ok(session)
+    }
+
+    fn check_open(&self) -> Result<(), TrueSealError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TrueSealError::Closed);
+        }
+        Ok(())
+    }
+
+    fn status_now(&self) -> GroupStatus {
+        self.inner.group_status().into()
+    }
+}
+
+// ── Module-level functions ────────────────────────────────────────────────────
+
+/// The version triple for this build (ADR-0022 Reporting): the two
+/// protocol versions come from the core constants — the single source of
+/// truth. Package versions imply nothing about wire compatibility.
 #[uniffi::export]
 pub fn trueseal_info() -> TruesealInfo {
     TruesealInfo {
@@ -156,432 +1151,52 @@ pub fn trueseal_info() -> TruesealInfo {
     }
 }
 
-// ── Public types ──────────────────────────────────────────────────────────────
-
-/// A remote group member as seen through the FFI surface.
-#[derive(Debug, Clone, uniffi::Record)]
-pub struct Member {
-    /// Stable opaque identifier, e.g. `"YWJjZGVmZ2"`.
-    pub id: String,
-    /// Auto-generated human-readable name, e.g. `"AmberFalcon"`.
-    pub name: String,
-}
-
-// ── Callback interfaces ───────────────────────────────────────────────────────
-
-/// Fired when a `Sync` message is delivered to this device.
-/// `blob` is the raw application payload; `sender_noise_pub` is the sender's 32-byte X25519 key.
-/// `message_id` is stable across re-delivery and opaque to callers.
-#[uniffi::export(callback_interface)]
-pub trait MessageCallback: Send + Sync {
-    fn on_message(&self, blob: Vec<u8>, sender_noise_pub: Vec<u8>, message_id: String);
-}
-
-/// Fired when this device is excluded from an incoming `GroupManifest` update.
-/// Another group member has issued a Soft Removal of this device (ADR-0015).
-/// The session remains connected; the caller decides whether to wipe and re-pair.
-#[uniffi::export(callback_interface)]
-pub trait RemovedFromGroupCallback: Send + Sync {
-    fn on_removed_from_group(&self);
-}
-
-/// Fired when a `Pair` message arrives within an open pairing window.
-/// The caller shows UI ("Name wants to join — Accept?"), then calls
-/// `accept_member(token)` or ignores the request.
-#[uniffi::export(callback_interface)]
-pub trait MemberRequestCallback: Send + Sync {
-    fn on_member_request(&self, token: String, name: String);
-}
-/// After this fires the session is terminal; call `create()` on the same namespace
-/// to start fresh with a new identity.
-#[uniffi::export(callback_interface)]
-pub trait GroupDestroyedCallback: Send + Sync {
-    fn on_group_destroyed(&self);
-}
-
-/// Fired when a new member appears in an incoming manifest update or after `acceptMember` succeeds.
-#[uniffi::export(callback_interface)]
-pub trait MemberJoinedCallback: Send + Sync {
-    fn on_member_joined(&self, member_id: String, member_name: String);
-}
-
-/// Fired when a member disappears from an incoming manifest update (Soft Removal).
-/// Does NOT fire when the local device is the removed one — that fires `onRemovedFromGroup`.
-#[uniffi::export(callback_interface)]
-pub trait MemberLeftCallback: Send + Sync {
-    fn on_member_left(&self, member_id: String, member_name: String);
-}
-
-/// Fired when the relay connection state changes.
-/// `connected = true` when the relay connects; `false` when it disconnects.
-/// Informational only — the library queues outbox messages and reconnects automatically.
-/// Does NOT fire at session construction time.
-#[uniffi::export(callback_interface)]
-pub trait ConnectionChangedCallback: Send + Sync {
-    fn on_connection_changed(&self, connected: bool);
-}
-
-/// Fired once from `create` when the store was unmigratable — unversioned
-/// (a development-build store) or from before a Store Reset release — and
-/// was automatically reset: group state wiped, fresh identity generated,
-/// status `notJoined` with reason `storeReset` (ADR-0032, ADR-0028). The
-/// object stays usable and can pair again. SYNC-15 folds this into the
-/// canonical `statusChanged(status, reason)` event stream.
-#[uniffi::export(callback_interface)]
-pub trait StoreResetCallback: Send + Sync {
-    fn on_store_reset(&self);
-}
-
-// ── TruesealFfiSession ────────────────────────────────────────────────────────────
-
-/// A connected trueseal-sync session over TCP.
-///
-/// Create via `TruesealFfiSession.create(...)`.  All key arguments are raw bytes.
-#[derive(uniffi::Object)]
-pub struct TruesealFfiSession {
-    inner: TruesealSession<TcpStream>,
-}
-
+/// The Protocol Size Limit (61,440 bytes, ADR-0025): the largest `Sync`
+/// body any device may send. `maxPayloadBytes` in the canonical API.
 #[uniffi::export]
-impl TruesealFfiSession {
-    /// Create a session. Always succeeds — the relay connects in the background.
-    ///
-    /// - `base_dir`: directory where the SQLite database is stored
-    /// - `namespace`: scopes the database file; one session per namespace
-    /// - `relay_host`: relay hostname or IP, e.g. `"relay.example.com"` (no port — ports are managed internally)
-    /// - `relay_pub`: 32-byte X25519 relay public key (wrong length → `InvalidRelayPublicKey`)
-    /// - `on_message`: called for every inbound `Sync` message
-    ///
-    /// The identity keypair is loaded from SQLite or auto-generated on first launch.
-    /// Automatically reconnects on relay disconnects using an exponential backoff
-    /// capped at 30 seconds.
-    #[uniffi::constructor]
-    pub fn create(
-        base_dir: String,
-        namespace: String,
-        relay_host: String,
-        relay_pub: Vec<u8>,
-        on_message: Box<dyn MessageCallback>,
-        on_removed_from_group: Box<dyn RemovedFromGroupCallback>,
-        on_group_destroyed: Box<dyn GroupDestroyedCallback>,
-        on_connection_changed: Option<Box<dyn ConnectionChangedCallback>>,
-        on_store_reset: Option<Box<dyn StoreResetCallback>>,
-    ) -> Result<Arc<Self>, SessionError> {
-        // Validate namespace: must be non-empty and match [a-zA-Z0-9_-]+
-        if namespace.is_empty()
-            || !namespace
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            return Err(SessionError::InvalidNamespace {
-                msg: format!("namespace must match [a-zA-Z0-9_-]+ (got {:?})", namespace),
-            });
-        }
-        // Validate every fallible argument BEFORE the store open: if
-        // create() fails after an automatic Store Reset ran, the reset's
-        // callback below would never fire and the wipe would be invisible
-        // to the app (B11 review). Cheap pure validation first keeps
-        // `storeReset` observable on every path.
-        let relay_pub_key =
-            noise_pub_from_bytes(&relay_pub).map_err(|_| SessionError::InvalidRelayPublicKey)?;
-        // SYNC-13 (ADR-0032): the first open runs the Store Version state
-        // machine — chained migrations, an automatic Store Reset for an
-        // unmigratable store, a typed refusal for a newer one. Later opens
-        // see a current store and are no-ops.
-        let (store, open_outcome) =
-            Store::open_with_outcome(Path::new(&base_dir), &namespace).map_err(map_store_error)?;
-        // After a Store Reset the identity row is empty: the library
-        // generates a fresh identity here, and the session below starts
-        // NotJoined — `storeReset` is reported once construction succeeds.
-        let keypair = load_or_generate_keypair(&store)?;
+pub fn trueseal_max_payload_bytes() -> u32 {
+    crate::limits::PROTOCOL_SIZE_LIMIT as u32
+}
 
-        // SYNC-7 (#99): the manifest slot is created and seeded from the store
-        // BEFORE the session (and its reconnect loop) starts, so the receive
-        // path never observes a transient `None`. The on_message closure shares
-        // the same slot for sender attribution, so it resolves the sender's
-        // noise key from the very first Deliver — no late-bind window.
-        // A store read error leaves the slot empty, matching the previous
-        // restore-failure tolerance: `create()` stays infallible (ADR-0017).
-        let manifest: Arc<Mutex<Option<crate::manifest::GroupManifest>>> =
-            Arc::new(Mutex::new(store.load_group_manifest().ok().flatten()));
-        // Wrap callbacks in Arc so the on_message closure can be Clone
-        // (required by connect_background for the reconnect loop).
-        let on_message = Arc::new(on_message);
-        let manifest_cb = manifest.clone();
+/// The Maximum Group Size (32, ADR-0027). `maxGroupSize` in the canonical
+/// API.
+#[uniffi::export]
+pub fn trueseal_max_group_size() -> u32 {
+    crate::session::MAX_GROUP_SIZE as u32
+}
 
-        // Open a second store handle for PersistentLog (same DB file, separate connection).
-        let log_store = Store::open(Path::new(&base_dir), &namespace).map_err(map_store_error)?;
-
-        let manifest_store_save = Arc::new(Mutex::new(
-            Store::open(Path::new(&base_dir), &namespace).map_err(map_store_error)?,
-        ));
-
-        // Open a fourth store handle for the wipe + rotate on deliberate
-        // removal, a completed Leave and a completed Destroy Group
-        // (ADR-0027, ADR-0029).
-        let rotate_store = Arc::new(Mutex::new(
-            Store::open(Path::new(&base_dir), &namespace).map_err(map_store_error)?,
-        ));
-
-        let receive_addr = format!("{}:7700", relay_host);
-        let push_addr = format!("{}:7701", relay_host);
-        let relay_addr_factory = receive_addr.clone();
-        let inner = TruesealSession::connect_background_rotating(
-            relay_pub_key,
-            keypair,
-            move |msg, author_signing_pub, sequence| {
-                if let Message::Sync { body } = msg {
-                    let sender_noise_pub = manifest_cb
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                        .and_then(|manifest| manifest.noise_pub_for_signing(&author_signing_pub))
-                        .map(|k| k.0.to_vec())
-                        .unwrap_or_default();
-                    let message_id = crate::message::message_id(&author_signing_pub, sequence);
-                    on_message.on_message(body, sender_noise_pub, message_id);
-                }
-            },
-            Box::new(PersistentLog::new(log_store)),
-            manifest,
-            move || {
-                on_removed_from_group.on_removed_from_group();
-            },
-            move |m: &crate::manifest::GroupManifest| {
-                let _ = manifest_store_save
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .save_group_manifest(m);
-            },
-            // ADR-0029: this fires at Destroy COMPLETION — the Relay has
-            // accepted every queued Revoke and the wipe + identity rotation
-            // already ran through `on_identity_rotated` (below). Pure
-            // notification: wiping here would delete the fresh keypair the
-            // rotation just persisted.
-            move || {
-                on_group_destroyed.on_group_destroyed();
-            },
-            // ADR-0027: on deliberate removal or a completed Leave the core
-            // has already rotated the in-memory identity; here the
-            // namespace's store is wiped (manifest, identity, outbox, dedup,
-            // pending records — one transaction) and the fresh keypair is
-            // persisted, so a restart opens as the rotated device.
-            move |fresh: DeviceKeypair, _reason: crate::session::ExitReason| {
-                let store = rotate_store.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = store.wipe();
-                let _ = store.save_keypair(&fresh);
-            },
-            move || {
-                let s = TcpStream::connect(&relay_addr_factory).map_err(|e| e.to_string())?;
-                s.set_nonblocking(true).map_err(|e| e.to_string())?;
-                Ok(s)
-            }, // transport_factory (XX, :7700)
-            move || {
-                let s = TcpStream::connect(&push_addr).map_err(|e| e.to_string())?;
-                s.set_nonblocking(true).map_err(|e| e.to_string())?;
-                Ok(s)
-            }, // push_factory (NK, :7701)
-            None, // use default 30-second cap
-            on_connection_changed.map(
-                |cb| -> Box<dyn Fn(crate::session::ConnectionChange) + Send + Sync + 'static> {
-                    Box::new(move |change| {
-                        cb.on_connection_changed(matches!(
-                            change,
-                            crate::session::ConnectionChange::Connected
-                        ))
-                    })
-                },
-            ),
-        )
-        .map_err(SessionError::from)?;
-
-        let session = Arc::new(Self { inner });
-        // ADR-0032: report the automatic Store Reset —
-        // `statusChanged(notJoined, storeReset)` in ADR-0028's terms — once
-        // the object exists and is usable (it can pair again immediately).
-        if open_outcome.reset {
-            if let Some(cb) = &on_store_reset {
-                cb.on_store_reset();
-            }
-        }
-        Ok(session)
-    }
-
-    /// Opens a pairing window and returns an opaque base64url token carrying a
-    /// fresh single-use Pairing Secret (ADR-0023): only a party that saw this
-    /// token out-of-band can raise a Join Request.
-    /// The window stays open until either `acceptMember()` is called (single-use:
-    /// the window closes after the first accept) or the caller explicitly calls
-    /// `cancelPairing()`. There is no auto-expiry — the caller controls lifetime
-    /// by closing the pairing UI and calling `cancelPairing()` on dismiss (ADR-0021).
-    /// The token encodes a version byte, `noise_pub || signing_pub || secret ||
-    /// device_name` — pass it to the peer's `joinGroup(token)` call.
-    ///
-    /// Documented limitation (ADR-0023): anyone who sees the token while the
-    /// window is open can request to join — confirm the device in front of you.
-    /// Fails typed `groupDestroyed` while Destroying (ADR-0029): a Destroying
-    /// device admits no one.
-    pub fn pairing_token(&self) -> Result<String, SessionError> {
-        self.inner.pairing_token().map_err(SessionError::from)
-    }
-
-    /// Join a group as the responding device by decoding the initiator's `token`
-    /// and durably queueing a `Pair` message with this device's public keys and
-    /// the token's Pairing Secret (ADR-0023). The device moves to
-    /// `GroupStatus::PendingJoin` and accepts only a first manifest anchored to
-    /// the token's signing key. `Ok` means durably queued — do not retry.
-    ///
-    /// Returns `SessionError::AlreadyInGroup` if a manifest exists; a second
-    /// call while pending replaces the Pending Join. Returns
-    /// `SessionError::InvalidToken` if the token is malformed or predates the
-    /// Pairing Secret.
-    pub fn join_group(&self, token: String) -> Result<(), SessionError> {
-        self.inner.join_group(&token).map_err(SessionError::from)
-    }
-
-    /// Abandon a Pending Join (ADR-0023): the device moves back to
-    /// `GroupStatus::NotJoined` and no manifest will be accepted.
-    pub fn cancel_join(&self) {
-        self.inner.cancel_join();
-    }
-
-    /// Where this device stands in its namespace's Sync Group (ADR-0028).
-    pub fn group_status(&self) -> GroupStatus {
-        self.inner.group_status().into()
-    }
-
-    /// Register the callback fired when a `Pair` message arrives within an open pairing window.
-    ///
-    /// `callback.on_member_request(token, name)` fires with the opaque request token
-    /// and the auto-generated member name. Pass `token` to `accept_member(token)` to admit.
-    pub fn set_on_member_request(&self, callback: Box<dyn MemberRequestCallback>) {
-        self.inner.set_on_member_request(move |token, name| {
-            callback.on_member_request(token, name);
-        });
-    }
-
-    /// Admit a pending member identified by their opaque `token` from `onMemberRequest`.
-    ///
-    /// Returns `Ok(true)` if admitted, `Ok(false)` if the token is unknown or the
-    /// pairing window closed. Errors: `GroupFull` when the admission would exceed
-    /// the Maximum Group Size of 32 (ADR-0027), `StoreFailed` if the durable
-    /// commit failed (nothing changed — retry is safe).
-    pub fn accept_member(&self, token: String) -> Result<bool, SessionError> {
-        self.inner.accept_member(&token).map_err(SessionError::from)
-    }
-
-    /// Register the callback fired when a new member joins the group.
-    ///
-    /// Fires both on the admitting device (after `acceptMember`) and on all other
-    /// current members when they receive the updated manifest.
-    pub fn set_on_member_joined(&self, callback: Box<dyn MemberJoinedCallback>) {
-        self.inner.set_on_member_joined(move |id, name| {
-            callback.on_member_joined(id, name);
-        });
-    }
-
-    /// Register the callback fired when a member is removed from the group (Soft Removal).
-    ///
-    /// Does NOT fire when the local device is removed — that fires `onRemovedFromGroup`.
-    pub fn set_on_member_left(&self, callback: Box<dyn MemberLeftCallback>) {
-        self.inner.set_on_member_left(move |id, name| {
-            callback.on_member_left(id, name);
-        });
-    }
-
-    /// Close the pairing window without admitting any device.
-    pub fn cancel_pairing(&self) {
-        self.inner.cancel_pairing();
-    }
-
-    /// Stable opaque identifier for the local device.
-    /// Derived from the local signing public key — identical to the `id`
-    /// field this device would have in a remote device's `members()` list.
-    pub fn local_node_id(&self) -> String {
-        member_id(&self.inner.signing_pub())
-    }
-
-    /// Auto-generated display name for the local device.
-    /// Derived from the local signing public key — identical to the `name`
-    /// field this device would have in a remote device's `members()` list.
-    pub fn local_device_name(&self) -> String {
-        member_name(&self.inner.signing_pub())
-    }
-
-    /// List remote group members (excludes the local device).
-    ///
-    /// Returns an empty `Vec` when no manifest is set.
-    /// Each `Member` has a stable `id` and an auto-generated `name`.
-    pub fn members(&self) -> Vec<Member> {
-        self.inner
-            .members()
-            .into_iter()
-            .map(|m| Member {
-                id: m.id,
-                name: m.name,
-            })
-            .collect()
-    }
-
-    /// Remove a group member by their opaque `member_id` from `members()`.
-    ///
-    /// Issues a new manifest excluding the target and propagates it to all
-    /// remaining members (including the removed device so it can fire
-    /// `onRemovedFromGroup`).
-    ///
-    /// Returns `SessionError::NotInGroup` if no manifest is set.
-    /// Returns `SessionError::MemberNotFound` if no member with that id exists.
-    pub fn remove_member(&self, member_id: String) -> Result<(), SessionError> {
-        self.inner
-            .remove_member_by_id(&member_id)
-            .map_err(SessionError::from)
-    }
-
-    /// Encrypt `blob` and fan out to all current group members.
-    /// Returns `SessionError::NotInGroup` if the session has no manifest yet.
-    pub fn send(&self, blob: Vec<u8>) -> Result<String, SessionError> {
-        self.inner.push_sync(blob).map_err(SessionError::from)
-    }
-
-    /// Leave the Sync Group (ADR-0027): issue a manifest excluding this
-    /// device and enter `GroupStatus::Leaving`. The device stops sending and
-    /// handling `Sync`, stays connected until the Relay has accepted every
-    /// Leave push, then wipes its group state, rotates its identity and
-    /// returns to `NotJoined`. Survives restarts; idempotent while a Leave
-    /// is in flight.
-    pub fn leave_group(&self) -> Result<(), SessionError> {
-        self.inner.leave_group().map_err(SessionError::from)
-    }
-
-    /// Destroy the group (ADR-0029): persist the Destroying state and queue one
-    /// Revoke per member through the outbox, in one transaction. The device stays
-    /// `GroupStatus::Destroying` — no `send()`, no handlers, still connected —
-    /// until the relay has accepted every Revoke; then it wipes, rotates its
-    /// identity and `on_group_destroyed` fires as the device returns to
-    /// `NotJoined`. No-op while already Destroying; `NotInGroup` in
-    /// `pendingJoin` / `notJoined`.
-    pub fn destroy_group(&self) -> Result<(), SessionError> {
-        self.inner.destroy_group().map_err(SessionError::from)
-    }
+/// Parse a Relay Address string into its typed form (ADR-0028), so SDKs
+/// can validate or display one without opening a session.
+#[uniffi::export]
+pub fn trueseal_parse_relay_address(input: String) -> Result<RelayAddress, TrueSealError> {
+    let parsed = ParsedRelayAddress::parse(&input)
+        .map_err(|e| TrueSealError::InvalidRelayAddress { msg: e.0 })?;
+    Ok(RelayAddress {
+        host: parsed.host,
+        public_key: parsed.public_key.0.to_vec(),
+        receive_port: parsed.receive_port,
+        push_port: parsed.push_port,
+    })
 }
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
-/// Load the identity keypair from `store`, or generate and persist a fresh one.
 /// Map a store failure to the typed taxonomy (ADR-0028): a newer store is
-/// `storeTooNew`; anything else is the `storage` case.
-fn map_store_error(e: crate::store::StoreError) -> SessionError {
+/// `storeTooNew`; anything else is the `storage` case — never
+/// `invalidNamespace`.
+fn map_store_error(e: crate::store::StoreError) -> TrueSealError {
     match e {
         crate::store::StoreError::StoreTooNew { found, supported } => {
-            SessionError::StoreTooNew { found, supported }
+            TrueSealError::StoreTooNew { found, supported }
         }
-        other => SessionError::StoreFailed {
+        other => TrueSealError::Storage {
             msg: format!("store: {other}"),
         },
     }
 }
 
-fn load_or_generate_keypair(store: &Store) -> Result<DeviceKeypair, SessionError> {
+/// Load the identity keypair from `store`, or generate and persist a fresh one.
+fn load_or_generate_keypair(store: &Store) -> Result<DeviceKeypair, TrueSealError> {
     match store.load_keypair() {
         Ok(Some(kp)) => Ok(kp),
         Ok(None) => {
@@ -593,246 +1208,5 @@ fn load_or_generate_keypair(store: &Store) -> Result<DeviceKeypair, SessionError
     }
 }
 
-// ── Key parsing helpers ───────────────────────────────────────────────────────
-
-fn noise_pub_from_bytes(bytes: &[u8]) -> Result<NoisePublicKey, SessionError> {
-    bytes
-        .try_into()
-        .map(NoisePublicKey)
-        .map_err(|_| SessionError::InvalidKeyLength {
-            expected: 32,
-            got: bytes.len() as u32,
-        })
-}
-
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Wrong-length relay_pub returns SessionError::InvalidKeyLength.
-    #[test]
-    fn short_relay_pub_returns_error() {
-        let result = noise_pub_from_bytes(&[0u8; 10]);
-        assert!(matches!(
-            result,
-            Err(SessionError::InvalidKeyLength {
-                expected: 32,
-                got: 10
-            })
-        ));
-    }
-
-    /// SessionError::NotInGroup variant exists and is distinct.
-    #[test]
-    fn not_in_group_error_variant_exists() {
-        let e = SessionError::NotInGroup;
-        assert!(matches!(e, SessionError::NotInGroup));
-    }
-
-    /// Store::load_or_generate round-trips the same keypair on second call.
-    #[test]
-    fn store_load_or_generate_is_stable() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let s1 = crate::store::Store::open(dir.path(), "test").expect("open");
-        let kp1 = load_or_generate_keypair(&s1).expect("first");
-        let s2 = crate::store::Store::open(dir.path(), "test").expect("reopen");
-        let kp2 = load_or_generate_keypair(&s2).expect("second");
-        assert_eq!(
-            kp1.public_key(),
-            kp2.public_key(),
-            "same keypair after reopen"
-        );
-    }
-
-    /// Invalid namespace (empty or bad chars) returns InvalidNamespace.
-    #[test]
-    fn invalid_namespace_returns_error() {
-        struct NoopMsg;
-        impl MessageCallback for NoopMsg {
-            fn on_message(&self, _blob: Vec<u8>, _snp: Vec<u8>, _message_id: String) {}
-        }
-        struct NoopRfg;
-        impl RemovedFromGroupCallback for NoopRfg {
-            fn on_removed_from_group(&self) {}
-        }
-        struct NoopGd;
-        impl GroupDestroyedCallback for NoopGd {
-            fn on_group_destroyed(&self) {}
-        }
-        let dir = tempfile::TempDir::new().unwrap();
-        let relay_pub = vec![0u8; 32];
-
-        for bad in &["", "bad namespace", "no/slash", "dot.bad", "sp ace"] {
-            let result = TruesealFfiSession::create(
-                dir.path().to_string_lossy().into_owned(),
-                bad.to_string(),
-                "relay.example.com".into(),
-                relay_pub.clone(),
-                Box::new(NoopMsg),
-                Box::new(NoopRfg),
-                Box::new(NoopGd),
-                None,
-                None,
-            );
-            assert!(
-                matches!(result, Err(SessionError::InvalidNamespace { .. })),
-                "namespace {bad:?} should return InvalidNamespace"
-            );
-        }
-    }
-
-    /// Two sessions with different namespaces have independent identities.
-    #[test]
-    fn different_namespaces_have_independent_identities() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let s1 = crate::store::Store::open(dir.path(), "alpha").expect("open alpha");
-        let s2 = crate::store::Store::open(dir.path(), "beta").expect("open beta");
-        let kp1 = load_or_generate_keypair(&s1).expect("kp1");
-        let kp2 = load_or_generate_keypair(&s2).expect("kp2");
-        assert_ne!(
-            kp1.public_key(),
-            kp2.public_key(),
-            "different namespaces must generate independent identities"
-        );
-    }
-
-    /// trueseal_info() reports the core version constants — the single source
-    /// of truth — plus the crate version (ADR-0022 Reporting).
-    #[test]
-    fn trueseal_info_reports_the_protocol_versions() {
-        let info = trueseal_info();
-        assert_eq!(info.transport_version, crate::TRANSPORT_VERSION);
-        assert_eq!(info.end_to_end_version, crate::END_TO_END_VERSION);
-        assert_eq!(info.transport_version, 1);
-        assert_eq!(info.end_to_end_version, 1);
-        assert!(!info.sdk_version.is_empty());
-    }
-
-    /// Same namespace returns the same identity on second open.
-    #[test]
-    fn same_namespace_is_stable_across_opens() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let s1 = crate::store::Store::open(dir.path(), "myapp").expect("first open");
-        let kp1 = load_or_generate_keypair(&s1).expect("kp1");
-        drop(s1);
-        let s2 = crate::store::Store::open(dir.path(), "myapp").expect("second open");
-        let kp2 = load_or_generate_keypair(&s2).expect("kp2");
-        assert_eq!(
-            kp1.public_key(),
-            kp2.public_key(),
-            "same namespace must return same identity after re-open"
-        );
-    }
-}
-
-#[cfg(test)]
-mod store_versioning_ffi_tests {
-    //! SYNC-13 (#105, ADR-0032): the FFI surface of the Store Version state
-    //! machine — the automatic Store Reset reports `storeReset` and the
-    //! object can pair again; a newer store is refused with `storeTooNew`.
-
-    use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    struct NoopMsg;
-    impl MessageCallback for NoopMsg {
-        fn on_message(&self, _blob: Vec<u8>, _snp: Vec<u8>, _message_id: String) {}
-    }
-    struct NoopRfg;
-    impl RemovedFromGroupCallback for NoopRfg {
-        fn on_removed_from_group(&self) {}
-    }
-    struct NoopGd;
-    impl GroupDestroyedCallback for NoopGd {
-        fn on_group_destroyed(&self) {}
-    }
-
-    struct CountingReset(Arc<AtomicUsize>);
-    impl StoreResetCallback for CountingReset {
-        fn on_store_reset(&self) {
-            self.0.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    /// A store whose version keys are gone (a development-build artifact) is
-    /// unmigratable: create() resets it, fires on_store_reset once, and the
-    /// session is NotJoined with a fresh identity, ready to pair again.
-    #[test]
-    fn unversioned_store_is_reset_reported_and_pairable() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let base = dir.path().to_string_lossy().into_owned();
-        // A populated store that then loses its version keys.
-        {
-            let s = crate::store::Store::open(dir.path(), "app").expect("open");
-            let kp = DeviceKeypair::generate();
-            s.save_keypair(&kp).expect("save");
-            let conn = rusqlite::Connection::open(dir.path().join("trueseal_app.db")).unwrap();
-            conn.execute(
-                "DELETE FROM meta WHERE key IN ('store_version', 'e2e_version')",
-                [],
-            )
-            .unwrap();
-        }
-        let resets = Arc::new(AtomicUsize::new(0));
-        let session = TruesealFfiSession::create(
-            base.clone(),
-            "app".into(),
-            "127.0.0.1:9".into(), // unreachable — connectivity is background
-            vec![0u8; 32],
-            Box::new(NoopMsg),
-            Box::new(NoopRfg),
-            Box::new(NoopGd),
-            None,
-            Some(Box::new(CountingReset(resets.clone()))),
-        )
-        .expect("create succeeds — the reset is automatic");
-        assert_eq!(resets.load(Ordering::SeqCst), 1, "storeReset reported once");
-        assert_eq!(session.group_status(), GroupStatus::NotJoined);
-        // The object can pair again.
-        assert!(!session.pairing_token().expect("window opens").is_empty());
-        // Destroying outside a group is a typed error, not a panic
-        // (ADR-0029 state table).
-        assert!(matches!(
-            session.destroy_group(),
-            Err(SessionError::NotInGroup)
-        ));
-    }
-
-    /// A store written by a newer release: create() fails with the typed
-    /// StoreTooNew and the store's bytes are unchanged.
-    #[test]
-    fn newer_store_fails_create_with_store_too_new() {
-        let dir = tempfile::TempDir::new().unwrap();
-        {
-            let _s = crate::store::Store::open(dir.path(), "app").expect("open");
-            let conn = rusqlite::Connection::open(dir.path().join("trueseal_app.db")).unwrap();
-            conn.execute("UPDATE meta SET value = 99 WHERE key = 'store_version'", [])
-                .unwrap();
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                .unwrap();
-        }
-        let before = std::fs::read(dir.path().join("trueseal_app.db")).unwrap();
-        let result = TruesealFfiSession::create(
-            dir.path().to_string_lossy().into_owned(),
-            "app".into(),
-            "127.0.0.1:9".into(),
-            vec![0u8; 32],
-            Box::new(NoopMsg),
-            Box::new(NoopRfg),
-            Box::new(NoopGd),
-            None,
-            None,
-        );
-        match result {
-            Err(SessionError::StoreTooNew { found, supported }) => {
-                assert_eq!(found, 99);
-                assert_eq!(supported, crate::version::STORE_VERSION);
-            }
-            other => panic!("expected StoreTooNew, got {:?}", other.map(|_| "session")),
-        }
-        let after = std::fs::read(dir.path().join("trueseal_app.db")).unwrap();
-        assert_eq!(before, after, "refused store: bytes unchanged");
-    }
-}
+mod tests;
