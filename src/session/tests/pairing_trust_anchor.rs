@@ -1548,3 +1548,99 @@ fn join_group_store_failure_is_a_typed_error_without_pending_state() {
         "no in-memory Pending Join survives a failed durable write"
     );
 }
+
+/// B13b (B13 review): a device with a Pending Join is not Idle in
+/// ADR-0023's admitter state machine (`Idle → WindowOpen → Idle`) — it is
+/// mid-join to a group it has not finished joining. Opening a Pairing
+/// Window or accepting a member in that state would issue a genesis
+/// manifest for a NEW group while the anchor for the OLD one is still
+/// live: when the real admission manifest later arrives, the device would
+/// hold a manifest it issued itself AND a pending anchor naming a
+/// different initiator — a state ADR-0023 does not contemplate. Both
+/// entry points are refused typed `NotInGroup` (→ FFI
+/// `notMember{pendingJoin}`), nothing is built or queued, and the Pending
+/// Join is left fully intact so the real join can still complete.
+///
+/// Red on pre-fix main: `pairing_token()` happily opened a window and
+/// `accept_pair` issued a genesis manifest while `group_status()` was
+/// `PendingJoin`.
+#[test]
+fn pending_join_device_cannot_open_window_or_accept() {
+    let relay_kp = make_relay_kp();
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let _relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+
+    let device = DeviceKeypair::generate();
+    let session = TruesealSession::<MemPipe>::connect_full(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        |_, _, _| {},
+        Box::new(MemLog::new()),
+        || {},
+        |_| {},
+        || {},
+        || Err("push factory unused".into()),
+    )
+    .expect("session");
+
+    // Move to PendingJoin: a well-formed token from some initiator.
+    let initiator = DeviceKeypair::generate();
+    let token = crate::message::pairing_token(
+        &initiator.public_key().0,
+        &initiator.signing_public_key().0,
+        &[7u8; 32],
+    );
+    session.join_group(&token).expect("join");
+    assert_eq!(session.group_status(), GroupStatus::PendingJoin);
+
+    // Opening a window is refused typed — no token, no window.
+    let window_result = session.pairing_token();
+    assert!(
+        matches!(window_result, Err(SessionError::NotInGroup)),
+        "pairing_token must fail typed NotInGroup while PendingJoin, got {window_result:?}"
+    );
+
+    // Accepting is refused typed, and nothing is built or queued.
+    let joiner = DeviceKeypair::generate();
+    let accept_result = session.accept_pair(joiner.public_key(), joiner.signing_public_key());
+    assert!(
+        matches!(accept_result, Err(SessionError::NotInGroup)),
+        "accept_pair must fail typed NotInGroup while PendingJoin, got {accept_result:?}"
+    );
+    assert!(
+        session.manifest.lock().unwrap().is_none(),
+        "no genesis manifest was issued"
+    );
+    {
+        let log = session.op_log.lock().unwrap();
+        let entries = log.undelivered_entries();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the queued Pair — no admission manifest was queued"
+        );
+        assert_eq!(
+            entries[0].blob[0], 0x01,
+            "the one queued entry is the Pair (tag 0x01)"
+        );
+        assert!(
+            log.pending_join().is_some(),
+            "the durable Pending Join record survives — the join can still complete"
+        );
+    }
+    assert_eq!(
+        session.group_status(),
+        GroupStatus::PendingJoin,
+        "the device is still pending, not stranded"
+    );
+
+    // The gate follows the state, not a permanent flag: after
+    // cancel_join() the device is Idle and may open a window.
+    session.cancel_join();
+    assert_eq!(session.group_status(), GroupStatus::NotJoined);
+    assert!(
+        session.pairing_token().is_ok(),
+        "a cancelled join leaves the device free to pair"
+    );
+}
