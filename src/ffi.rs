@@ -996,13 +996,16 @@ impl TrueSeal {
         let on_identity_rotated = {
             let events = events.clone();
             let last_status = last_status.clone();
+            let manifest_slot = manifest.clone();
             move |fresh: DeviceKeypair, reason: ExitReason| {
                 // The namespace's store is wiped (manifest, identity,
                 // outbox, dedup, pending records) and the fresh keypair
                 // persisted, so a restart opens as the rotated device.
-                // Failures are logged loudly, never swallowed (B13 review
-                // note): the durable Leaving/Destroying record survives a
-                // failed wipe, so the next open retries the completion.
+                // This runs mid-wipe, inside the crash window — the durable
+                // work is done here, inline, on purpose. Failures are
+                // logged loudly, never swallowed (B13 review note): the
+                // durable Leaving/Destroying record survives a failed wipe,
+                // so the next open retries the completion.
                 let store = rotate_store.lock().unwrap_or_else(|e| e.into_inner());
                 if let Err(e) = store.wipe() {
                     log::error!("[trueseal-sync] store wipe during identity rotation failed: {e}");
@@ -1010,15 +1013,32 @@ impl TrueSeal {
                 if let Err(e) = store.save_keypair(&fresh) {
                     log::error!("[trueseal-sync] persisting the rotated identity failed: {e}");
                 }
-                *last_status.lock().unwrap_or_else(|e| e.into_inner()) = GroupStatus::NotJoined;
-                events.fire(TrueSealEvent::MembersChanged { members: vec![] });
-                events.fire(TrueSealEvent::StatusChanged {
-                    status: GroupStatus::NotJoined,
-                    reason: match reason {
-                        ExitReason::Removed => StatusReason::Removed,
-                        ExitReason::Left => StatusReason::Left,
-                        ExitReason::Destroyed => StatusReason::Destroyed,
-                    },
+                // The events fire once the wipe has SETTLED (the manifest
+                // slot clears right after this callback returns), so the
+                // `status` getter never contradicts a `statusChanged` the
+                // app already received. Bounded poll: if the settle never
+                // comes the events fire anyway rather than being lost.
+                let events = events.clone();
+                let last_status = last_status.clone();
+                let slot = manifest_slot.clone();
+                std::thread::spawn(move || {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while std::time::Instant::now() < deadline {
+                        if slot.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    *last_status.lock().unwrap_or_else(|e| e.into_inner()) = GroupStatus::NotJoined;
+                    events.fire(TrueSealEvent::MembersChanged { members: vec![] });
+                    events.fire(TrueSealEvent::StatusChanged {
+                        status: GroupStatus::NotJoined,
+                        reason: match reason {
+                            ExitReason::Removed => StatusReason::Removed,
+                            ExitReason::Left => StatusReason::Left,
+                            ExitReason::Destroyed => StatusReason::Destroyed,
+                        },
+                    });
                 });
             }
         };
