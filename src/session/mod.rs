@@ -817,6 +817,18 @@ pub(super) fn build_subscribe_handler(
             secret,
         } = &msg
         {
+            // ADR-0029: a Destroying device is ending the group — inbound
+            // Pairs are dropped like manifests. No window can be OPEN while
+            // Destroying (pairing_token refuses and destroy_group() closes
+            // any open window); this guards the residual race where a Pair
+            // passed the secret check just as destroy_group() committed.
+            if destroying
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+            {
+                return;
+            }
             // SYNC-4 (#96): the Pair body's signing_pub must equal the key
             // that actually signed this Envelope. Without the binding, a
             // requester can get a signing key it does not control admitted,
@@ -2791,7 +2803,19 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// the window is open can request to join — the admitting user must
     /// confirm the device in front of them. Member names are labels, not
     /// authentication.
-    pub fn pairing_token(&self) -> String {
+    ///
+    /// Fails typed with `GroupDestroyed` while Destroying (ADR-0029): a
+    /// window opened mid-Destroy could only admit a joiner into a group
+    /// every other device has already dropped.
+    pub fn pairing_token(&self) -> Result<String, SessionError> {
+        if self
+            .destroying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            return Err(SessionError::GroupDestroyed);
+        }
         let secret: [u8; 32] = rand::random();
         {
             // Hold the window lock across the clear AND the replace (B8
@@ -2813,7 +2837,11 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             *window = Some(PairingWindow { secret });
         }
         let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-        crate::message::pairing_token(&ks.noise_pub.0, &ks.signing_pub.0, &secret)
+        Ok(crate::message::pairing_token(
+            &ks.noise_pub.0,
+            &ks.signing_pub.0,
+            &secret,
+        ))
     }
 
     pub fn cancel_pairing(&self) {
@@ -2847,6 +2875,16 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         noise_pub: NoisePublicKey,
         signing_pub: SigningPublicKey,
     ) -> Result<bool, SessionError> {
+        // A Destroying device admits no one (ADR-0029): the group is
+        // ending and no other device would honour the admission.
+        if self
+            .destroying
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            return Err(SessionError::GroupDestroyed);
+        }
         // A Leaving device admits no one (ADR-0027).
         if self
             .leaving

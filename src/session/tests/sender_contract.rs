@@ -474,11 +474,19 @@ fn head_of_line_per_recipient_with_isolation() {
     let b_noise = b.public_key().0;
     let c_noise = c.public_key().0;
 
-    // Custom relay: B's FIRST push is dropped (temporary); everything else
-    // acks. Records (recipient, sequence) per ACKED push, in order. The
-    // sequence is sealed (ADR-0031), so the relay opens each envelope with
-    // the recipient key the test hands it (a colluding-relay vantage is NOT
-    // needed — the test owns every key).
+    // Custom relay: B's pushes are dropped (temporary failure) UNTIL C's
+    // line has fully drained; everything else acks. Records (recipient,
+    // sequence) per ACKED push, in order. The sequence is sealed
+    // (ADR-0031), so the relay opens each envelope with the recipient key
+    // the test hands it (a colluding-relay vantage is NOT needed — the
+    // test owns every key).
+    //
+    // B12b flake fix: the drop used to cover only B's FIRST push, so the
+    // isolation assertion implicitly assumed C's second push beats B's ~1 s
+    // retry backoff — under full-suite CI load a single NK handshake can
+    // exceed that window and the order flipped. Gating B on C's drain makes
+    // the tested property (B's failing line never holds C's up)
+    // deterministic at any machine speed. No assertion weakened.
     let b_priv = b.noise.private();
     let c_priv = c.noise.private();
     let acked: Arc<Mutex<Vec<([u8; 32], u64)>>> = Arc::new(Mutex::new(vec![]));
@@ -487,7 +495,7 @@ fn head_of_line_per_recipient_with_isolation() {
         let kp_xx = Keypair::new(relay_kp.private(), relay_kp.public_key);
         let relay_priv = relay_kp.private();
         let relay_pub_key = relay_kp.public_key;
-        let b_first_failed = Arc::new(AtomicBool::new(false));
+        let c_drained = Arc::new(AtomicBool::new(false));
         std::thread::spawn(move || {
             let session = crate::version::testutil::xx_accept_after_prefix(pipe_relay, kp_xx)
                 .expect("relay accept");
@@ -495,7 +503,7 @@ fn head_of_line_per_recipient_with_isolation() {
             while let Ok(nk_pipe) = nk_rx.recv() {
                 let kp = Keypair::new(relay_priv, relay_pub_key);
                 let acked = acked.clone();
-                let b_first_failed = b_first_failed.clone();
+                let c_drained = c_drained.clone();
                 std::thread::spawn(move || {
                     let sess = match crate::version::testutil::nk_accept_after_prefix(nk_pipe, kp) {
                         Ok(s) => s,
@@ -524,14 +532,15 @@ fn head_of_line_per_recipient_with_isolation() {
                         .and_then(|e| e.open_sealed(priv_key).ok())
                         .map(|sc| sc.sequence)
                         .unwrap_or(u64::MAX);
-                    // B's first-ever push is lost (no ack).
-                    if recipient == b_noise
-                        && seq == 0
-                        && !b_first_failed.swap(true, Ordering::SeqCst)
-                    {
+                    // B's pushes are lost (no ack) until C has fully
+                    // drained — a temporary failure on B's line only.
+                    if recipient == b_noise && !c_drained.load(Ordering::SeqCst) {
                         return; // drop session without ack
                     }
                     acked.lock().unwrap().push((recipient, seq));
+                    if recipient == c_noise && seq == 1 {
+                        c_drained.store(true, Ordering::SeqCst);
+                    }
                     let _ = sess.send(&frame(MsgType::Ack, &[]));
                 });
             }
@@ -1100,7 +1109,7 @@ fn accept_pair_offline_queues_manifest_and_delivers_on_reconnect() {
     .expect("A session");
 
     // Offline admission: window opens, accept_pair persists + queues.
-    let _token = session_a.pairing_token();
+    let _token = session_a.pairing_token().expect("pairing window opens");
     assert!(session_a.accept_pair(b_noise, b_signing).expect("accept"));
     {
         let entries = session_a

@@ -305,9 +305,10 @@ fn main() {
         let (cmd, rest) = split_first(line);
 
         match cmd {
-            "token" => {
-                println!("{}", session.pairing_token());
-            }
+            "token" => match session.pairing_token() {
+                Ok(token) => println!("{token}"),
+                Err(e) => println!("cannot open a pairing window: {e}"),
+            },
 
             "pair" => {
                 if rest.is_empty() {

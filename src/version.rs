@@ -251,9 +251,23 @@ fn check_deadline(deadline: Instant) -> Result<(), TransportVersionError> {
 /// Server half of the prefix exchange, shared by every in-repo fake relay.
 /// Reads and validates the prefix, replies `0x01`, and returns the prefix
 /// bytes to use as the Noise prologue.
+///
+/// The read deadline is the generous HARNESS constant, not the production
+/// EXCHANGE_TIMEOUT: a fake relay's accept thread starts waiting the moment
+/// the relay is SET UP, and in reconnect tests the client only dials the
+/// replacement pipe after the first pipe's failure is detected and the
+/// reconnect loop polls — legitimately far later. Under full-suite CI load
+/// (hundreds of relay/client threads) that gap exceeded 10 s and the relay
+/// thread panicked mid-test, cascading into lost deliveries (the
+/// `post_reconnect_destroy` flake class, #55 — diagnosed in the B12b PR).
+/// Timing expectations in tests are enforced by each test's own wait
+/// budgets, not by the harness plumbing.
+#[cfg(test)]
+const HARNESS_ACCEPT_TIMEOUT: Duration = Duration::from_secs(120);
+
 #[cfg(test)]
 pub(crate) fn fake_relay_accept_prefix<T: Read + Write>(transport: &mut T) -> [u8; 5] {
-    let deadline = Instant::now() + EXCHANGE_TIMEOUT;
+    let deadline = Instant::now() + HARNESS_ACCEPT_TIMEOUT;
     let mut prefix = [0u8; TRANSPORT_PREFIX_LEN];
     read_exact_retry(transport, &mut prefix, deadline).expect("fake relay reads the prefix");
     assert_eq!(

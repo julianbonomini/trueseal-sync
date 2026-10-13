@@ -49,7 +49,7 @@ fn join_group_sends_pair_message_to_initiator() {
         *rt.lock().unwrap() = Some(token);
     });
 
-    let token = session_a.pairing_token();
+    let token = session_a.pairing_token().expect("pairing window opens");
     let result = session_b.join_group(&token);
     assert!(result.is_ok(), "join_group failed: {:?}", result);
 
@@ -169,7 +169,7 @@ fn join_group_queues_the_pair_when_the_relay_refuses_our_version() {
     )
     .expect("connect");
 
-    let token = session.pairing_token();
+    let token = session.pairing_token().expect("pairing window opens");
     session
         .join_group(&token)
         .expect("join_group queues the Pair durably and returns Ok");

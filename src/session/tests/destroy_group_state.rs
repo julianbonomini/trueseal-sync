@@ -14,6 +14,9 @@
 //! - Revoke is ignored in `pendingJoin`, `notJoined` and `destroying`;
 //!   replaying a Revoke changes no state (ADR-0034).
 //! - No `Sync` is sent and no handler runs while Destroying.
+//! - A Destroying device admits no one (B12 review): `pairing_token` and
+//!   `accept_pair` fail typed `GroupDestroyed`, and inbound Pairs are
+//!   dropped — a joiner can never be stranded in a dying group.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -741,7 +744,7 @@ fn revoke_ignored_in_not_joined_and_pending_join() {
     assert!(session_b.op_log.lock().unwrap().destroying().is_none());
 
     // pendingJoin: B asked to join via A's token and is waiting.
-    let token = session_a.pairing_token();
+    let token = session_a.pairing_token().expect("pairing window opens");
     session_b.join_group(&token).expect("join");
     assert_eq!(session_b.group_status(), GroupStatus::PendingJoin);
     let control_before = session_b.op_log.lock().unwrap().undelivered_entries().len();
@@ -1079,4 +1082,213 @@ fn no_handler_runs_while_destroying() {
         0,
         "no handler runs while Destroying"
     );
+}
+
+/// ADR-0029 (B12 review): a Destroying device admits no one. Opening a
+/// Pairing Window mid-Destroy fails typed, `accept_pair` refuses typed,
+/// and no manifest is ever built — a joiner admitted into a dying group
+/// would be stranded: every other device is Destroying or wiped and
+/// drops its manifests.
+#[test]
+fn pairing_is_refused_while_destroying() {
+    let me = DeviceKeypair::generate();
+    let other = DeviceKeypair::generate();
+    let (session, _relay, _destroyed, _gate) = gated_destroy_session(&me);
+    session.set_manifest(GroupManifest::new(
+        new_group_id(),
+        1,
+        vec![member_of(&me), member_of(&other)],
+        &sk_of(&me),
+    ));
+    session.destroy_group().expect("member can destroy");
+    assert_eq!(session.group_status(), GroupStatus::Destroying);
+
+    // Opening a window fails typed — no token, no window.
+    assert!(
+        matches!(session.pairing_token(), Err(SessionError::GroupDestroyed)),
+        "pairing_token must fail typed while Destroying"
+    );
+
+    // Admission refuses typed, and nothing is built or queued.
+    let joiner = DeviceKeypair::generate();
+    let result = session.accept_pair(joiner.public_key(), joiner.signing_public_key());
+    assert!(
+        matches!(result, Err(SessionError::GroupDestroyed)),
+        "accept_pair must fail typed while Destroying, got {result:?}"
+    );
+    {
+        let m = session.manifest.lock().unwrap();
+        let m = m.as_ref().expect("manifest survives");
+        assert_eq!(m.version, 1, "no admission manifest was issued");
+        assert_eq!(m.members.len(), 2, "membership unchanged");
+    }
+    {
+        let log = session.op_log.lock().unwrap();
+        let entries = log.undelivered_entries();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the queued Revoke — no manifest was queued"
+        );
+        assert_eq!(
+            entries[0].blob,
+            Message::Revoke.encode(),
+            "the one queued entry is the Revoke"
+        );
+    }
+}
+
+/// ADR-0029 crash matrix (B12 review gap): a restart with SOME Revoke
+/// refs drained and some still pending resumes Destroying, pushes only
+/// what is still owed, and completes exactly once.
+#[test]
+fn destroy_partially_drained_restart_resumes_and_completes_once() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let me = DeviceKeypair::generate();
+    let o1 = DeviceKeypair::generate();
+    let o2 = DeviceKeypair::generate();
+    let my_noise = me.public_key();
+    let v1 = GroupManifest::new(
+        new_group_id(),
+        1,
+        vec![member_of(&me), member_of(&o1), member_of(&o2)],
+        &sk_of(&me),
+    );
+
+    // Stage: a Destroying record with two Revoke refs. o1's Revoke was
+    // accepted by the Relay (delivered rows are deleted, ADR-0026);
+    // o2's is still queued. CRASH: the process dies here, mid-drain.
+    {
+        let store = Store::open(dir.path(), "ns").expect("store");
+        let mut log = PersistentLog::new(store);
+        let record = super::super::DestroyingRecord {
+            refs: vec![(o1.public_key().0, 7), (o2.public_key().0, 8)],
+        };
+        log.commit_membership(crate::operation_log::MembershipCommit {
+            manifest: v1.encode(),
+            held: vec![(v1.hash(), true)],
+            pending_changes: Vec::new(),
+            leaving: None,
+            destroying: Some(record.encode()),
+            drop_sync_outbox: false,
+            outbox: vec![
+                (o1.public_key().0, 7, Message::Revoke.encode()),
+                (o2.public_key().0, 8, Message::Revoke.encode()),
+            ],
+        })
+        .expect("stage destroying");
+        log.mark_delivered(&o1.public_key().0, 7);
+    }
+
+    // Restart over the same store with a working relay that Acks pushes.
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let relay_priv = relay_kp.private();
+    let relay_pub_raw = relay_kp.public_key;
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
+    let pushes: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    {
+        let pp = pushes.clone();
+        let relay_kp2 = trueseal_noise::keypair::Keypair::new(relay_priv, relay_pub_raw);
+        std::thread::spawn(move || {
+            // Hold the XX session open (B12 harness note): dropping it
+            // EOFs the client's receive loop.
+            let Ok(_sess) = crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2)
+            else {
+                return;
+            };
+            while let Ok(p) = nk_rx.recv() {
+                let kp = trueseal_noise::keypair::Keypair::new(relay_priv, relay_pub_raw);
+                let pp2 = pp.clone();
+                std::thread::spawn(move || {
+                    if let Ok(sess) = crate::version::testutil::nk_accept_after_prefix(p, kp) {
+                        if sess.receive().is_ok() {
+                            *pp2.lock().unwrap() += 1;
+                            let _ =
+                                sess.send(&crate::relay::frame(crate::relay::MsgType::Ack, &[]));
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    let destroyed: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let dc = destroyed.clone();
+    let rotated_to: Arc<Mutex<Option<NoisePublicKey>>> = Arc::new(Mutex::new(None));
+    let rt = rotated_to.clone();
+    let store = Store::open(dir.path(), "ns").expect("store reopen");
+    let seeded = store.load_group_manifest().expect("load");
+    let log = PersistentLog::new(store);
+    let pipe_slot: Arc<Mutex<Option<MemPipe>>> = Arc::new(Mutex::new(Some(pipe_client)));
+    let ps = pipe_slot.clone();
+    let session = TruesealSession::connect_background_rotating(
+        relay_pub,
+        clone_kp(&me),
+        |_, _, _| {},
+        Box::new(log),
+        Arc::new(Mutex::new(seeded)),
+        || {},
+        |_| {},
+        move || {
+            *dc.lock().unwrap() += 1;
+        },
+        move |fresh| *rt.lock().unwrap() = Some(fresh.public_key()),
+        move || {
+            ps.lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| "exhausted".to_string())
+        },
+        nk.factory(),
+        Some(Duration::from_millis(50)),
+        None,
+    )
+    .expect("session");
+
+    // The partial drain did NOT complete at construction — o2's Revoke is
+    // still owed, so Destroying resumes.
+    assert_eq!(
+        session.group_status(),
+        GroupStatus::Destroying,
+        "a partially drained Destroying resumes, it does not complete"
+    );
+
+    // The pump pushes only the still-owed Revoke (o2's), the relay Acks
+    // it, and completion fires exactly once.
+    wait_for(
+        || session.group_status() == GroupStatus::NotJoined,
+        Duration::from_secs(20),
+    );
+    assert_eq!(
+        *pushes.lock().unwrap(),
+        1,
+        "only the pending Revoke is pushed — the drained ref is not re-sent"
+    );
+    assert_eq!(
+        *destroyed.lock().unwrap(),
+        1,
+        "on_group_destroyed fired exactly once"
+    );
+    assert_ne!(
+        session.noise_pub(),
+        my_noise,
+        "identity rotated by the completing wipe"
+    );
+    assert_eq!(
+        *rotated_to.lock().unwrap(),
+        Some(session.noise_pub()),
+        "rotation callback carried the fresh identity"
+    );
+    {
+        let store = Store::open(dir.path(), "ns").expect("check store");
+        let log = PersistentLog::new(store);
+        assert!(log.destroying().is_none(), "Destroying record cleared");
+        assert!(log.undelivered_entries().is_empty(), "outbox empty");
+        assert!(
+            !log.is_held_signer(&me.signing_public_key().0),
+            "held signer history wiped"
+        );
+    }
 }

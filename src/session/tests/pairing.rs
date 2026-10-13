@@ -34,7 +34,7 @@ fn pairing_ceremony_creates_manifest_with_new_member() {
         .expect("session A"),
     );
 
-    let _token = session_a.pairing_token();
+    let _token = session_a.pairing_token().expect("pairing window opens");
 
     let device_b_noise_pub = device_b.public_key();
     let device_b_signing_pub = device_b.signing_public_key();
@@ -89,7 +89,7 @@ fn accept_pair_outside_window_is_noop() {
     // No window open — should be a noop.
     session.accept_pair(dummy, dummy_signing).expect("accept");
 
-    let _ = session.pairing_token();
+    let _ = session.pairing_token().expect("pairing window opens");
     session.cancel_pairing();
     // Window cancelled — accept_pair should return false.
     assert!(!session.accept_pair(dummy, dummy_signing).expect("accept"));
@@ -116,7 +116,7 @@ fn accept_pair_window_stays_open_until_cancelled() {
     )
     .expect("connect");
 
-    let _token = session.pairing_token();
+    let _token = session.pairing_token().expect("pairing window opens");
     // Sleep well beyond the old 60-second auto-expiry — window must still be open.
     std::thread::sleep(Duration::from_millis(10));
 
@@ -157,7 +157,7 @@ fn accept_pair_returns_bool_reflecting_window_state() {
         "no window: should return false"
     );
 
-    let _token = session.pairing_token();
+    let _token = session.pairing_token().expect("pairing window opens");
     assert!(
         session.accept_pair(dummy, dummy_signing).expect("accept"),
         "open window: should return true"
@@ -167,7 +167,7 @@ fn accept_pair_returns_bool_reflecting_window_state() {
         "window consumed: should return false"
     );
 
-    let _token = session.pairing_token();
+    let _token = session.pairing_token().expect("pairing window opens");
     session.cancel_pairing();
     assert!(
         !session.accept_pair(dummy, dummy_signing).expect("accept"),
@@ -232,7 +232,7 @@ fn cancel_pairing_clears_pending_members() {
     .expect("connect");
 
     // Open window, inject a fake pending member directly.
-    let _token = session.pairing_token();
+    let _token = session.pairing_token().expect("pairing window opens");
     let fake_token = "fake-token".to_string();
     session.pending_members.lock().unwrap().insert(
         fake_token.clone(),

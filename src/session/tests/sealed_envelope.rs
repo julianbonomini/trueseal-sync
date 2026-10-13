@@ -664,7 +664,7 @@ fn replayed_pair_after_window_closed_is_a_harmless_no_op() {
     let issues_cb = issues.clone();
     session.subscribe_delivery_issues(move |i| issues_cb.lock().unwrap().push(i));
 
-    let token = session.pairing_token();
+    let token = session.pairing_token().expect("pairing window opens");
     let (_, _, secret, _) = crate::message::decode_pairing_token(&token).expect("token");
     let pair = crate::message::Message::Pair {
         noise_pub: [0xC3; 32],

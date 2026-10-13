@@ -406,8 +406,10 @@ impl TruesealFfiSession {
     ///
     /// Documented limitation (ADR-0023): anyone who sees the token while the
     /// window is open can request to join — confirm the device in front of you.
-    pub fn pairing_token(&self) -> String {
-        self.inner.pairing_token()
+    /// Fails typed `groupDestroyed` while Destroying (ADR-0029): a Destroying
+    /// device admits no one.
+    pub fn pairing_token(&self) -> Result<String, SessionError> {
+        self.inner.pairing_token().map_err(SessionError::from)
     }
 
     /// Join a group as the responding device by decoding the initiator's `token`
@@ -776,7 +778,7 @@ mod store_versioning_ffi_tests {
         assert_eq!(resets.load(Ordering::SeqCst), 1, "storeReset reported once");
         assert_eq!(session.group_status(), GroupStatus::NotJoined);
         // The object can pair again.
-        assert!(!session.pairing_token().is_empty());
+        assert!(!session.pairing_token().expect("window opens").is_empty());
         // Destroying outside a group is a typed error, not a panic
         // (ADR-0029 state table).
         assert!(matches!(

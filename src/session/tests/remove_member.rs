@@ -159,6 +159,14 @@ fn remove_member_issues_new_manifest_excluding_target() {
     session_b.set_manifest(v1.clone());
     session_c.set_manifest(v1.clone());
 
+    // Capture C's identity BEFORE the trigger (B12b flake fix): the wipe
+    // rotates keys BEFORE clearing the manifest slot (wipe_and_rotate),
+    // so a fast removal can complete while the B-version wait below is
+    // still polling — capturing after remove_member() could record the
+    // ALREADY-rotated key as "before" and wait forever for a change that
+    // already happened (~1/6 flake on main).
+    let c_signing_before = session_c.signing_pub();
+
     // A removes C.
     session_a.remove_member(c_signing).expect("remove_member");
 
@@ -182,7 +190,6 @@ fn remove_member_issues_new_manifest_excluding_target() {
     // C is DELIBERATELY removed (ADR-0027): the removal manifest is
     // parent-linked to the v1 C held — so the library wipes C's group
     // state (its manifest slot empties) and rotates its identity.
-    let c_signing_before = session_c.signing_pub();
     wait_for(
         || session_c.manifest.lock().unwrap().is_none(),
         Duration::from_secs(15),

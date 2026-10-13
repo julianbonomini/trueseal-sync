@@ -241,7 +241,7 @@ fn manifest_restore_via_connect_background() {
     )
     .expect("session B1");
 
-    let _token = session_a.pairing_token();
+    let _token = session_a.pairing_token().expect("pairing window opens");
     assert!(
         session_a.accept_pair(b_noise, b_signing).expect("accept"),
         "accept_pair"
