@@ -63,7 +63,11 @@ fn connection_changed_fires_true_on_initial_connect() {
     )
     .expect("session");
 
-    std::thread::sleep(Duration::from_millis(400));
+    // SYNC-19 flake sweep: react to the event, not a fixed delay.
+    wait_for(
+        || *events.lock().unwrap() == vec![true],
+        Duration::from_millis(5_000),
+    );
     assert_eq!(
         *events.lock().unwrap(),
         vec![true],
@@ -142,16 +146,25 @@ fn connection_changed_fires_sequence_on_disconnect_and_reconnect() {
     )
     .expect("session");
 
-    // Wait for first connect → true.
-    std::thread::sleep(Duration::from_millis(400));
+    // Wait for first connect → true (SYNC-19 flake sweep: no fixed sleep).
+    wait_for(
+        || *events.lock().unwrap() == vec![true],
+        Duration::from_millis(5_000),
+    );
     assert_eq!(*events.lock().unwrap(), vec![true], "should connect first");
 
     // Kill the first connection → run_loop detects EOF → is_connected = false.
     close_client1.store(true, Ordering::Release);
 
-    // Wait for false + reconnect true.
-    // Reconnect backoff is reset to 1s after success, so allow ~1.5s total.
-    std::thread::sleep(Duration::from_millis(1800));
+    // Wait for false + reconnect true, however long the backoff takes on a
+    // loaded runner (generous timeout; the assertions are unchanged).
+    wait_for(
+        || {
+            let e = events.lock().unwrap();
+            e.contains(&false) && e.last() == Some(&true)
+        },
+        Duration::from_millis(10_000),
+    );
     let snapshot = events.lock().unwrap().clone();
     assert!(
         snapshot.contains(&false),
