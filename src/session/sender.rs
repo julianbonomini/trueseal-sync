@@ -361,12 +361,21 @@ fn sender_loop<T: crate::relay::Severable>(
                         backoffs.remove(&recipient);
                     }
                     Err(e) => {
-                        // Classify the refusal: permanent (the relay's Error
-                        // frame; an Envelope that cannot fit one Noise
-                        // frame) deletes the entry and reports; anything
-                        // else is temporary.
+                        // Classify the refusal: permanent (the relay's
+                        // Error frame with a permanent reason code; an
+                        // Envelope that cannot fit one Noise frame)
+                        // deletes the entry and reports; anything else —
+                        // including the relay's TEMPORARY reason codes
+                        // (bit 7 set, relay ADR-0008 amended by RELAY-5):
+                        // a transient relay-internal failure must never
+                        // drop a queued message (B20b) — is temporary.
                         let permanent = match e {
-                            RelayError::PushRejected => Some(SendFailedReason::Malformed),
+                            RelayError::PushRejected(crate::relay::RelayRefusal::TooLarge) => {
+                                Some(SendFailedReason::TooLarge)
+                            }
+                            RelayError::PushRejected(crate::relay::RelayRefusal::Malformed {
+                                ..
+                            }) => Some(SendFailedReason::Malformed),
                             RelayError::EnvelopeTooLarge => Some(SendFailedReason::TooLarge),
                             _ => None,
                         };

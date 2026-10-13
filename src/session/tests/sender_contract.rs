@@ -338,7 +338,8 @@ fn permanent_refusal_raises_send_failed_and_is_never_retried() {
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let (nk_rx, nk) = nk_push_channel();
     // Every push is refused with the legacy reasonless Error body.
-    let relay = ScriptedPushRelay::spawn(pipe_relay, &relay_kp, nk_rx, vec![], Verdict::Error(None));
+    let relay =
+        ScriptedPushRelay::spawn(pipe_relay, &relay_kp, nk_rx, vec![], Verdict::Error(None));
 
     let device = DeviceKeypair::generate();
     let recipient = DeviceKeypair::generate();

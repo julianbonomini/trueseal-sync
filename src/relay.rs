@@ -32,10 +32,12 @@ pub enum RelayError {
     /// Non-retryable — the outbox must not replay this blob.
     #[error("envelope too large")]
     EnvelopeTooLarge,
-    /// The relay permanently rejected the blob (e.g. oversized, malformed).
-    /// Non-retryable — the outbox must not replay this blob indefinitely.
-    #[error("push rejected by relay")]
-    PushRejected,
+    /// The relay refused the blob with an Error frame, classified by the
+    /// typed reason byte (relay ADR-0008, amended by RELAY-5). Permanent
+    /// refusals are non-retryable — the outbox must not replay this blob
+    /// indefinitely; temporary refusals back off and retry (ADR-0026).
+    #[error("push refused by relay: {0:?}")]
+    PushRejected(RelayRefusal),
     /// The relay refused our Transport Version and reported the range it
     /// supports (ADR-0022). Not a per-blob rejection — outbox entries stay
     /// queued; the relay (or this client) must be upgraded.
@@ -54,6 +56,43 @@ impl From<TransportVersionError> for RelayError {
     }
 }
 
+/// The relay's typed refusal of a Push, classified from the Error frame's
+/// one-byte reason code (relay ADR-0008, amended by RELAY-5; the ADR-0026
+/// relay contract). Bit 7 set marks a TEMPORARY refusal — the blob may be
+/// accepted on a later retry. Bit 7 clear is permanent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayRefusal {
+    /// 0x01 tooLarge — the blob exceeds the relay's size limit (ADR-0025:
+    /// a size refusal is permanent and typed; a relay operator may only
+    /// LOWER the limit, so a client-legal blob can still be refused).
+    TooLarge,
+    /// 0x02 malformed, an unknown bit-7-clear code, or a legacy reasonless
+    /// Error body. Permanent: the blob will never be accepted. The legacy
+    /// mapping is ADR-0026's documented rule — an untyped refusal reports
+    /// `sendFailed(malformed)` — and pre-RELAY-5 relays only refused
+    /// oversize pushes, which the client-side size check already prevents.
+    Malformed { code: Option<u8> },
+    /// Any reason byte with bit 7 set: 0x81 inboxFull, 0x82 rateLimited,
+    /// 0x83 unavailable, 0x84 internal, or a future temporary code.
+    /// Temporary — the outbox backs off and retries while connected.
+    Temporary { code: u8 },
+}
+
+/// Classify a relay Error frame body (relay ADR-0008 amended). A
+/// zero-length body remains well-formed for backward compatibility with
+/// pre-typed relays and maps to the ADR-0026 legacy rule (permanent,
+/// malformed). Unknown codes classify by bit 7 alone, so a future relay
+/// taxonomy stays forward-compatible: unknown temporary codes retry,
+/// unknown permanent codes fail typed.
+fn classify_refusal(body: &[u8]) -> RelayRefusal {
+    match body.first().copied() {
+        Some(0x01) => RelayRefusal::TooLarge,
+        Some(0x02) => RelayRefusal::Malformed { code: Some(0x02) },
+        Some(code) if code & 0x80 != 0 => RelayRefusal::Temporary { code },
+        other => RelayRefusal::Malformed { code: other },
+    }
+}
+
 /// Wire protocol framing over the Noise session.
 /// Each message: [msg_type: u8][len: u32 BE][body: bytes]
 #[repr(u8)]
@@ -69,9 +108,11 @@ pub(crate) enum MsgType {
     /// NK already authenticates the relay so a well-formed Ack is sufficient proof.
     /// trueseal-sync accepts any body length defensively but the relay always sends 0 bytes.
     Ack = 0x04,
-    /// Relay → client. Body: empty (0 bytes).
-    /// Semantic: the relay permanently rejected the blob (e.g. oversized envelope).
-    /// The sender must NOT retry — `push_send` returns `RelayError::PushRejected`.
+    /// Relay → client. Body: one byte — the typed reason code (relay
+    /// ADR-0008, amended by RELAY-5); a zero-length body stays well-formed
+    /// for pre-typed relays. `push_send` classifies it into
+    /// `RelayError::PushRejected(RelayRefusal)` — permanent codes must not
+    /// be retried; temporary codes (bit 7 set) back off and retry.
     Error = 0x05,
     DeliverAck = 0x06,
 }
@@ -980,7 +1021,9 @@ fn push_send_with_deadline<T: Read + Write + Send>(
         .map_err(|e| RelayError::PushFailed(format!("expected Ack: {e}")))?;
     match parse(&raw) {
         Some((MsgType::Ack, _)) => {}
-        Some((MsgType::Error, _)) => return Err(RelayError::PushRejected),
+        Some((MsgType::Error, body)) => {
+            return Err(RelayError::PushRejected(classify_refusal(body)))
+        }
         _ => return Err(RelayError::PushFailed("expected Ack".into())),
     }
     session.close().ok();
@@ -1218,10 +1261,63 @@ mod tests {
 
         let result = push_send(client_pipe, relay_pub, blob);
         assert!(
-            matches!(result, Err(RelayError::PushRejected)),
-            "expected PushRejected, got {:?}",
+            matches!(
+                result,
+                Err(RelayError::PushRejected(RelayRefusal::Malformed {
+                    code: None
+                }))
+            ),
+            "a legacy reasonless Error body maps to permanent Malformed, got {:?}",
             result
         );
+    }
+
+    /// The relay's typed Error reason byte classifies at the push seam
+    /// (relay ADR-0008, amended by RELAY-5): permanent codes never retry,
+    /// temporary codes (bit 7 set) back off, and the legacy reasonless
+    /// body keeps ADR-0026's documented untyped mapping.
+    #[test]
+    fn error_reason_byte_classifies_at_the_push_seam() {
+        use crate::version::testutil::nk_accept_after_prefix as nk_accept;
+        use trueseal_noise::keypair::generate_keypair;
+
+        let cases: &[(&[u8], RelayRefusal)] = &[
+            (&[0x01], RelayRefusal::TooLarge),
+            (&[0x02], RelayRefusal::Malformed { code: Some(0x02) }),
+            (&[0x81], RelayRefusal::Temporary { code: 0x81 }),
+            (&[0x82], RelayRefusal::Temporary { code: 0x82 }),
+            (&[0x83], RelayRefusal::Temporary { code: 0x83 }),
+            (&[0x84], RelayRefusal::Temporary { code: 0x84 }),
+            // Unknown codes classify by bit 7 alone (forward-compatible).
+            (&[0x03], RelayRefusal::Malformed { code: Some(0x03) }),
+            (&[0x85], RelayRefusal::Temporary { code: 0x85 }),
+            (&[0xFF], RelayRefusal::Temporary { code: 0xFF }),
+            // The legacy pre-RELAY-5 reasonless body: permanent, ADR-0026.
+            (&[], RelayRefusal::Malformed { code: None }),
+        ];
+        for (body, expected) in cases {
+            let relay_kp = generate_keypair();
+            let relay_pub = relay_kp.public_key;
+            let (client_pipe, relay_pipe) = mem_pipe_pair();
+            let body = body.to_vec();
+            let body_dbg = format!("{body:02x?}");
+            std::thread::spawn(move || {
+                let relay_kp2 =
+                    trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_pub);
+                let session = nk_accept(relay_pipe, relay_kp2).unwrap();
+                let _ = session.receive(); // drain the Push
+                let _ = session.send(&frame(MsgType::Error, &body));
+            });
+
+            let result = push_send(client_pipe, relay_pub, b"blob".to_vec());
+            match result {
+                Err(RelayError::PushRejected(refusal)) => assert_eq!(
+                    &refusal, expected,
+                    "Error body {body_dbg} must classify as {expected:?}"
+                ),
+                other => panic!("expected a typed refusal, got {other:?}"),
+            }
+        }
     }
 
     /// Connecting with the wrong relay public key is rejected.
@@ -2443,7 +2539,7 @@ mod tests {
         drop(relay_handle);
         let result = answered.expect("a hung Ack wait must resolve, not wedge the pump forever");
         match result {
-            Err(RelayError::PushRejected) => {
+            Err(RelayError::PushRejected(_)) => {
                 panic!("a missing Ack is temporary (retry), never a permanent refusal")
             }
             Err(_) => {}
