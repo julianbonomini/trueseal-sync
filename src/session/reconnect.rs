@@ -4,17 +4,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ed25519_dalek::SigningKey;
 use trueseal_noise::keypair::Keypair as NoiseKeypair;
 
-use crate::envelope::SigningKeypair;
 use crate::keys::NoisePublicKey;
 use crate::manifest::GroupManifest;
 use crate::message::Message;
 use crate::operation_log::OperationLog;
-use crate::relay::{build_push_blob, push_send, RelayClient};
+use crate::relay::RelayClient;
 
-use super::{IssueSink, KeyState, PendingMember};
+use super::{EventSink, IssueSink, KeyState, PendingMember};
 
 /// Polls for relay disconnect, backs off, reconnects, and replays the outbox.
 /// Runs in a background thread spawned by `connect_with_reconnect`.
@@ -31,12 +29,11 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     destroyed: Arc<AtomicBool>,
     pairing: Arc<Mutex<Option<super::PairingWindow>>>,
     pending_members: Arc<Mutex<HashMap<String, PendingMember>>>,
-    on_member_request: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
-    on_member_joined: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
-    on_member_left: Arc<Mutex<Option<Box<dyn Fn(String, String) + Send + Sync>>>>,
+    on_member_request: Arc<Mutex<EventSink>>,
+    on_member_joined: Arc<Mutex<EventSink>>,
+    on_member_left: Arc<Mutex<EventSink>>,
     issue_sink: Arc<Mutex<IssueSink>>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
-    push_factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
     on_connection_changed: Arc<dyn Fn(bool) + Send + Sync + 'static>,
 ) {
@@ -75,9 +72,9 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             Err(_) => continue,
         };
 
-        let (noise_priv, noise_pub_key, signing_priv) = {
+        let (noise_priv, noise_pub_key) = {
             let ks = keys.lock().unwrap_or_else(|e| e.into_inner());
-            (ks.noise_priv, ks.noise_pub_key, ks.signing_priv)
+            (ks.noise_priv, ks.noise_pub_key)
         };
 
         let noise_kp = NoiseKeypair::new(noise_priv, noise_pub_key);
@@ -98,51 +95,44 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             on_member_joined.clone(),
             on_member_left.clone(),
             issue_sink.clone(),
+            op_log.clone(),
             on_message.clone(),
         );
-        let new_client =
-            match RelayClient::connect_subscribed(transport, relay_pub, noise_kp, handler) {
-                Ok(c) => c,
-                Err(crate::relay::RelayError::RelayVersionUnsupported { min, max }) => {
-                    // The relay refuses our Transport Version (ADR-0022). Keep
-                    // retrying — the relay may be upgraded — and leave every
-                    // outbox entry queued.
-                    log::warn!(
-                        "relay supports Transport Version {min}..={max}, \
-                         this build speaks {}; outbox stays queued",
-                        crate::version::TRANSPORT_VERSION
-                    );
-                    continue;
-                }
-                Err(_) => continue,
-            };
+        // SYNC-5: receive-path Delivery Issues forward into the session sink
+        // from the first frame of the new session.
+        let issue_forwarder = {
+            let sink = issue_sink.clone();
+            move |issue: crate::delivery_issue::DeliveryIssue| {
+                sink.lock().unwrap_or_else(|e| e.into_inner()).fire(issue);
+            }
+        };
+        let new_client = match RelayClient::connect_subscribed(
+            transport,
+            relay_pub,
+            noise_kp,
+            handler,
+            Some(Box::new(issue_forwarder)),
+        ) {
+            Ok(c) => c,
+            Err(crate::relay::RelayError::RelayVersionUnsupported { min, max }) => {
+                // The relay refuses our Transport Version (ADR-0022). Keep
+                // retrying — the relay may be upgraded — and leave every
+                // outbox entry queued.
+                log::warn!(
+                    "relay supports Transport Version {min}..={max}, \
+                     this build speaks {}; outbox stays queued",
+                    crate::version::TRANSPORT_VERSION
+                );
+                continue;
+            }
+            Err(_) => continue,
+        };
 
         *client.lock().unwrap_or_else(|e| e.into_inner()) = new_client;
         backoff = Duration::from_secs(1);
 
-        // Replay undelivered outbox in ascending sequence order.
-        let signing = SigningKeypair::from_signing_key(SigningKey::from_bytes(&signing_priv));
-        let relay_pub_bytes = relay_pub.0;
-        let entries = op_log
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .undelivered_entries();
-        for entry in entries {
-            let oid = entry.object_id;
-            let recipient_pub = NoisePublicKey(oid);
-            let msg = crate::message::Message::Sync { body: entry.blob };
-            let result = build_push_blob(&msg, recipient_pub, entry.sequence, vec![], &signing)
-                .and_then(|framed| {
-                    (push_factory)()
-                        .map_err(crate::relay::RelayError::PushFailed)
-                        .and_then(|transport| push_send(transport, relay_pub_bytes, framed))
-                });
-            if result.is_ok() {
-                op_log
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .mark_delivered(&oid, entry.sequence);
-            }
-        }
+        // SYNC-5: no outbox replay here. The sender pump owns the whole
+        // outbox state machine (ADR-0026) — it notices the reconnection,
+        // clears its per-recipient backoffs and retries immediately.
     }
 }

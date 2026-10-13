@@ -116,11 +116,15 @@ fn join_group_invalid_token_returns_error() {
     );
 }
 
-/// A relay that refuses the push's Transport Version surfaces the typed
-/// RelayVersionUnsupported through join_group — not a stringified PushFailed.
-/// PR #116 preserved it in push_message; join_group must not re-erase it.
+/// A relay that refuses the push's Transport Version leaves the queued Pair
+/// in the outbox — an unsupported Transport Version affects the whole
+/// connection, not one entry, and entries stay queued until the library or
+/// relay is upgraded (ADR-0022, ADR-0026). Before SYNC-5 moved the control
+/// plane through the outbox, this surfaced synchronously as the typed
+/// `RelayVersionUnsupported`; now `join_group` returns Ok after durably
+/// queueing and the refusal is the pump's to retry.
 #[test]
-fn join_group_surfaces_typed_relay_version_unsupported() {
+fn join_group_queues_the_pair_when_the_relay_refuses_our_version() {
     let relay_kp = make_relay_kp();
     let relay_pub = relay_pub(&relay_kp);
     let (pipe_client, pipe_relay) = mem_pipe_pair();
@@ -166,13 +170,22 @@ fn join_group_surfaces_typed_relay_version_unsupported() {
     .expect("connect");
 
     let token = session.pairing_token();
-    let result = session.join_group(&token);
-    assert!(
-        matches!(
-            result,
-            Err(super::super::SessionError::RelayVersionUnsupported { min: 1, max: 1 })
-        ),
-        "join_group must surface the typed refusal, got {:?}",
-        result
+    session
+        .join_group(&token)
+        .expect("join_group queues the Pair durably and returns Ok");
+
+    // The pump keeps attempting (temporary class) and the entry never
+    // leaves the outbox: give it several backoff cycles, then verify.
+    std::thread::sleep(Duration::from_millis(500));
+    let entries = session
+        .op_log
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .undelivered_entries();
+    assert_eq!(entries.len(), 1, "the Pair stays queued, undelivered");
+    assert_eq!(
+        entries[0].kind,
+        crate::operation_log::OutboxKind::Control,
+        "the queued Pair is a control-plane entry that never expires"
     );
 }

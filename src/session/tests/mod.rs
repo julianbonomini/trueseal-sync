@@ -1,6 +1,7 @@
 mod accept_member;
 mod accept_pair;
 mod connection;
+mod delivery_contract;
 mod destroy_group;
 mod early_deliver;
 mod fanout;
@@ -20,6 +21,7 @@ mod push;
 mod remove_member;
 mod remove_member_by_id;
 mod revocation;
+mod sender_contract;
 mod size_limit;
 mod version_arithmetic;
 

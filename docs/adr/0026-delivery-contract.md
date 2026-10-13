@@ -1,6 +1,12 @@
 # Delivery contract: ack after handling, library dedup, per-sender order
 
-Status: accepted (decided 2026-09-29 in [trueseal-roadmap#7](https://github.com/julianbonomini/trueseal-roadmap/issues/7); not yet implemented). This supersedes the DeliverAck timing and caller-owned dedup of ADR-0020. The Message ID derivation in ADR-0020 stands. Amended by ADR-0034.
+Status: accepted (decided 2026-09-29 in [trueseal-roadmap#7](https://github.com/julianbonomini/trueseal-roadmap/issues/7); implemented in SYNC-5, trueseal-sync#97). This supersedes the DeliverAck timing and caller-owned dedup of ADR-0020. The Message ID derivation in ADR-0020 stands. Amended by ADR-0034.
+
+Implementation notes (SYNC-5):
+- The dedup table keeps a handled Message ID for 60 days from the handling time. ADR-0034 §2's refinement ("the later of the handling time and the Sender Timestamp") lands with the sealed Sender Timestamp in SYNC-12; the Envelope carries no timestamp yet.
+- The relay's refusal codes are untyped today, so a permanent refusal reports `sendFailed(malformed)`; RELAY-5's typed Error codes may split the reason.
+- The in-memory handler backoff between the 5 attempts is 100/200/400/800 ms; a hung handler stalls the session's delivery, as specified.
+- A Revoke is queued through the outbox before the destroyed flag is set, and the sender pump drains it while connected. The durable Destroying state that survives a restart is SYNC-11 (ADR-0029), as this ADR defers.
 
 A Device acks a Blob to the Relay only after the app's message handler has finished with it, or after the library has decided the Blob is unusable. The library runs handlers one at a time and drops duplicates itself, using a table of handled Message IDs. Senders retry while connected, never let a later message overtake one still being retried, and learn about every message they give up on. Pair and every Group Manifest use the same durable outbox as `Sync`.
 

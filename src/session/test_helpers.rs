@@ -211,7 +211,7 @@ pub(super) fn spawn_routing_relay(
     std::thread::spawn(move || {
         let sess_a = xx_accept_after_prefix(pipe_a, relay_kp_a).unwrap();
         let sess_b = xx_accept_after_prefix(pipe_b, relay_kp_b).unwrap();
-        let (_src, dst) = if a_is_src {
+        let (src, dst) = if a_is_src {
             (Arc::new(sess_a), Arc::new(sess_b))
         } else {
             (Arc::new(sess_b), Arc::new(sess_a))
@@ -219,6 +219,12 @@ pub(super) fn spawn_routing_relay(
         // NK push accept loop: every push from the pushing device arrives here.
         let dst_nk = dst.clone();
         std::thread::spawn(move || {
+            // Hold the source session OPEN for the life of the relay, like a
+            // real relay does: dropping it EOFs the pushing device's Receive
+            // Session, and since SYNC-5 the sender pump (correctly) only
+            // sends while connected — a dropped src session silently wedged
+            // the outbox in every test using this relay.
+            let _keep_src_alive = src;
             while let Ok(nk_pipe) = nk_rx.recv() {
                 let kp = Keypair::new(relay_priv, relay_pub_key);
                 let dst2 = dst_nk.clone();
