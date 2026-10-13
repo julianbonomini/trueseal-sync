@@ -1802,3 +1802,472 @@ mod tests {
         assert_eq!(log.max_sequence(), Some(7));
     }
 }
+
+#[cfg(test)]
+mod versioning_tests {
+    //! ADR-0032 / ADR-0034 §1: Store Versions, chained migrations, the
+    //! automatic Store Reset, storeTooNew, crash behaviour, and the
+    //! End-to-End bump re-seal (SYNC-13, #105).
+
+    use super::*;
+    use crate::device::DeviceKeypair;
+    use crate::manifest::{GroupManifest, ManifestMember};
+    use crate::message::Message;
+
+    fn tmp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    fn oid(b: u8) -> [u8; 32] {
+        [b; 32]
+    }
+
+    fn member(kp: &DeviceKeypair, name: &str) -> ManifestMember {
+        ManifestMember {
+            noise_pub: kp.public_key(),
+            signing_pub: kp.signing_public_key(),
+            name: name.to_string(),
+        }
+    }
+
+    fn sha256_file(path: &Path) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(std::fs::read(path).expect("read db")).into()
+    }
+
+    /// A v1 store with one marker row, closed.
+    fn make_v1_store(dir: &Path, ns: &str) -> DeviceKeypair {
+        let kp = DeviceKeypair::generate();
+        let s = Store::open(dir, ns).expect("open");
+        s.save_keypair(&kp).expect("save keypair");
+        drop(s);
+        kp
+    }
+
+    fn raw_meta_get(dir: &Path, ns: &str, key: &str) -> Option<i64> {
+        let conn = rusqlite::Connection::open(dir.join(format!("trueseal_{ns}.db"))).unwrap();
+        conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| {
+            r.get::<_, i64>(0)
+        })
+        .ok()
+    }
+
+    // ── Fresh store ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn fresh_store_records_store_version_1_and_reopen_is_idempotent() {
+        let dir = tmp_dir();
+        let (s, outcome) = Store::open_with_outcome(dir.path(), "ns").expect("open");
+        assert!(outcome.created);
+        assert!(!outcome.reset);
+        assert_eq!(outcome.migrated_from, None);
+        assert_eq!(outcome.resealed_from_e2e, None);
+        assert_eq!(
+            meta_get(&s.conn, META_STORE_VERSION).unwrap(),
+            Some(crate::version::STORE_VERSION as i64)
+        );
+        assert_eq!(
+            meta_get(&s.conn, META_E2E_VERSION).unwrap(),
+            Some(crate::version::END_TO_END_VERSION as i64)
+        );
+        drop(s);
+        let (_s2, outcome2) = Store::open_with_outcome(dir.path(), "ns").expect("reopen");
+        assert_eq!(outcome2, OpenOutcome::default(), "reopen: nothing to do");
+    }
+
+    // ── Chained migrations ───────────────────────────────────────────────────
+
+    fn step_1_to_2(tx: &rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error> {
+        tx.execute("INSERT INTO meta (key, value) VALUES ('step_1_to_2', 1)", [])?;
+        Ok(())
+    }
+    fn step_2_to_3(tx: &rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error> {
+        tx.execute("INSERT INTO meta (key, value) VALUES ('step_2_to_3', 1)", [])?;
+        Ok(())
+    }
+
+    #[test]
+    fn synthetic_older_store_migrates_through_every_chained_step() {
+        let dir = tmp_dir();
+        make_v1_store(dir.path(), "ns");
+        let steps: &[(u32, Migration)] = &[(1, step_1_to_2), (2, step_2_to_3)];
+        let (s, outcome) = Store::open_inner(dir.path(), "ns", 3, crate::version::END_TO_END_VERSION, steps)
+            .expect("migrate");
+        assert_eq!(outcome.migrated_from, Some(1));
+        assert_eq!(meta_get(&s.conn, META_STORE_VERSION).unwrap(), Some(3));
+        // Every step ran, in order.
+        assert_eq!(raw_meta_get(dir.path(), "ns", "step_1_to_2"), Some(1));
+        assert_eq!(raw_meta_get(dir.path(), "ns", "step_2_to_3"), Some(1));
+        // Identity survived the chain.
+        assert!(s.load_keypair().expect("load").is_some());
+    }
+
+    #[test]
+    fn migration_without_a_path_fails_and_leaves_the_store_intact() {
+        let dir = tmp_dir();
+        make_v1_store(dir.path(), "ns");
+        // No steps registered: v1 -> v2 has no path.
+        let err = match Store::open_inner(dir.path(), "ns", 2, crate::version::END_TO_END_VERSION, &[]) {
+            Ok(_) => panic!("no migration path should fail"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, StoreError::MigrationFailed { from: 1, .. }));
+        assert_eq!(raw_meta_get(dir.path(), "ns", META_STORE_VERSION), Some(1));
+    }
+
+    fn step_writes_then_fails(tx: &rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error> {
+        tx.execute("INSERT INTO meta (key, value) VALUES ('partial_step', 1)", [])?;
+        Err(rusqlite::Error::InvalidQuery)
+    }
+
+    /// ADR-0032 crash table, row 1: a migration that dies before its
+    /// transaction commits leaves the old store intact, and the next open
+    /// retries the migration.
+    #[test]
+    fn killed_migration_leaves_old_store_intact_and_next_open_retries() {
+        let dir = tmp_dir();
+        make_v1_store(dir.path(), "ns");
+        let crashy: &[(u32, Migration)] = &[(1, step_writes_then_fails)];
+        let err = match Store::open_inner(dir.path(), "ns", 2, crate::version::END_TO_END_VERSION, crashy) {
+            Ok(_) => panic!("step should fail"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, StoreError::MigrationFailed { from: 1, .. }));
+        // The step's writes rolled back with its transaction.
+        assert_eq!(raw_meta_get(dir.path(), "ns", META_STORE_VERSION), Some(1));
+        assert_eq!(raw_meta_get(dir.path(), "ns", "partial_step"), None);
+        // The next open retries — with a working step it completes.
+        let fixed: &[(u32, Migration)] = &[(1, step_1_to_2)];
+        let (s, outcome) = Store::open_inner(dir.path(), "ns", 2, crate::version::END_TO_END_VERSION, fixed)
+            .expect("retry succeeds");
+        assert_eq!(outcome.migrated_from, Some(1));
+        assert_eq!(meta_get(&s.conn, META_STORE_VERSION).unwrap(), Some(2));
+    }
+
+    // ── Store Reset ──────────────────────────────────────────────────────────
+
+    /// A versioned store whose version keys were lost (a dev-build artifact)
+    /// is unversioned for open's purposes: reset, and the group state is
+    /// gone — the session layer regenerates a fresh identity and reports
+    /// `statusChanged(notJoined, storeReset)` (ADR-0032).
+    #[test]
+    fn store_with_lost_version_keys_is_reset() {
+        let dir = tmp_dir();
+        make_v1_store(dir.path(), "ns");
+        {
+            let conn =
+                rusqlite::Connection::open(dir.path().join("trueseal_ns.db")).unwrap();
+            conn.execute("DELETE FROM meta WHERE key IN ('store_version', 'e2e_version')", [])
+                .unwrap();
+        }
+        let (s, outcome) = Store::open_with_outcome(dir.path(), "ns").expect("open resets");
+        assert!(outcome.reset);
+        assert!(s.load_keypair().expect("load").is_none(), "identity wiped");
+        assert_eq!(
+            meta_get(&s.conn, META_STORE_VERSION).unwrap(),
+            Some(crate::version::STORE_VERSION as i64)
+        );
+    }
+
+    // ── storeTooNew ──────────────────────────────────────────────────────────
+
+    /// ADR-0032: a store written by a newer release is refused with
+    /// `storeTooNew`, and its file bytes are UNCHANGED — rolling forward
+    /// again loses nothing.
+    #[test]
+    fn newer_store_fails_with_store_too_new_and_bytes_unchanged() {
+        let dir = tmp_dir();
+        make_v1_store(dir.path(), "ns");
+        let path = dir.path().join("trueseal_ns.db");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "UPDATE meta SET value = 99 WHERE key = 'store_version'",
+                [],
+            )
+            .unwrap();
+            // Checkpoint so the main file holds every byte, then hash it.
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+        let before = sha256_file(&path);
+        let err = match Store::open_with_outcome(dir.path(), "ns") {
+            Ok(_) => panic!("a newer store must be refused"),
+            Err(e) => e,
+        };
+        match err {
+            StoreError::StoreTooNew { found, supported } => {
+                assert_eq!(found, 99);
+                assert_eq!(supported, crate::version::STORE_VERSION);
+            }
+            other => panic!("expected StoreTooNew, got {other}"),
+        }
+        assert_eq!(sha256_file(&path), before, "refused store: bytes unchanged");
+        // Rolling "forward" again (a build that understands v99) is not
+        // simulated — the byte check above is the promise that it can.
+    }
+
+    // ── End-to-End bump re-seal (ADR-0034 §1) ────────────────────────────────
+
+    /// Queue one of each kind: Sync (seq 1), Pair (seq 2), a genesis
+    /// manifest (seq 3), a child manifest built on it (seq 4), Revoke
+    /// (seq 5). The stored current manifest is the child (issued offline);
+    /// the held history covers both. Returns the keypair and the original
+    /// row bytes for later comparison.
+    fn queue_all_kinds(dir: &Path, ns: &str) -> (DeviceKeypair, GroupManifest, GroupManifest) {
+        let kp = DeviceKeypair::generate();
+        let s = Store::open(dir, ns).expect("open");
+        s.save_keypair(&kp).expect("save");
+        let group_id = oid(9);
+        let genesis = GroupManifest::new(group_id, 0, vec![member(&kp, "me")], &kp.signing);
+        let child = GroupManifest::update(&genesis, vec![member(&kp, "me")], &kp.signing)
+            .expect("update");
+        let mut log = PersistentLog::new(s);
+        log.append(&oid(1), 1, b"hello sync body".to_vec());
+        log.append_control(
+            &oid(2),
+            2,
+            Message::Pair {
+                noise_pub: oid(3),
+                signing_pub: oid(4),
+                secret: oid(5),
+            }
+            .encode(),
+        );
+        log.append_control(
+            &oid(1),
+            3,
+            Message::GroupManifest {
+                manifest: genesis.clone(),
+            }
+            .encode(),
+        );
+        log.append_control(
+            &oid(1),
+            4,
+            Message::GroupManifest {
+                manifest: child.clone(),
+            }
+            .encode(),
+        );
+        log.append_control(&oid(1), 5, Message::Revoke.encode());
+        // Stored current manifest = the child; held history covers both.
+        drop(log);
+        let s2 = Store::open(dir, ns).expect("reopen");
+        s2.save_group_manifest(&child).expect("save manifest");
+        let mut log2 = PersistentLog::new(s2);
+        log2.commit_membership(crate::operation_log::MembershipCommit {
+            manifest: child.encode(),
+            held: vec![(genesis.hash(), true), (child.hash(), true)],
+            pending_changes: vec![],
+            leaving: None,
+            outbox: vec![],
+        });
+        (kp, genesis, child)
+    }
+
+    fn outbox_row(dir: &Path, ns: &str, seq: i64) -> (Vec<u8>, i64, i64) {
+        let conn = rusqlite::Connection::open(dir.join(format!("trueseal_{ns}.db"))).unwrap();
+        conn.query_row(
+            "SELECT blob, created_at, delivered FROM outbox WHERE sequence = ?1",
+            [seq],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    /// The headline criterion: a simulated End-to-End bump re-seals every
+    /// queued entry. Manifests are re-signed under the new version with the
+    /// hash remap propagated; Sync/Pair/Revoke rows are byte-identical, so
+    /// the Sync message keeps its original Message ID (signing_pub +
+    /// sequence, unchanged) and Sender Timestamp (created_at, unchanged) —
+    /// and is delivered exactly once, pinned end-to-end in the session
+    /// tests.
+    #[test]
+    fn e2e_bump_reseals_queued_entries_and_preserves_sync_identity() {
+        let dir = tmp_dir();
+        let (_kp, genesis, child) = queue_all_kinds(dir.path(), "ns");
+        let (sync_blob, sync_created_at, _) = outbox_row(dir.path(), "ns", 1);
+        let (pair_blob, _, _) = outbox_row(dir.path(), "ns", 2);
+        let (revoke_blob, _, _) = outbox_row(dir.path(), "ns", 5);
+
+        let (s, outcome) = Store::open_inner(
+            dir.path(),
+            "ns",
+            crate::version::STORE_VERSION,
+            crate::version::END_TO_END_VERSION + 1,
+            MIGRATIONS,
+        )
+        .expect("open reseals");
+        assert_eq!(outcome.resealed_from_e2e, Some(crate::version::END_TO_END_VERSION));
+        assert_eq!(
+            meta_get(&s.conn, META_E2E_VERSION).unwrap(),
+            Some(crate::version::END_TO_END_VERSION as i64 + 1)
+        );
+
+        // Sync / Pair / Revoke rows: byte-identical (sealed at push).
+        assert_eq!(outbox_row(dir.path(), "ns", 1).0, sync_blob);
+        assert_eq!(outbox_row(dir.path(), "ns", 1).1, sync_created_at);
+        assert_eq!(outbox_row(dir.path(), "ns", 2).0, pair_blob);
+        assert_eq!(outbox_row(dir.path(), "ns", 5).0, revoke_blob);
+
+        // Manifests: re-signed under v2, hash remap propagated.
+        let new_e2e = crate::version::END_TO_END_VERSION + 1;
+        let (genesis_blob, _, _) = outbox_row(dir.path(), "ns", 3);
+        let (child_blob, _, _) = outbox_row(dir.path(), "ns", 4);
+        let Message::GroupManifest { manifest: new_genesis } =
+            Message::decode(&genesis_blob).unwrap()
+        else {
+            panic!("seq 3 is a manifest");
+        };
+        let Message::GroupManifest { manifest: new_child } =
+            Message::decode(&child_blob).unwrap()
+        else {
+            panic!("seq 4 is a manifest");
+        };
+        new_genesis
+            .verify_signature_for_version(new_e2e)
+            .expect("genesis verifies under the new version");
+        new_child
+            .verify_signature_for_version(new_e2e)
+            .expect("child verifies under the new version");
+        new_genesis
+            .verify_signature_for_version(crate::version::END_TO_END_VERSION)
+            .expect_err("genesis no longer verifies under the old version");
+        assert_ne!(new_genesis.hash(), genesis.hash(), "re-sign changes the hash");
+        assert_eq!(
+            new_child.parent,
+            Some(new_genesis.hash()),
+            "child parent remapped to the new genesis hash"
+        );
+        assert_eq!(new_child.version, child.version, "logical version unchanged");
+        assert_eq!(new_child.members, child.members, "members unchanged");
+
+        // Stored current manifest: re-written to the re-signed child.
+        let stored = s.load_group_manifest().expect("load").expect("some");
+        assert_eq!(stored.hash(), new_child.hash());
+        stored
+            .verify_signature_for_version(new_e2e)
+            .expect("stored manifest verifies under the new version");
+
+        // Held history: new hashes, included_self preserved.
+        let held_new_genesis: Option<i64> = s
+            .conn
+            .query_row(
+                "SELECT included_self FROM held_manifests WHERE hash = ?1",
+                rusqlite::params![new_genesis.hash().as_slice()],
+                |r| r.get(0),
+            )
+            .ok();
+        let held_old_genesis: Option<i64> = s
+            .conn
+            .query_row(
+                "SELECT included_self FROM held_manifests WHERE hash = ?1",
+                rusqlite::params![genesis.hash().as_slice()],
+                |r| r.get(0),
+            )
+            .ok();
+        assert_eq!(held_new_genesis, Some(1));
+        assert_eq!(held_old_genesis, None, "old hash replaced");
+
+        // Nothing lost: every queued entry is still there, same sequences.
+        let count: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM outbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 5);
+    }
+
+    /// A delivered row's hash may be installed at peers — re-signing it
+    /// would fork the chain. Delivered rows are not re-signed.
+    #[test]
+    fn e2e_bump_does_not_touch_delivered_rows() {
+        let dir = tmp_dir();
+        let (_kp, genesis, _child) = queue_all_kinds(dir.path(), "ns");
+        {
+            let conn =
+                rusqlite::Connection::open(dir.path().join("trueseal_ns.db")).unwrap();
+            conn.execute("UPDATE outbox SET delivered = 1 WHERE sequence = 3", [])
+                .unwrap();
+        }
+        let (_s, _outcome) = Store::open_inner(
+            dir.path(),
+            "ns",
+            crate::version::STORE_VERSION,
+            crate::version::END_TO_END_VERSION + 1,
+            MIGRATIONS,
+        )
+        .expect("open");
+        let (blob, _, delivered) = outbox_row(dir.path(), "ns", 3);
+        assert_eq!(delivered, 1);
+        let Message::GroupManifest { manifest } = Message::decode(&blob).unwrap() else {
+            panic!("seq 3 is a manifest");
+        };
+        assert_eq!(manifest.hash(), genesis.hash(), "delivered row untouched");
+        manifest
+            .verify_signature_for_version(crate::version::END_TO_END_VERSION)
+            .expect("still under the old version");
+    }
+
+    /// ADR-0034 §1 crash behaviour: a re-seal that fails rolls its
+    /// transaction back — every entry is still at the old version and the
+    /// recorded e2e version is unchanged.
+    #[test]
+    fn failed_reseal_rolls_back_everything() {
+        let dir = tmp_dir();
+        let (kp, genesis, _child) = queue_all_kinds(dir.path(), "ns");
+        // Corrupt the queued genesis: re-sign it with a DIFFERENT device's
+        // key, so the migration's resign_for_version refuses (UnknownIssuer).
+        {
+            let conn =
+                rusqlite::Connection::open(dir.path().join("trueseal_ns.db")).unwrap();
+            let other = DeviceKeypair::generate();
+            let foreign = GroupManifest::new(
+                genesis.group_id,
+                genesis.version,
+                vec![member(&other, "other")],
+                &other.signing,
+            );
+            let _ = kp; // identity in the store is kp; the queued manifest is not its issuance
+            conn.execute(
+                "UPDATE outbox SET blob = ?1 WHERE sequence = 3",
+                rusqlite::params![Message::GroupManifest { manifest: foreign }.encode()],
+            )
+            .unwrap();
+        }
+        let err = match Store::open_inner(
+            dir.path(),
+            "ns",
+            crate::version::STORE_VERSION,
+            crate::version::END_TO_END_VERSION + 1,
+            MIGRATIONS,
+        ) {
+            Ok(_) => panic!("re-seal must refuse a foreign manifest"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, StoreError::ResealFailed(_)));
+        // Everything is still at the old version.
+        assert_eq!(
+            raw_meta_get(dir.path(), "ns", META_E2E_VERSION),
+            Some(crate::version::END_TO_END_VERSION as i64)
+        );
+        let (child_blob, _, _) = outbox_row(dir.path(), "ns", 4);
+        let Message::GroupManifest { manifest } = Message::decode(&child_blob).unwrap() else {
+            panic!("seq 4 is a manifest");
+        };
+        manifest
+            .verify_signature_for_version(crate::version::END_TO_END_VERSION)
+            .expect("child still verifies under the old version — nothing re-sealed");
+        // The store is still usable: a retry at the real version opens fine.
+        let (_s, outcome) = Store::open_with_outcome(dir.path(), "ns").expect("still opens");
+        assert_eq!(outcome, OpenOutcome::default());
+    }
+
+    #[test]
+    fn resign_for_version_refuses_another_devices_issuance() {
+        let me = DeviceKeypair::generate();
+        let other = DeviceKeypair::generate();
+        let m = GroupManifest::new(oid(1), 0, vec![member(&other, "o")], &other.signing);
+        m.resign_for_version(None, 2, &me.signing)
+            .expect_err("only the issuer may re-sign");
+    }
+}
