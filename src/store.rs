@@ -4,7 +4,9 @@ use thiserror::Error;
 
 use crate::device::DeviceKeypair;
 use crate::manifest::GroupManifest;
-use crate::operation_log::{now_secs, LogEntry, OperationLog, OutboxKind, DEDUP_RETENTION_SECS};
+use crate::operation_log::{
+    now_secs, LogEntry, MembershipCommit, OperationLog, OutboxKind, DEDUP_RETENTION_SECS,
+};
 
 /// Outbox `kind` column values. `Sync` is 0 so rows written by builds from
 /// before the column existed (all application `Sync` bodies) migrate to the
@@ -96,6 +98,29 @@ impl Store {
                  id      INTEGER PRIMARY KEY CHECK (id = 1),
                  data    BLOB NOT NULL
              );
+             -- The Pending Membership Change set (ADR-0027): singleton
+             -- blob, session-owned encoding. Replaced wholesale on every
+             -- membership commit; survives restarts so an offline issuer
+             -- re-applies after reconnecting.
+             CREATE TABLE IF NOT EXISTS pending_changes (
+                 id      INTEGER PRIMARY KEY CHECK (id = 1),
+                 data    BLOB NOT NULL
+             );
+             -- Held-manifest history (ADR-0027): every manifest this
+             -- device installed, with whether it included the device. The
+             -- deliberate-removal test: an excluding manifest counts only
+             -- when its parent is a held manifest that included the device.
+             CREATE TABLE IF NOT EXISTS held_manifests (
+                 hash          BLOB PRIMARY KEY,
+                 included_self INTEGER NOT NULL
+             );
+             -- The Leaving record (ADR-0027): the outbox refs the Leave
+             -- waits on before the wipe. Survives restarts — a crash in
+             -- Leaving resumes Leaving.
+             CREATE TABLE IF NOT EXISTS leaving (
+                 id      INTEGER PRIMARY KEY CHECK (id = 1),
+                 data    BLOB NOT NULL
+             );
              COMMIT;",
         )?;
 
@@ -140,6 +165,9 @@ impl Store {
              DELETE FROM handled_messages;
              DELETE FROM meta;
              DELETE FROM pending_join;
+             DELETE FROM pending_changes;
+             DELETE FROM held_manifests;
+             DELETE FROM leaving;
              COMMIT;",
         )?;
         Ok(())
@@ -505,6 +533,112 @@ impl OperationLog for PersistentLog {
             warn!("[trueseal-sync] clear_pending_join failed: {e}");
         }
     }
+
+    fn commit_membership(&mut self, commit: MembershipCommit) -> Result<(), String> {
+        // ADR-0027: the manifest, the held record, the Pending Membership
+        // Change set, the Leaving record and the outbox entries commit in
+        // ONE transaction. A crash leaves either the whole prior state or
+        // the whole new state — the delivery of the manifest and the
+        // re-check of pending changes are driven by the outbox after it.
+        let MembershipCommit {
+            manifest,
+            held,
+            pending_changes,
+            leaving,
+            outbox,
+        } = commit;
+        let result = (|| -> Result<(), rusqlite::Error> {
+            let tx = self.store.conn.transaction()?;
+            tx.execute(
+                "INSERT INTO manifest (id, data) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                rusqlite::params![manifest],
+            )?;
+            tx.execute(
+                "INSERT INTO held_manifests (hash, included_self) VALUES (?1, ?2)
+                 ON CONFLICT(hash) DO UPDATE SET included_self=excluded.included_self",
+                rusqlite::params![held.0.as_slice(), held.1 as i64],
+            )?;
+            if pending_changes.is_empty() {
+                tx.execute("DELETE FROM pending_changes", [])?;
+            } else {
+                tx.execute(
+                    "INSERT INTO pending_changes (id, data) VALUES (1, ?1)
+                     ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                    rusqlite::params![pending_changes],
+                )?;
+            }
+            if let Some(record) = leaving {
+                tx.execute(
+                    "INSERT INTO leaving (id, data) VALUES (1, ?1)
+                     ON CONFLICT(id) DO UPDATE SET data=excluded.data",
+                    rusqlite::params![record],
+                )?;
+            }
+            for (object_id, sequence, blob) in outbox {
+                tx.execute(
+                    "INSERT INTO outbox (object_id, sequence, blob, delivered, kind, created_at)
+                     VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+                    rusqlite::params![
+                        object_id.as_slice(),
+                        sequence as i64,
+                        blob,
+                        KIND_CONTROL,
+                        now_secs() as i64,
+                    ],
+                )?;
+            }
+            tx.commit()
+        })();
+        result.map_err(|e| format!("commit_membership failed: {e}"))
+    }
+
+    fn pending_membership_changes(&self) -> Option<Vec<u8>> {
+        self.store
+            .conn
+            .query_row("SELECT data FROM pending_changes WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .ok()
+    }
+
+    fn is_held_including_self(&self, hash: &[u8; 32]) -> bool {
+        self.store
+            .conn
+            .query_row(
+                "SELECT included_self FROM held_manifests WHERE hash = ?1",
+                rusqlite::params![hash.as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|v| v != 0)
+            .unwrap_or(false)
+    }
+
+    fn leaving(&self) -> Option<Vec<u8>> {
+        self.store
+            .conn
+            .query_row("SELECT data FROM leaving WHERE id = 1", [], |row| row.get(0))
+            .ok()
+    }
+
+    fn wipe_group_state(&mut self) {
+        // Everything the log owns; identity and manifest rows are wiped by
+        // the caller (the FFI's Store handle) as part of the same removal /
+        // completed-Leave flow.
+        if let Err(e) = self.store.conn.execute_batch(
+            "BEGIN;
+             DELETE FROM outbox;
+             DELETE FROM handled_messages;
+             DELETE FROM meta;
+             DELETE FROM pending_join;
+             DELETE FROM pending_changes;
+             DELETE FROM held_manifests;
+             DELETE FROM leaving;
+             COMMIT;",
+        ) {
+            warn!("[trueseal-sync] wipe_group_state failed: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -556,6 +690,31 @@ mod tests {
         let s3 = Store::open(dir.path(), "ns").expect("open3");
         let log2 = PersistentLog::new(s3);
         assert!(log2.undelivered_entries().is_empty());
+    }
+
+    /// wipe() also clears the ADR-0027 tables (changes, held history,
+    /// Leaving) — after a Destroy Group nothing from the old group survives.
+    #[test]
+    fn wipe_clears_membership_tables() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.commit_membership(MembershipCommit {
+            manifest: b"m".to_vec(),
+            held: ([1u8; 32], true),
+            pending_changes: b"changes".to_vec(),
+            leaving: Some(b"refs".to_vec()),
+            outbox: vec![],
+        })
+        .expect("commit");
+        drop(log);
+        let s2 = Store::open(dir.path(), "ns").expect("open2");
+        s2.wipe().expect("wipe");
+        let s3 = Store::open(dir.path(), "ns").expect("open3");
+        let log3 = PersistentLog::new(s3);
+        assert!(log3.pending_membership_changes().is_none());
+        assert!(!log3.is_held_including_self(&[1u8; 32]));
+        assert!(log3.leaving().is_none());
     }
 
     /// Identity round-trips through save and load.
@@ -1032,6 +1191,106 @@ mod tests {
         let log3 = PersistentLog::new(s3);
         assert!(!log3.is_handled("tsm1_a"));
         assert_eq!(log3.max_sequence(), None);
+    }
+
+    /// ADR-0027: a membership commit lands the manifest, the held record,
+    /// the Pending Membership Change set, the Leaving record and the outbox
+    /// entries as one unit — all visible after a reopen.
+    #[test]
+    fn commit_membership_commits_everything_and_survives_reopen() {
+        let dir = tmp_dir();
+        {
+            let s = Store::open(dir.path(), "ns").expect("open");
+            let mut log = PersistentLog::new(s);
+            log.commit_membership(MembershipCommit {
+                manifest: b"manifest-v2".to_vec(),
+                held: ([7u8; 32], true),
+                pending_changes: b"change-set".to_vec(),
+                leaving: Some(b"leave-refs".to_vec()),
+                outbox: vec![(oid(9), 3, b"\x04m".to_vec())],
+            })
+            .expect("commit");
+        }
+        let s2 = Store::open(dir.path(), "ns").expect("reopen");
+        let log2 = PersistentLog::new(s2);
+        assert_eq!(
+            log2.pending_membership_changes().as_deref(),
+            Some(b"change-set".as_slice())
+        );
+        assert!(log2.is_held_including_self(&[7u8; 32]));
+        assert!(!log2.is_held_including_self(&[8u8; 32]));
+        assert_eq!(log2.leaving().as_deref(), Some(b"leave-refs".as_slice()));
+        let undelivered = log2.undelivered_entries();
+        assert_eq!(undelivered.len(), 1);
+        assert_eq!(undelivered[0].kind, OutboxKind::Control);
+        // The manifest row landed too (same DB the FFI reads).
+        let s3 = Store::open(dir.path(), "ns").expect("open3");
+        assert_eq!(
+            s3.load_manifest().expect("load").as_deref(),
+            Some(b"manifest-v2".as_slice())
+        );
+    }
+
+    /// An empty change set clears the row; a commit without a Leaving
+    /// record leaves the existing record untouched.
+    #[test]
+    fn commit_membership_empty_changes_clear_and_leaving_is_sticky() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.commit_membership(MembershipCommit {
+            manifest: b"m1".to_vec(),
+            held: ([1u8; 32], true),
+            pending_changes: b"changes".to_vec(),
+            leaving: Some(b"refs".to_vec()),
+            outbox: vec![],
+        })
+        .expect("commit 1");
+        log.commit_membership(MembershipCommit {
+            manifest: b"m2".to_vec(),
+            held: ([2u8; 32], false),
+            pending_changes: Vec::new(),
+            leaving: None,
+            outbox: vec![],
+        })
+        .expect("commit 2");
+        assert!(log.pending_membership_changes().is_none());
+        assert_eq!(
+            log.leaving().as_deref(),
+            Some(b"refs".as_slice()),
+            "leaving untouched by a commit that does not mention it"
+        );
+        // A held record that excluded self is not "held including self".
+        assert!(!log.is_held_including_self(&[2u8; 32]));
+    }
+
+    /// wipe_group_state clears everything the log owns — outbox, dedup,
+    /// high-water, Pending Join, changes, held history, Leaving — so a
+    /// removed or departed device starts over clean (ADR-0027).
+    #[test]
+    fn wipe_group_state_clears_all_log_owned_state() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.begin_pending_join(b"pending", &oid(7), 3, b"pair".to_vec())
+            .unwrap();
+        log.record_handled("tsm1_a", now_secs());
+        log.commit_membership(MembershipCommit {
+            manifest: b"m".to_vec(),
+            held: ([1u8; 32], true),
+            pending_changes: b"changes".to_vec(),
+            leaving: Some(b"refs".to_vec()),
+            outbox: vec![(oid(2), 4, b"ctrl".to_vec())],
+        })
+        .expect("commit");
+        log.wipe_group_state();
+        assert!(log.undelivered_entries().is_empty());
+        assert!(!log.is_handled("tsm1_a"));
+        assert_eq!(log.max_sequence(), None);
+        assert!(log.pending_join().is_none());
+        assert!(log.pending_membership_changes().is_none());
+        assert!(!log.is_held_including_self(&[1u8; 32]));
+        assert!(log.leaving().is_none());
     }
 
     /// max_sequence returns None on an empty log, the highest sequence otherwise.

@@ -1476,6 +1476,24 @@ impl OperationLog for FailingJoinLog {
     fn clear_pending_join(&mut self) {
         self.inner.clear_pending_join();
     }
+    fn commit_membership(
+        &mut self,
+        commit: crate::operation_log::MembershipCommit,
+    ) -> Result<(), String> {
+        self.inner.commit_membership(commit)
+    }
+    fn pending_membership_changes(&self) -> Option<Vec<u8>> {
+        self.inner.pending_membership_changes()
+    }
+    fn is_held_including_self(&self, hash: &[u8; 32]) -> bool {
+        self.inner.is_held_including_self(hash)
+    }
+    fn leaving(&self) -> Option<Vec<u8>> {
+        self.inner.leaving()
+    }
+    fn wipe_group_state(&mut self) {
+        self.inner.wipe_group_state();
+    }
 }
 
 /// A store failure on join surfaces a typed error and leaves NO in-memory
