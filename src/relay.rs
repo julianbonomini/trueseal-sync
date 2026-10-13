@@ -664,8 +664,10 @@ fn run_loop<T: Severable>(
     sever: Arc<dyn Fn() + Send + Sync>,
 ) {
     // On ANY exit — clean or unwinding — signal that the relay connection
-    // has been lost.
-    let _disconnect_guard = DisconnectGuard(is_connected);
+    // has been lost. (A clone: the watchdog below keeps its own handle so
+    // it can signal link-down even while this loop is parked in an app
+    // callback and the guard cannot drop yet — B23c.)
+    let _disconnect_guard = DisconnectGuard(is_connected.clone());
     // We need to interleave: check for pending pushes, then do one receive.
     // Since receive() blocks until a message arrives, we wrap the session in a
     // thread pair: one blocking-receive thread + one push-sender thread, both
@@ -744,6 +746,7 @@ fn run_loop<T: Severable>(
     let (heartbeat_stop_tx, heartbeat_stop_rx) = mpsc::channel::<()>();
     let _heartbeat_stop_tx = heartbeat_stop_tx;
     let last_inbound_heartbeat = last_inbound.clone();
+    let is_connected_watchdog = is_connected.clone();
     // `while let` on the timeout arm: any other outcome (sender dropped
     // — the run loop is exiting — or a spurious send) ends the thread.
     std::thread::spawn(move || {
@@ -752,6 +755,7 @@ fn run_loop<T: Severable>(
         {
             let age = now_millis().saturating_sub(last_inbound_heartbeat.load(Ordering::Acquire));
             if age > timeouts.liveness.as_millis() as u64 {
+                is_connected_watchdog.store(false, Ordering::Release);
                 (sever)();
                 break;
             }
@@ -759,6 +763,10 @@ fn run_loop<T: Severable>(
                 .send(&frame(MsgType::Heartbeat, &[]))
                 .is_err()
             {
+                // The write side is broken while reads may hang forever
+                // (a half-open link): the same verdict as silence.
+                is_connected_watchdog.store(false, Ordering::Release);
+                (sever)();
                 break;
             }
         }
@@ -2616,6 +2624,68 @@ mod tests {
             wait_until(|| !client.is_connected(), 3_000),
             "a black-holed relay (no FIN) must be severed by the liveness watchdog"
         );
+    }
+
+    /// A PARKED app callback must not wedge disconnect detection (B23c —
+    /// the structural shape of the D1 finding): the run loop dispatches
+    /// callbacks (message AND issue) on its own thread, so a handler that
+    /// never returns keeps the DisconnectGuard from ever dropping. The
+    /// watchdog may sever the socket on schedule, but is_connected would
+    /// stay true forever and no Disconnected would ever surface — unless
+    /// the watchdog signals link-down itself. B7b covered PANICKING
+    /// callbacks; this covers PARKED ones. RED before the watchdog flip:
+    /// is_connected stayed true 3 s+ past the liveness window.
+    #[test]
+    fn parked_callback_does_not_wedge_disconnect_detection() {
+        let relay_kp = generate_keypair();
+        let relay_pub = NoisePublicKey(relay_kp.public_key);
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        let (client_pipe, relay_pipe) = mem_pipe_pair();
+
+        // Relay: accept, send one garbage Deliver (fires
+        // unreadable(Malformed) into the issue callback), then stay alive
+        // and silent forever — a black-hole.
+        std::thread::spawn(move || {
+            let session = xx_accept_after_prefix(relay_pipe, relay_kp2).unwrap();
+            let _ = session.send(&frame(MsgType::Deliver, &[7u8; 16]));
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let device = DeviceKeypair::generate();
+        let client = RelayClient::connect_subscribed_with_timeouts(
+            client_pipe,
+            relay_pub,
+            Keypair::new(device.noise.private(), device.noise.public_key),
+            |_, _, _, _| {},
+            Some(Box::new(move |_| {
+                // The parked callback: signal entry, then block until the
+                // test releases it.
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+            })),
+            test_timeouts(100, 300),
+        )
+        .expect("connect");
+
+        // The run loop is now parked inside the issue callback.
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("issue callback entered");
+
+        // Silence exceeds the liveness window: the watchdog must signal
+        // link-down ITSELF — the DisconnectGuard cannot drop while the
+        // dispatch loop is parked in the callback.
+        assert!(
+            wait_until(|| !client.is_connected(), 3_000),
+            "a parked app callback must not wedge disconnect detection"
+        );
+
+        // Cleanup: release the callback; the run loop drains and exits.
+        let _ = release_tx.send(());
     }
 
     /// After the relay answers `0x01` (supported), a silent relay must not
