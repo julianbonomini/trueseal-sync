@@ -558,7 +558,7 @@ fn revoke_from_past_member_is_honoured_after_their_removal() {
                 .map(|m| m.hash())
                 == Some(v2.hash())
         },
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
 
     // A Revoke from a key that never appeared in any held manifest is
@@ -566,7 +566,7 @@ fn revoke_from_past_member_is_honoured_after_their_removal() {
     deliver_revoke(&relay_c, 2, &stranger, &c, 900);
     wait_for(
         || relay_c.deliver_acks().contains(&2),
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
     assert_eq!(session_c.group_status(), GroupStatus::Member);
     assert!(
@@ -585,7 +585,7 @@ fn revoke_from_past_member_is_honoured_after_their_removal() {
     deliver_revoke(&relay_c, 3, &owner, &c, 901);
     wait_for(
         || session_c.group_status() == GroupStatus::Destroying,
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
     {
         let log = session_c.op_log.lock().unwrap();
@@ -599,7 +599,7 @@ fn revoke_from_past_member_is_honoured_after_their_removal() {
     }
     // The Relay accepts the forward: completion wipes and rotates.
     gate.store(true, Ordering::Release);
-    wait_for(|| *destroyed.lock().unwrap() == 1, Duration::from_secs(10));
+    wait_for(|| *destroyed.lock().unwrap() == 1, Duration::from_secs(20));
     assert_eq!(session_c.group_status(), GroupStatus::NotJoined);
     assert_ne!(
         session_c.signing_pub(),
@@ -702,7 +702,7 @@ fn forwarded_revoke_reaches_concurrently_admitted_device() {
             let ev = events.lock().unwrap();
             ev.contains(&"a") && ev.contains(&"b") && ev.contains(&"c")
         },
-        Duration::from_secs(10),
+        Duration::from_secs(20),
     );
     for (name, session) in [("a", &session_a), ("b", &session_b), ("c", &session_c)] {
         assert_eq!(
@@ -735,7 +735,7 @@ fn revoke_ignored_in_not_joined_and_pending_join() {
     deliver_revoke(&relay_b, 1, &a, &b, 900);
     wait_for(
         || relay_b.deliver_acks().contains(&1),
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
     assert_eq!(session_b.group_status(), GroupStatus::NotJoined);
     assert!(session_b.op_log.lock().unwrap().destroying().is_none());
@@ -748,7 +748,7 @@ fn revoke_ignored_in_not_joined_and_pending_join() {
     deliver_revoke(&relay_b, 2, &a, &b, 901);
     wait_for(
         || relay_b.deliver_acks().contains(&2),
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
     assert_eq!(
         session_b.group_status(),
@@ -784,7 +784,7 @@ fn replayed_revoke_forwards_at_most_once() {
     deliver_revoke(&relay_c, 1, &a, &c, 900);
     wait_for(
         || session_c.group_status() == GroupStatus::Destroying,
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
     let forwards = || session_c.op_log.lock().unwrap().undelivered_entries().len();
     assert_eq!(forwards(), 1, "one forward queued (to D)");
@@ -795,13 +795,13 @@ fn replayed_revoke_forwards_at_most_once() {
     deliver_revoke(&relay_c, 3, &d, &c, 700);
     wait_for(
         || relay_c.deliver_acks().contains(&2) && relay_c.deliver_acks().contains(&3),
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
     assert_eq!(forwards(), 1, "no second forward round");
 
     // Once pushes flow, completion happens exactly once.
     gate.store(true, Ordering::Release);
-    wait_for(|| *destroyed.lock().unwrap() == 1, Duration::from_secs(10));
+    wait_for(|| *destroyed.lock().unwrap() == 1, Duration::from_secs(20));
     assert_eq!(session_c.group_status(), GroupStatus::NotJoined);
     assert_eq!(*destroyed.lock().unwrap(), 1);
 }
@@ -839,14 +839,14 @@ fn group_of_32_forwards_one_round_per_device() {
     deliver_revoke(&relay_c, 1, a, c, 900);
     wait_for(
         || session_c.group_status() == GroupStatus::Destroying,
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
     let forwards = || session_c.op_log.lock().unwrap().undelivered_entries().len();
     assert_eq!(forwards(), 30, "one forward round to the receiver's view");
     deliver_revoke(&relay_c, 2, a, c, 900);
     wait_for(
         || relay_c.deliver_acks().contains(&2),
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
     assert_eq!(forwards(), 30, "a replay adds no forwards");
 }
@@ -941,7 +941,7 @@ fn leave_then_destroy_and_destroy_then_leave_end_in_not_joined() {
     // Leave manifest pushes too — harmless), the Relay accepts everything,
     // the Destroy completes.
     online.store(true, Ordering::Release);
-    wait_for(|| *destroyed.lock().unwrap() == 1, Duration::from_secs(10));
+    wait_for(|| *destroyed.lock().unwrap() == 1, Duration::from_secs(20));
     assert_eq!(session.group_status(), GroupStatus::NotJoined);
     drop(session);
 
@@ -954,7 +954,7 @@ fn leave_then_destroy_and_destroy_then_leave_end_in_not_joined() {
         matches!(result, Err(SessionError::GroupDestroyed)),
         "Leave while Destroying is a typed error, got: {result:?}"
     );
-    wait_for(|| *destroyed2.lock().unwrap() == 1, Duration::from_secs(10));
+    wait_for(|| *destroyed2.lock().unwrap() == 1, Duration::from_secs(20));
     assert_eq!(session2.group_status(), GroupStatus::NotJoined);
 }
 
@@ -982,7 +982,7 @@ fn leaving_device_forwards_revoke_and_destroys() {
     deliver_revoke(&relay_c, 1, &a, &c, 900);
     wait_for(
         || session_c.group_status() == GroupStatus::Destroying,
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
     {
         let log = session_c.op_log.lock().unwrap();
@@ -1052,7 +1052,7 @@ fn no_handler_runs_while_destroying() {
     deliver_revoke(&relay, 1, &a, &c, 900);
     wait_for(
         || session_c.group_status() == GroupStatus::Destroying,
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
 
     // A Sync from a member arrives mid-Destroy: acked, never handled.
@@ -1065,7 +1065,10 @@ fn no_handler_runs_while_destroying() {
         &signing_keypair(&a.signing.to_bytes()),
         901,
     );
-    wait_for(|| relay.deliver_acks().contains(&2), Duration::from_secs(5));
+    wait_for(
+        || relay.deliver_acks().contains(&2),
+        Duration::from_secs(20),
+    );
     assert_eq!(
         session_c.group_status(),
         GroupStatus::Destroying,

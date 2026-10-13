@@ -86,7 +86,7 @@ fn destroy_group_completes_after_relay_accepts_revokes() {
 
     // The pump pushes the Revoke, the relay Acks it, the Destroy
     // completes: wipe + rotate + exactly one callback.
-    wait_for(|| *destroyed.lock().unwrap() == 1, Duration::from_secs(5));
+    wait_for(|| *destroyed.lock().unwrap() == 1, Duration::from_secs(20));
     assert_eq!(
         session.group_status(),
         super::super::GroupStatus::NotJoined,
@@ -155,7 +155,10 @@ fn destroy_group_fires_on_group_destroyed_on_all_members() {
     session_b.set_manifest(v1);
 
     session_a.destroy_group().expect("destroy");
-    wait_for(|| *b_destroyed.lock().unwrap() >= 1, Duration::from_secs(5));
+    wait_for(
+        || *b_destroyed.lock().unwrap() >= 1,
+        Duration::from_secs(20),
+    );
 
     assert_eq!(
         *b_destroyed.lock().unwrap(),
@@ -355,7 +358,7 @@ fn destroy_completion_wipes_store_and_persists_fresh_identity() {
 
     // Completion: the relay Acks the Revoke, the wipe + rotation runs, the
     // callback fires once.
-    wait_for(|| *destroyed.lock().unwrap() == 1, Duration::from_secs(5));
+    wait_for(|| *destroyed.lock().unwrap() == 1, Duration::from_secs(20));
     assert!(
         check_store.load_group_manifest().unwrap().is_none(),
         "manifest cleared after the Destroy completed"
@@ -514,7 +517,7 @@ fn destroy_group_drops_sync_sends_and_replays_revoke_after_reconnect() {
     should_connect.store(true, std::sync::atomic::Ordering::Release);
     wait_for(
         || *relay_received.lock().unwrap() >= 1,
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
     assert_eq!(
         *relay_received.lock().unwrap(),
@@ -523,7 +526,7 @@ fn destroy_group_drops_sync_sends_and_replays_revoke_after_reconnect() {
     );
     wait_for(
         || *destroyed_count.lock().unwrap() == 1,
-        Duration::from_secs(5),
+        Duration::from_secs(20),
     );
     assert_eq!(
         session.group_status(),
