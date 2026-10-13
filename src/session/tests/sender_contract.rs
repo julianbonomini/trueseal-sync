@@ -561,6 +561,8 @@ fn head_of_line_per_recipient_with_isolation() {
     session.push_sync(b"two".to_vec()).expect("queued");
 
     // Everything drains: B after its retry (~1 s backoff), C immediately.
+    // CI-scaled budget (the suite runs ~5x slower under CI load; the wait
+    // reacts to the drain, so a generous budget costs nothing when fast).
     wait_for(
         || {
             session
@@ -570,7 +572,7 @@ fn head_of_line_per_recipient_with_isolation() {
                 .undelivered_entries()
                 .is_empty()
         },
-        Duration::from_secs(6),
+        Duration::from_secs(20),
     );
 
     let acked = acked.lock().unwrap();
