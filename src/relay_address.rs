@@ -13,7 +13,8 @@ pub const DEFAULT_RECEIVE_PORT: u16 = 7700;
 /// Default port of the Relay's Push Session listener (Noise NK).
 pub const DEFAULT_PUSH_PORT: u16 = 7701;
 
-const SCHEME: &str = "trueseal://";
+/// The Relay Address scheme. Surfaced in Shared Facts (SYNC-21).
+pub const SCHEME: &str = "trueseal://";
 
 /// A parsed Relay Address (ADR-0028's typed form).
 #[derive(Debug, Clone, PartialEq, Eq)]
