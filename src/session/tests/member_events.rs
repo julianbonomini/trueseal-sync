@@ -75,7 +75,7 @@ fn on_member_joined_fires_on_admitting_device() {
     );
 
     let req_token = token_slot.lock().unwrap().clone().expect("request token");
-    session_a.accept_member(&req_token);
+    session_a.accept_member(&req_token).expect("accept");
 
     let calls = joined.lock().unwrap().clone();
     assert_eq!(calls.len(), 1, "onMemberJoined fires once for B");

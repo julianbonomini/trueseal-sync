@@ -64,7 +64,7 @@ fn join_group_sends_pair_message_to_initiator() {
 
     // Accept B via the issued token — this consumes pending_members and builds a manifest.
     // Verifies B's noise_pub and signing_pub were correctly delivered.
-    let admitted = session_a.accept_member(&issued.unwrap());
+    let admitted = session_a.accept_member(&issued.unwrap()).expect("accept");
     assert!(admitted, "accept_member must succeed");
 
     let manifest = session_a.manifest.lock().unwrap();

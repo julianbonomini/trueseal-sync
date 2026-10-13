@@ -20,9 +20,17 @@ message GroupManifest {
   // signing_pub of the member who issued this version. 32 bytes.
   bytes issued_by = 4;
 
-  // Ed25519 signature over: group_id || version(8 bytes LE) || encoded members.
-  // Signed by issued_by's Ed25519 private key. 64 bytes.
+  // Ed25519 signature over: group_id || version(8 bytes LE) || encoded members
+  // || parent flag + parent hash. Signed by issued_by's Ed25519 private key.
+  // 64 bytes.
   bytes signature = 5;
+
+  // The hash of the manifest this one was built on (ADR-0027). Empty for the
+  // genesis manifest. Covered by the signature. Lets a deliberate later
+  // change be told apart from a concurrent one: a device counts itself
+  // removed only when the excluding manifest's parent is a manifest it
+  // holds or has held that included it.
+  bytes parent = 6;
 }
 
 message ManifestMember {

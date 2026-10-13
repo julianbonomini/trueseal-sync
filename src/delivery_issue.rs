@@ -71,4 +71,9 @@ pub enum DeliveryIssue {
     /// recipient step 4). The Blob was then acked and dropped — it will not
     /// be delivered again. Carries the Message ID and the last error.
     HandlerGaveUp { message_id: String, error: String },
+    /// A Pending Membership Change re-application was dropped because the
+    /// admission would exceed the Maximum Group Size (32, ADR-0027). The
+    /// joiner stays in Pending Join. (`admissionDropped` in ADR-0028's
+    /// event list.)
+    AdmissionDropped { member_id: String, name: String },
 }

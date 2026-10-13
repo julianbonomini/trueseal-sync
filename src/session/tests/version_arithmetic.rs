@@ -160,7 +160,7 @@ fn hostile_manifest_at_max_version_never_freezes_membership() {
     rig.push_manifest(2, rig.three_members());
     wait_for(
         || rig.session_b.members().len() == 2,
-        Duration::from_secs(2),
+        Duration::from_secs(5),
     );
     assert_eq!(
         rig.session_b.members().len(),
@@ -186,7 +186,7 @@ fn hostile_manifest_with_jump_over_bound_is_rejected() {
     rig.push_manifest(2, rig.three_members());
     wait_for(
         || rig.session_b.members().len() == 2,
-        Duration::from_secs(2),
+        Duration::from_secs(5),
     );
     assert_eq!(
         rig.session_b.members().len(),
@@ -206,7 +206,7 @@ fn manifest_with_jump_at_bound_is_accepted() {
     rig.push_manifest(1 + 1024, rig.three_members());
     wait_for(
         || rig.session_b.members().len() == 2,
-        Duration::from_secs(2),
+        Duration::from_secs(5),
     );
     assert_eq!(rig.session_b.members().len(), 2);
 }

@@ -131,7 +131,7 @@ fn accept_member_with_valid_token_returns_true() {
         .unwrap()
         .clone()
         .expect("token received");
-    let admitted = session_a.accept_member(&request_token);
+    let admitted = session_a.accept_member(&request_token).expect("accept");
     assert!(admitted, "accept_member with valid token returns true");
 }
 
@@ -176,7 +176,7 @@ fn accept_member_with_unknown_token_returns_false() {
     .expect("connect");
 
     let _ = session.pairing_token(); // open window
-    let result = session.accept_member("nonexistent-token");
+    let result = session.accept_member("nonexistent-token").expect("accept");
     assert!(!result, "unknown token returns false");
 }
 

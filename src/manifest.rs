@@ -38,6 +38,9 @@ pub struct GroupManifest {
     pub members: Vec<ManifestMember>,
     pub issued_by: [u8; 32],
     pub signature: [u8; 64],
+    /// The hash of the manifest this one was built on (ADR-0027). `None`
+    /// for the genesis manifest. Covered by the signature.
+    pub parent: Option<[u8; 32]>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -52,6 +55,10 @@ pub enum ManifestError {
     },
     #[error("invalid signature")]
     InvalidSignature,
+    /// The incoming manifest is not strictly greater than the current one
+    /// in the (version, hash) total order (ADR-0027): an older version, or
+    /// the same version with an equal-or-higher hash (a concurrent-issuer
+    /// loser or a relay re-delivery — benign stale).
     #[error("version regression: incoming {incoming} <= current {current}")]
     VersionRegression { incoming: u64, current: u64 },
     #[error(
@@ -73,9 +80,16 @@ pub enum ManifestError {
 // ── Signing message ───────────────────────────────────────────────────────────
 
 /// Canonical bytes that are signed/verified for a manifest.
-/// domain || group_id(32) || version(8 LE) || members_encoded
-/// The domain separator carries the End-to-End Version (ADR-0022).
-fn signing_message(group_id: &[u8; 32], version: u64, members: &[ManifestMember]) -> Vec<u8> {
+/// domain || group_id(32) || version(8 LE) || members_encoded || parent
+/// The domain separator carries the End-to-End Version (ADR-0022). The
+/// parent is covered by the signature (ADR-0027): a 1-byte flag (0 =
+/// genesis, 1 = update) followed by the 32-byte parent hash when present.
+fn signing_message(
+    group_id: &[u8; 32],
+    version: u64,
+    members: &[ManifestMember],
+    parent: &Option<[u8; 32]>,
+) -> Vec<u8> {
     // `crate::` — the `version` parameter shadows the module name here.
     let mut msg = crate::version::manifest_signing_domain();
     msg.extend_from_slice(group_id);
@@ -86,13 +100,20 @@ fn signing_message(group_id: &[u8; 32], version: u64, members: &[ManifestMember]
         msg.extend_from_slice(m.name.as_bytes());
         msg.push(0u8); // null separator between members
     }
+    match parent {
+        None => msg.push(0u8),
+        Some(p) => {
+            msg.push(1u8);
+            msg.extend_from_slice(p);
+        }
+    }
     msg
 }
 
 // ── GroupManifest impl ────────────────────────────────────────────────────────
 
 impl GroupManifest {
-    /// Create and sign a new GroupManifest.
+    /// Create and sign a genesis GroupManifest (no parent).
     pub fn new(
         group_id: [u8; 32],
         version: u64,
@@ -101,7 +122,7 @@ impl GroupManifest {
     ) -> Self {
         use ed25519_dalek::Signer;
         let issued_by: [u8; 32] = signing_key.verifying_key().to_bytes();
-        let msg = signing_message(&group_id, version, &members);
+        let msg = signing_message(&group_id, version, &members, &None);
         let sig = signing_key.sign(&msg);
         Self {
             group_id,
@@ -109,11 +130,56 @@ impl GroupManifest {
             members,
             issued_by,
             signature: sig.to_bytes(),
+            parent: None,
         }
     }
 
-    /// Generate a genesis manifest (first manifest for a new group).
-    /// `previous` is None for genesis.
+    /// Create and sign the next GroupManifest built on `base` (ADR-0027):
+    /// `version = base.version + 1` with checked arithmetic (SYNC-10 —
+    /// never panics, never wraps, never issues `u64::MAX`) and
+    /// `parent = base.hash()`.
+    pub fn update(
+        base: &GroupManifest,
+        members: Vec<ManifestMember>,
+        signing_key: &SigningKey,
+    ) -> Result<Self, ManifestError> {
+        use ed25519_dalek::Signer;
+        let version = base
+            .version
+            .checked_add(1)
+            .filter(|&v| v < u64::MAX)
+            .ok_or(ManifestError::VersionExhausted)?;
+        let parent = Some(base.hash());
+        let issued_by: [u8; 32] = signing_key.verifying_key().to_bytes();
+        let msg = signing_message(&base.group_id, version, &members, &parent);
+        let sig = signing_key.sign(&msg);
+        Ok(Self {
+            group_id: base.group_id,
+            version,
+            members,
+            issued_by,
+            signature: sig.to_bytes(),
+            parent,
+        })
+    }
+
+    /// The manifest hash — the tiebreaker of the (version, hash) total
+    /// order and the value a child names as its `parent` (ADR-0027).
+    /// SHA-256 over the canonical protobuf encoding, the same pattern as
+    /// [`crate::envelope::Envelope::hash`]. SYNC-2 pins it in the test
+    /// vectors.
+    pub fn hash(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(self.encode()).into()
+    }
+
+    /// Verify a manifest. `previous` is None for genesis.
+    ///
+    /// An update is accepted only if it is STRICTLY GREATER than
+    /// `previous` in the (version, hash) total order (ADR-0027): a higher
+    /// version (within the Maximum Manifest Version Jump), or the same
+    /// version with a lower hash — the tie rule that makes every device
+    /// pick the same winner from the same concurrent pair.
     pub fn verify(&self, previous: Option<&GroupManifest>) -> Result<(), ManifestError> {
         use ed25519_dalek::{Signature, VerifyingKey};
 
@@ -129,21 +195,36 @@ impl GroupManifest {
             if self.group_id != prev.group_id {
                 return Err(ManifestError::GroupIdMismatch);
             }
-            if self.version <= prev.version {
-                return Err(ManifestError::VersionRegression {
-                    incoming: self.version,
-                    current: prev.version,
-                });
-            }
-            // SYNC-10 (#102): bound the version jump. Subtraction is safe —
-            // the regression check above guarantees self.version > prev.version.
-            let jump = self.version - prev.version;
-            if jump > MAX_MANIFEST_VERSION_JUMP {
-                return Err(ManifestError::VersionJumpTooLarge {
-                    incoming: self.version,
-                    current: prev.version,
-                    max: MAX_MANIFEST_VERSION_JUMP,
-                });
+            match self.version.cmp(&prev.version) {
+                std::cmp::Ordering::Less => {
+                    return Err(ManifestError::VersionRegression {
+                        incoming: self.version,
+                        current: prev.version,
+                    });
+                }
+                std::cmp::Ordering::Equal => {
+                    // The tie rule (ADR-0027): the LOWER manifest hash wins.
+                    // Accept only if this manifest beats the current one;
+                    // an equal-or-higher hash is a benign stale (a relay
+                    // re-delivery or the concurrent loser).
+                    if self.hash() >= prev.hash() {
+                        return Err(ManifestError::VersionRegression {
+                            incoming: self.version,
+                            current: prev.version,
+                        });
+                    }
+                }
+                std::cmp::Ordering::Greater => {
+                    // SYNC-10 (#102): bound the version jump.
+                    let jump = self.version - prev.version;
+                    if jump > MAX_MANIFEST_VERSION_JUMP {
+                        return Err(ManifestError::VersionJumpTooLarge {
+                            incoming: self.version,
+                            current: prev.version,
+                            max: MAX_MANIFEST_VERSION_JUMP,
+                        });
+                    }
+                }
             }
             let issuer_known = prev
                 .members
@@ -158,7 +239,7 @@ impl GroupManifest {
         let vk = VerifyingKey::from_bytes(&self.issued_by)
             .map_err(|_| ManifestError::InvalidSignature)?;
         let sig = Signature::from_bytes(&self.signature);
-        let msg = signing_message(&self.group_id, self.version, &self.members);
+        let msg = signing_message(&self.group_id, self.version, &self.members, &self.parent);
         vk.verify_strict(&msg, &sig)
             .map_err(|_| ManifestError::InvalidSignature)
     }
@@ -179,6 +260,7 @@ impl GroupManifest {
                 .collect(),
             issued_by: self.issued_by.to_vec(),
             signature: self.signature.to_vec(),
+            parent: self.parent.map(|p| p.to_vec()).unwrap_or_default(),
         };
         proto.encode_to_vec()
     }
@@ -221,6 +303,19 @@ impl GroupManifest {
                     got: proto.signature.len(),
                 })?;
 
+        let parent: Option<[u8; 32]> =
+            if proto.parent.is_empty() {
+                None
+            } else {
+                Some(proto.parent.as_slice().try_into().map_err(|_| {
+                    ManifestError::InvalidLength {
+                        field: "parent",
+                        expected: 32,
+                        got: proto.parent.len(),
+                    }
+                })?)
+            };
+
         let members = proto
             .members
             .into_iter()
@@ -253,6 +348,7 @@ impl GroupManifest {
             members,
             issued_by,
             signature,
+            parent,
         })
     }
 

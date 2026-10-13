@@ -31,6 +31,37 @@ pub enum OutboxKind {
     Control,
 }
 
+/// One atomic membership commit (ADR-0027): an issued or accepted Group
+/// Manifest, the held-manifest record for deliberate-removal detection, the
+/// full replacement Pending Membership Change set, optionally the Leaving
+/// record, and the control-plane outbox entries that carry the manifest to
+/// the other members — all committed as ONE unit, so a crash leaves either
+/// the whole prior state or the whole new state.
+///
+/// The encoding of `pending_changes` and `leaving` is owned by the session;
+/// the log treats them as opaque blobs.
+pub struct MembershipCommit {
+    /// The encoded GroupManifest being installed as the current view.
+    pub manifest: Vec<u8>,
+    /// `(hash, includes_self)` records for the held-manifest history
+    /// (ADR-0027: a device counts itself removed only when the excluding
+    /// manifest's `parent` is a manifest it holds or has held that includes
+    /// it). Usually one entry — the installed manifest. When an accepted
+    /// manifest is immediately re-applied upon, BOTH the intermediate and
+    /// the final manifest are recorded: the device held both, and a
+    /// removal built on the intermediate is a deliberate removal.
+    pub held: Vec<([u8; 32], bool)>,
+    /// The full replacement Pending Membership Change set; empty = none.
+    pub pending_changes: Vec<u8>,
+    /// `Some(record)` sets/replaces the Leaving record (entering Leaving or
+    /// updating its outbox refs on a re-applied Leave); `None` leaves it
+    /// untouched.
+    pub leaving: Option<Vec<u8>>,
+    /// Control-plane outbox entries carrying the manifest to members:
+    /// `(recipient noise_pub, sequence, encoded Message)`.
+    pub outbox: Vec<([u8; 32], u64, Vec<u8>)>,
+}
+
 /// A named entry returned from the operation log.
 /// Replaces positional tuple returns in the trait — callers use field names instead
 /// of destructuring by position, which is both more readable and refactor-safe.
@@ -147,6 +178,40 @@ pub trait OperationLog: Send {
     /// Clear the Pending Join — on `cancelJoin()` and when the first
     /// manifest is accepted (ADR-0023).
     fn clear_pending_join(&mut self);
+
+    // ── Membership convergence (ADR-0027) ───────────────────────────────────
+
+    /// Commit an issued or accepted manifest with its held record, Pending
+    /// Membership Change set, optional Leaving record and outbox entries as
+    /// ONE unit. Implementations with transactions (SQLite) must make the
+    /// whole commit atomic — the ADR's crash points depend on it: after the
+    /// commit the manifest is redelivered from the outbox and the pending
+    /// change is re-checked on the next accepted manifest; before it, the
+    /// change never happened.
+    ///
+    /// Fallible like `begin_pending_join`: the caller must not update
+    /// in-memory state on error.
+    fn commit_membership(&mut self, commit: MembershipCommit) -> Result<(), String>;
+    /// The persisted Pending Membership Change set (opaque encoding), if
+    /// any. Loaded at construction so pending changes survive restarts and
+    /// an offline issuer re-applies after reconnecting.
+    fn pending_membership_changes(&self) -> Option<Vec<u8>>;
+    /// Was `hash` a manifest this device holds or has held that included
+    /// it? The deliberate-removal test (ADR-0027): an excluding manifest
+    /// counts as a deliberate removal only when its `parent` passes this.
+    fn is_held_including_self(&self, hash: &[u8; 32]) -> bool;
+    /// The persisted Leaving record (opaque encoding of the outbox refs the
+    /// Leave waits on), if any. Loaded at construction so a crash during
+    /// Leaving resumes Leaving (ADR-0027).
+    fn leaving(&self) -> Option<Vec<u8>>;
+    /// Wipe all group state this log owns: outbox, dedup table, sequence
+    /// high-water mark, Pending Join, Pending Membership Changes,
+    /// held-manifest history and the Leaving record. Identity and manifest
+    /// rows live on the Store side and are wiped by the caller (the FFI's
+    /// store handle). Used on deliberate removal and completed Leave
+    /// (ADR-0027): the device starts over with a fresh identity, so nothing
+    /// from the old group may carry over.
+    fn wipe_group_state(&mut self);
 }
 
 /// A single entry in the log.
@@ -167,6 +232,12 @@ pub struct MemLog {
     handled: BTreeMap<String, u64>,
     /// The Pending Join record (ADR-0023). In-memory like the rest of MemLog.
     pending_join: Option<Vec<u8>>,
+    /// The Pending Membership Change set (ADR-0027). Empty = none.
+    pending_changes: Vec<u8>,
+    /// Held-manifest history: hash → included_self (ADR-0027).
+    held: BTreeMap<[u8; 32], bool>,
+    /// The Leaving record (ADR-0027).
+    leaving: Option<Vec<u8>>,
 }
 
 impl MemLog {
@@ -176,6 +247,9 @@ impl MemLog {
             high_water: None,
             handled: BTreeMap::new(),
             pending_join: None,
+            pending_changes: Vec::new(),
+            held: BTreeMap::new(),
+            leaving: None,
         }
     }
 }
@@ -297,6 +371,55 @@ impl OperationLog for MemLog {
 
     fn clear_pending_join(&mut self) {
         self.pending_join = None;
+    }
+
+    fn commit_membership(&mut self, commit: MembershipCommit) -> Result<(), String> {
+        let MembershipCommit {
+            manifest: _,
+            held,
+            pending_changes,
+            leaving,
+            outbox,
+        } = commit;
+        // MemLog owns no manifest row (persistence is the Store's job);
+        // the held record, change set and entries are the in-memory state.
+        for (hash, included_self) in held {
+            self.held.insert(hash, included_self);
+        }
+        self.pending_changes = pending_changes;
+        if let Some(record) = leaving {
+            self.leaving = Some(record);
+        }
+        for (object_id, sequence, blob) in outbox {
+            self.append_control(&object_id, sequence, blob);
+        }
+        Ok(())
+    }
+
+    fn pending_membership_changes(&self) -> Option<Vec<u8>> {
+        if self.pending_changes.is_empty() {
+            None
+        } else {
+            Some(self.pending_changes.clone())
+        }
+    }
+
+    fn is_held_including_self(&self, hash: &[u8; 32]) -> bool {
+        self.held.get(hash).copied().unwrap_or(false)
+    }
+
+    fn leaving(&self) -> Option<Vec<u8>> {
+        self.leaving.clone()
+    }
+
+    fn wipe_group_state(&mut self) {
+        self.inner.clear();
+        self.high_water = None;
+        self.handled.clear();
+        self.pending_join = None;
+        self.pending_changes = Vec::new();
+        self.held.clear();
+        self.leaving = None;
     }
 }
 

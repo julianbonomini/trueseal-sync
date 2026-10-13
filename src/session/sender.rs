@@ -36,7 +36,7 @@ use crate::message::{message_id, Message};
 use crate::operation_log::{now_secs, LogEntry, OperationLog, OutboxKind};
 use crate::relay::{build_push_blob, push_send, RelayClient, RelayError};
 
-use super::{IssueSink, KeyState};
+use super::{leaving_refs_drained, IssueSink, KeyState, LeavingRecord};
 
 /// Tunables for the sender pump. Defaults follow ADR-0026: backoff from
 /// 1 s to a 5 min cap, and a 30-day expiry on `Sync` entries.
@@ -110,6 +110,13 @@ pub(super) fn backoff_delay(config: &SenderConfig, failures: u32) -> Duration {
 /// has drained (a Destroy Group queues its Revokes first; the pump's last
 /// job is to push them while connected — the durable Destroying state that
 /// survives a restart is SYNC-11 scope).
+///
+/// Two ADR-0027 duties on top of the outbox state machine:
+/// - complete a Leaving once the Relay has accepted every Leave push
+///   (`on_leave_complete` wipes and rotates);
+/// - rebind the Receive Session after an identity rotation: the client is
+///   swapped for the disconnected stub and the reconnect loop redials with
+///   the fresh keys.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_sender<T: Read + Write + Send + 'static>(
     client: Arc<Mutex<RelayClient<T>>>,
@@ -121,6 +128,9 @@ pub(super) fn spawn_sender<T: Read + Write + Send + 'static>(
     destroyed: Arc<AtomicBool>,
     kick: Arc<Kick>,
     config: SenderConfig,
+    leaving: Arc<Mutex<Option<LeavingRecord>>>,
+    rotation_pending: Arc<AtomicBool>,
+    on_leave_complete: Box<dyn Fn() + Send>,
 ) {
     std::thread::spawn(move || {
         sender_loop(
@@ -133,6 +143,9 @@ pub(super) fn spawn_sender<T: Read + Write + Send + 'static>(
             destroyed,
             kick,
             config,
+            leaving,
+            rotation_pending,
+            on_leave_complete,
         );
     });
 }
@@ -148,10 +161,35 @@ fn sender_loop<T: Read + Write + Send + 'static>(
     destroyed: Arc<AtomicBool>,
     kick: Arc<Kick>,
     config: SenderConfig,
+    leaving: Arc<Mutex<Option<LeavingRecord>>>,
+    rotation_pending: Arc<AtomicBool>,
+    on_leave_complete: Box<dyn Fn() + Send>,
 ) {
     let mut backoffs: HashMap<[u8; 32], RecipientBackoff> = HashMap::new();
     let mut was_connected = false;
     loop {
+        // ADR-0027: the identity rotated (deliberate removal or a completed
+        // Leave) — drop the old-key Receive Session so the reconnect loop
+        // rebinds with the fresh keys. The old client drops here; its Drop
+        // EOFs the receive loop.
+        if rotation_pending.swap(false, Ordering::AcqRel) {
+            *client.lock().unwrap_or_else(|e| e.into_inner()) = RelayClient::disconnected();
+            was_connected = false;
+        }
+
+        // ADR-0027: a Leaving completes when the Relay has accepted every
+        // Leave push (delivered rows are deleted). Runs before the
+        // not-connected skip: the refs may have drained just before a
+        // disconnect, and the wipe must not wait for a reconnect.
+        let leaving_rec = leaving.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(rec) = leaving_rec {
+            if leaving_refs_drained(&op_log, &rec) {
+                (on_leave_complete)();
+                // The wipe dropped every outbox entry; fall through to the
+                // (now empty) idle path.
+            }
+        }
+
         let connected = client
             .lock()
             .unwrap_or_else(|e| e.into_inner())

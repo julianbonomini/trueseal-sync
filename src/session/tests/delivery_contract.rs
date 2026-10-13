@@ -608,7 +608,7 @@ fn member_request_arriving_before_registration_flushes_on_registration() {
     );
     let (token, _name) = events.lock().unwrap()[0].clone();
     assert!(
-        session.accept_member(&token),
+        session.accept_member(&token).expect("accept"),
         "the buffered request stays admissible after the flush"
     );
 }

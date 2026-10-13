@@ -12,10 +12,13 @@ use crate::message::Message;
 use crate::operation_log::OperationLog;
 use crate::relay::RelayClient;
 
-use super::{EventSink, IssueSink, KeyState, PendingJoin, PendingMember};
+use super::{
+    EventSink, IssueSink, KeyState, LeavingRecord, PendingChange, PendingJoin, PendingMember,
+};
 
 /// Polls for relay disconnect, backs off, reconnects, and replays the outbox.
 /// Runs in a background thread spawned by `connect_with_reconnect`.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     client: Arc<Mutex<RelayClient<T>>>,
     op_log: Arc<Mutex<Box<dyn OperationLog>>>,
@@ -34,6 +37,11 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     on_member_left: Arc<Mutex<EventSink>>,
     issue_sink: Arc<Mutex<IssueSink>>,
     pending_join: Arc<Mutex<Option<PendingJoin>>>,
+    sequence: Arc<Mutex<u64>>,
+    pending_changes: Arc<Mutex<Vec<PendingChange>>>,
+    leaving: Arc<Mutex<Option<LeavingRecord>>>,
+    on_identity_rotated: Arc<dyn Fn(crate::device::DeviceKeypair) + Send + Sync + 'static>,
+    rotation_pending: Arc<AtomicBool>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
     on_connection_changed: Arc<dyn Fn(bool) + Send + Sync + 'static>,
@@ -98,6 +106,11 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             on_member_left.clone(),
             issue_sink.clone(),
             op_log.clone(),
+            sequence.clone(),
+            pending_changes.clone(),
+            leaving.clone(),
+            on_identity_rotated.clone(),
+            rotation_pending.clone(),
             on_message.clone(),
         );
         // SYNC-5: receive-path Delivery Issues forward into the session sink

@@ -124,7 +124,7 @@ fn joiner_accepts_only_initiator_manifest() {
     session_a.set_on_member_request(move |t, _| *r.lock().unwrap() = Some(t));
     wait_for(|| req.lock().unwrap().is_some(), Duration::from_secs(5));
     let t = req.lock().unwrap().clone().unwrap();
-    assert!(session_a.accept_member(&t), "A admits B");
+    assert!(session_a.accept_member(&t).expect("accept"), "A admits B");
 
     wait_for(
         || session_b.manifest.lock().unwrap().is_some(),
@@ -513,7 +513,7 @@ fn pair_replaying_spent_secret_is_rejected() {
     );
     wait_for(|| first.lock().unwrap().is_some(), Duration::from_secs(5));
     let t = first.lock().unwrap().clone().unwrap();
-    assert!(session.accept_member(&t));
+    assert!(session.accept_member(&t).expect("accept"));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 
     // M eavesdropped nothing — but suppose it somehow holds the spent
@@ -1277,7 +1277,9 @@ fn admitter_restart_keeps_the_queued_admission_manifest() {
         .expect("session");
         let _token = session.pairing_token();
         assert!(
-            session.accept_pair(joiner.public_key(), joiner.signing_public_key()),
+            session
+                .accept_pair(joiner.public_key(), joiner.signing_public_key())
+                .expect("accept"),
             "admission commits"
         );
         // The manifest is local and queued; nothing could be pushed.
@@ -1394,7 +1396,7 @@ fn two_concurrent_accepts_exactly_one_succeeds() {
         let noise = NoisePublicKey(rand::random());
         let signing = SigningPublicKey(joiner.public_key_bytes());
         handles.push(std::thread::spawn(move || {
-            session.accept_pair(noise, signing)
+            session.accept_pair(noise, signing).expect("accept")
         }));
     }
     let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -1475,6 +1477,24 @@ impl OperationLog for FailingJoinLog {
     }
     fn clear_pending_join(&mut self) {
         self.inner.clear_pending_join();
+    }
+    fn commit_membership(
+        &mut self,
+        commit: crate::operation_log::MembershipCommit,
+    ) -> Result<(), String> {
+        self.inner.commit_membership(commit)
+    }
+    fn pending_membership_changes(&self) -> Option<Vec<u8>> {
+        self.inner.pending_membership_changes()
+    }
+    fn is_held_including_self(&self, hash: &[u8; 32]) -> bool {
+        self.inner.is_held_including_self(hash)
+    }
+    fn leaving(&self) -> Option<Vec<u8>> {
+        self.inner.leaving()
+    }
+    fn wipe_group_state(&mut self) {
+        self.inner.wipe_group_state();
     }
 }
 

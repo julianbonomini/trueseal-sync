@@ -304,10 +304,10 @@ fn main() {
                     println!("usage: accept <token>");
                     continue;
                 }
-                if session.accept_member(rest) {
-                    println!("accepted");
-                } else {
-                    println!("no pending request with that token");
+                match session.accept_member(rest) {
+                    Ok(true) => println!("accepted"),
+                    Ok(false) => println!("no pending request with that token"),
+                    Err(e) => println!("accept failed: {e}"),
                 }
             }
 

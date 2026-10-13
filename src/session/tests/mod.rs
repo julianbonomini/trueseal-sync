@@ -1,6 +1,7 @@
 mod accept_member;
 mod accept_pair;
 mod connection;
+mod convergence;
 mod delivery_contract;
 mod destroy_group;
 mod early_deliver;
@@ -11,6 +12,7 @@ mod manifest_persist;
 mod manifest_restore;
 mod member_events;
 mod members;
+mod membership_convergence;
 mod nk_push;
 mod offline;
 mod outbox;
