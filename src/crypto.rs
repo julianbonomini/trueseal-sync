@@ -21,11 +21,16 @@ const EPH_PUB_LEN: usize = 32;
 const NONCE_LEN: usize = 12;
 const OVERHEAD: usize = EPH_PUB_LEN + NONCE_LEN;
 
-/// Generate the ephemeral X25519 keypair for one seal. Exposed so the
-/// Envelope can sign the ephemeral public key BEFORE encrypting (ADR-0031:
-/// the signature input binds the ephemeral key, and the signature itself
-/// lives inside the ciphertext — so sealing is two-phase).
-pub fn ephemeral_keypair() -> (StaticSecret, [u8; 32]) {
+/// Generate the ephemeral X25519 keypair for one seal. Used by the
+/// Envelope's two-phase seal (ADR-0031): the ephemeral public key is signed
+/// BEFORE encrypting, because the signature itself lives inside the
+/// ciphertext.
+///
+/// SINGLE-USE: the ephemeral key derives the AEAD key, and the AEAD nonce
+/// is zero — sealing twice with the same ephemeral key reuses a
+/// (key, nonce) pair, which breaks ChaCha20-Poly1305 confidentiality.
+/// One ephemeral key, one seal, ever.
+pub(crate) fn ephemeral_keypair() -> (StaticSecret, [u8; 32]) {
     let secret = StaticSecret::random_from_rng(rand::thread_rng());
     let public = PublicKey::from(&secret);
     (secret, *public.as_bytes())
@@ -66,7 +71,9 @@ pub fn encrypt(recipient_pub: NoisePublicKey, plaintext: &[u8]) -> Vec<u8> {
 /// Seal `plaintext` with a caller-supplied ephemeral key. The Envelope uses
 /// this for its two-phase seal: sign the ephemeral public key first, then
 /// encrypt the sealed plaintext (signature included) with that key.
-pub fn encrypt_with_ephemeral(
+///
+/// SINGLE-USE: see [`ephemeral_keypair`] — one ephemeral key, one seal.
+pub(crate) fn encrypt_with_ephemeral(
     recipient_pub: NoisePublicKey,
     eph_secret: &StaticSecret,
     plaintext: &[u8],

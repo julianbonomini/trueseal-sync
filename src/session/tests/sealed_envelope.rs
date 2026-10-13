@@ -530,3 +530,171 @@ fn replayed_revoke_after_destroy_does_nothing() {
         "a replayed Revoke changes no state"
     );
 }
+
+/// Replaying a Group Manifest changes no state (ADR-0034 §2: "an old Group
+/// Manifest loses on (version, hash)"). The same v2 delivered twice —
+/// re-sealed, new blob id, the hostile-Relay case — installs once: no
+/// second manifest-changed callback, no member events, no Delivery Issue.
+#[test]
+fn replayed_manifest_is_a_harmless_no_op() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let relay_kp = make_relay_kp();
+    let device = crate::device::DeviceKeypair::generate();
+    let issuer = crate::device::DeviceKeypair::generate();
+    let issuer_sk = ed25519_dalek::SigningKey::from_bytes(&issuer.signing.to_bytes());
+    let issuer_signing = crate::envelope::SigningKeypair::from_signing_key(
+        ed25519_dalek::SigningKey::from_bytes(&issuer.signing.to_bytes()),
+    );
+
+    let gid = crate::manifest::new_group_id();
+    let members = vec![
+        crate::manifest::ManifestMember {
+            noise_pub: device.public_key(),
+            signing_pub: device.signing_public_key(),
+            name: "Me".into(),
+        },
+        crate::manifest::ManifestMember {
+            noise_pub: issuer.public_key(),
+            signing_pub: issuer.signing_public_key(),
+            name: "Issuer".into(),
+        },
+    ];
+    let v1 = crate::manifest::GroupManifest::new(gid, 1, members.clone(), &issuer_sk);
+    let v2 = crate::manifest::GroupManifest::new(gid, 2, members, &issuer_sk);
+
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    let device_pub = device.public_key();
+
+    let manifest_changes = Arc::new(AtomicUsize::new(0));
+    let mc = manifest_changes.clone();
+    let session = super::super::TruesealSession::<MemPipe>::connect_full(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        |_, _, _| {},
+        Box::new(crate::operation_log::MemLog::new()),
+        || {},
+        move |_| {
+            mc.fetch_add(1, Ordering::SeqCst);
+        },
+        || {},
+        || Err("push factory unused".into()),
+    )
+    .expect("session");
+    session.set_manifest(v1);
+    let issues: std::sync::Arc<std::sync::Mutex<Vec<crate::delivery_issue::DeliveryIssue>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let issues_cb = issues.clone();
+    session.subscribe_delivery_issues(move |i| issues_cb.lock().unwrap().push(i));
+
+    let update = crate::message::Message::GroupManifest {
+        manifest: v2.clone(),
+    };
+    relay.deliver(1, &update, device_pub, &issuer_signing, 1);
+    wait_for(
+        || manifest_changes.load(Ordering::SeqCst) == 1,
+        std::time::Duration::from_secs(5),
+    );
+
+    // The hostile replay: identical content, fresh seal, new blob id.
+    relay.deliver(2, &update, device_pub, &issuer_signing, 2);
+    relay.deliver(3, &update, device_pub, &issuer_signing, 3);
+    wait_for(
+        || relay.deliver_acks() == vec![1, 2, 3],
+        std::time::Duration::from_secs(5),
+    );
+
+    assert_eq!(
+        manifest_changes.load(Ordering::SeqCst),
+        1,
+        "the replayed manifest installs nothing twice"
+    );
+    assert_eq!(
+        session.manifest.lock().unwrap().as_ref().map(|m| m.version),
+        Some(2),
+        "still v2 — no regression, no re-install"
+    );
+    assert!(
+        issues.lock().unwrap().is_empty(),
+        "a benign-stale replay raises no Delivery Issue"
+    );
+}
+
+/// Replaying a Pair after the window has closed changes no state
+/// (ADR-0034 §2: "a Pair for a closed Pairing Window is dropped"). The
+/// accept path is pinned by pairing_trust_anchor's
+/// `pair_replaying_spent_secret_is_rejected`; this pins the cancel path:
+/// a valid-secret Pair that DID raise a request, re-delivered after
+/// cancel_pairing(), raises nothing and reports nothing.
+#[test]
+fn replayed_pair_after_window_closed_is_a_harmless_no_op() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let relay_kp = make_relay_kp();
+    let device = crate::device::DeviceKeypair::generate();
+    let joiner = crate::envelope::SigningKeypair::generate();
+
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    let device_pub = device.public_key();
+
+    let session = super::super::TruesealSession::<MemPipe>::connect_full(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        |_, _, _| {},
+        Box::new(crate::operation_log::MemLog::new()),
+        || {},
+        |_| {},
+        || {},
+        || Err("push factory unused".into()),
+    )
+    .expect("session");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let rq = requests.clone();
+    session.set_on_member_request(move |_, _| {
+        rq.fetch_add(1, Ordering::SeqCst);
+    });
+    let issues: std::sync::Arc<std::sync::Mutex<Vec<crate::delivery_issue::DeliveryIssue>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+    let issues_cb = issues.clone();
+    session.subscribe_delivery_issues(move |i| issues_cb.lock().unwrap().push(i));
+
+    let token = session.pairing_token();
+    let (_, _, secret, _) = crate::message::decode_pairing_token(&token).expect("token");
+    let pair = crate::message::Message::Pair {
+        noise_pub: [0xC3; 32],
+        signing_pub: joiner.public_key_bytes(),
+        secret,
+    };
+
+    // The live Pair raises exactly one Join Request.
+    relay.deliver(1, &pair, device_pub, &joiner, 1);
+    wait_for(
+        || requests.load(Ordering::SeqCst) == 1,
+        std::time::Duration::from_secs(5),
+    );
+
+    // The window closes; the replayed Pair must be a harmless no-op.
+    session.cancel_pairing();
+    relay.deliver(2, &pair, device_pub, &joiner, 2);
+    relay.deliver(3, &pair, device_pub, &joiner, 3);
+    wait_for(
+        || relay.deliver_acks() == vec![1, 2, 3],
+        std::time::Duration::from_secs(5),
+    );
+
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "a replayed Pair after the window closed raises no request"
+    );
+    assert!(
+        issues.lock().unwrap().is_empty(),
+        "a replayed Pair is dropped silently — no Delivery Issue"
+    );
+}

@@ -473,12 +473,14 @@ fn run_loop<T: Read + Write + Send + 'static>(
                     let env = match Envelope::decode(envelope_bytes) {
                         Ok(env) => env,
                         Err(_) => {
-                            // Undecodable envelope: ack and drop (malformed).
-                            let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
+                            // Undecodable envelope: the rejection is
+                            // recorded BEFORE the ack (ADR-0031/0034 crash
+                            // ordering), then ack and drop (malformed).
                             fire_issue(
                                 &issue_callbacks,
                                 DeliveryIssue::Unreadable(UnreadableReason::Malformed),
                             );
+                            let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
                             continue;
                         }
                     };
@@ -495,13 +497,15 @@ fn run_loop<T: Read + Write + Send + 'static>(
                                 // Cap overflow: ack and drop the oldest held blob.
                                 if let Some(oldest) = held.pop_front() {
                                     held_set.remove(&oldest);
-                                    let _ = session.send(&frame(MsgType::DeliverAck, &oldest));
+                                    // Rejection recorded before the ack
+                                    // (ADR-0031/0034 crash ordering).
                                     fire_issue(
                                         &issue_callbacks,
                                         DeliveryIssue::Unreadable(
                                             UnreadableReason::DroppedWhileHeld,
                                         ),
                                     );
+                                    let _ = session.send(&frame(MsgType::DeliverAck, &oldest));
                                 }
                             }
                         }
@@ -512,12 +516,14 @@ fn run_loop<T: Read + Write + Send + 'static>(
 
                     if env.version < version::END_TO_END_VERSION {
                         // Older version — including 0, the refused pre-version
-                        // format: ack and drop, never reaches a handler.
-                        let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
+                        // format: the rejection is recorded BEFORE the ack
+                        // (ADR-0031/0034 crash ordering), then ack and drop,
+                        // never reaching a handler.
                         fire_issue(
                             &issue_callbacks,
                             DeliveryIssue::Unreadable(UnreadableReason::SenderOutdated),
                         );
+                        let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
                         continue;
                     }
 
@@ -543,11 +549,13 @@ fn run_loop<T: Read + Write + Send + 'static>(
                             // each seal, so an honest control is always fresh.
                             let now_ms = crate::operation_log::now_secs() * 1000;
                             if crate::envelope::is_expired(sealed.sender_timestamp_ms, now_ms) {
-                                let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
+                                // Rejection recorded BEFORE the ack
+                                // (ADR-0031/0034 crash ordering).
                                 fire_issue(
                                     &issue_callbacks,
                                     DeliveryIssue::Unreadable(UnreadableReason::Expired),
                                 );
+                                let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
                                 continue;
                             }
 
@@ -575,14 +583,15 @@ fn run_loop<T: Read + Write + Send + 'static>(
                         }
                         Err(_) => {
                             // Undecodable or unauthenticated: the library
-                            // decided the Blob is unusable — ack and drop it
-                            // (ADR-0026 step 3) and report malformed. Nothing
+                            // decided the Blob is unusable — report it
+                            // (BEFORE the ack: ADR-0031/0034 crash ordering),
+                            // then ack and drop (ADR-0026 step 3). Nothing
                             // but the DeliverAck ever leaves this device.
-                            let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
                             fire_issue(
                                 &issue_callbacks,
                                 DeliveryIssue::Unreadable(UnreadableReason::Malformed),
                             );
+                            let _ = session.send(&frame(MsgType::DeliverAck, &blob_id));
                         }
                     }
                 } else if let Some((MsgType::Heartbeat, _)) = parse(&raw) {

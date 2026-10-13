@@ -466,15 +466,18 @@ impl OperationLog for PersistentLog {
             .is_ok()
     }
 
-    fn record_handled(&mut self, message_id: &str, now: u64) {
+    fn record_handled(&mut self, message_id: &str, stamp: u64) {
         if let Err(e) = self.store.conn.execute(
             "INSERT INTO handled_messages (message_id, handled_at) VALUES (?1, ?2)
              ON CONFLICT(message_id) DO UPDATE SET handled_at = excluded.handled_at",
-            rusqlite::params![message_id, now as i64],
+            rusqlite::params![message_id, stamp as i64],
         ) {
             warn!("[trueseal-sync] record_handled failed: {e}");
         }
-        let cutoff = now.saturating_sub(DEDUP_RETENTION_SECS);
+        // Prune against the REAL WALL CLOCK, never the stored stamp (see
+        // the trait docs): a far-future Sender Timestamp must not delete
+        // existing dedup records.
+        let cutoff = now_secs().saturating_sub(DEDUP_RETENTION_SECS);
         if let Err(e) = self.store.conn.execute(
             "DELETE FROM handled_messages WHERE handled_at < ?1",
             rusqlite::params![cutoff as i64],
@@ -1039,24 +1042,54 @@ mod tests {
     }
 
     /// Handled Message IDs persist across a reopen and prune past the
-    /// 60-day retention window (ADR-0026).
+    /// 60-day retention window, measured from the REAL wall clock
+    /// (ADR-0026; the clamp-poisons-pruning fix).
     #[test]
     fn handled_messages_persist_and_prune() {
         let dir = tmp_dir();
         {
             let s = Store::open(dir.path(), "ns").expect("open");
             let mut log = PersistentLog::new(s);
-            log.record_handled("tsm1_a", 1_000_000);
+            log.record_handled("tsm1_a", now_secs());
             assert!(log.is_handled("tsm1_a"));
             assert!(!log.is_handled("tsm1_b"));
         }
         let s2 = Store::open(dir.path(), "ns").expect("reopen");
         let mut log2 = PersistentLog::new(s2);
         assert!(log2.is_handled("tsm1_a"), "dedup records survive restart");
-        // Recording past the retention window prunes the old record.
-        log2.record_handled("tsm1_b", 1_000_000 + DEDUP_RETENTION_SECS + 1);
+        // An expired row (61 days behind the wall clock, inserted directly)
+        // is pruned when the next record lands; the fresh row survives.
+        log2.store
+            .conn
+            .execute(
+                "INSERT INTO handled_messages (message_id, handled_at) VALUES ('tsm1_old', ?1)",
+                rusqlite::params![(now_secs() - DEDUP_RETENTION_SECS - 1) as i64],
+            )
+            .expect("seed expired row");
+        log2.record_handled("tsm1_b", now_secs());
         assert!(log2.is_handled("tsm1_b"));
-        assert!(!log2.is_handled("tsm1_a"));
+        assert!(log2.is_handled("tsm1_a"), "fresh records survive the prune");
+        assert!(!log2.is_handled("tsm1_old"), "expired records are pruned");
+    }
+
+    /// The clamp-poisons-pruning attack (review P1), persistent backend:
+    /// a far-future stored stamp must not prune existing records.
+    #[test]
+    fn far_future_stamp_does_not_prune_existing_records_persistent() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let mut log = PersistentLog::new(s);
+        log.record_handled("m1", now_secs());
+        log.record_handled("m2", now_secs());
+        log.record_handled("evil", now_secs() + 10 * 365 * 24 * 60 * 60);
+        assert!(log.is_handled("m1"), "existing records survive the clamp");
+        assert!(log.is_handled("m2"), "existing records survive the clamp");
+        assert!(log.is_handled("evil"));
+        // And the future-stamped record persists across a reopen.
+        let s2 = Store::open(dir.path(), "ns").expect("reopen");
+        let log2 = PersistentLog::new(s2);
+        assert!(log2.is_handled("evil"), "the clamped record persists");
+        assert!(log2.is_handled("m1"));
     }
 
     /// A store written before SYNC-5 (outbox without kind/created_at, no

@@ -43,7 +43,6 @@ fn deliver_body(
         body: body.to_vec(),
     }
     .encode();
-    let _ = &plaintext;
     let env = Envelope::build_sealed(
         1,
         vec![],
