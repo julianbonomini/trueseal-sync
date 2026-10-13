@@ -99,10 +99,6 @@ const WIPE_DATA_SQL: &str = "
     DELETE FROM leaving;
     DELETE FROM meta WHERE key NOT IN ('store_version', 'e2e_version');";
 
-fn wipe_tables(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
-    conn.execute_batch(WIPE_DATA_SQL)
-}
-
 /// Drops every table. The Store Reset uses this — a dev-build store can
 /// predate columns added later, and a reset should produce exactly the
 /// current schema, not a wiped legacy shape.
@@ -392,10 +388,8 @@ fn reseal_outbox_rows(conn: &rusqlite::Connection, to_e2e: u32) -> Result<usize,
                 if let Some((_, new_bytes)) = remap.get(&m.hash()) {
                     // new_bytes is the encoded Message; the manifest table
                     // stores the bare manifest encoding.
-                    if let Message::GroupManifest { manifest } =
-                        Message::decode(new_bytes).map_err(|e| {
-                            StoreError::ResealFailed(format!("re-decode: {e}"))
-                        })?
+                    if let Message::GroupManifest { manifest } = Message::decode(new_bytes)
+                        .map_err(|e| StoreError::ResealFailed(format!("re-decode: {e}")))?
                     {
                         conn.execute(
                             "INSERT INTO manifest (id, data) VALUES (1, ?1)
@@ -512,12 +506,11 @@ impl Store {
             let found: Option<u32> = if versioned {
                 // A negative or overflowing stored version is nonsense; read
                 // it as u32::MAX so the store is REFUSED, never reset.
-                meta_get(&probe, META_STORE_VERSION)?
-                    .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+                meta_get(&probe, META_STORE_VERSION)?.map(|v| u32::try_from(v).unwrap_or(u32::MAX))
             } else {
                 None
             };
-            let decision = match found {
+            match found {
                 _ if !versioned && !any_table_exists(&probe)? => Decision::Fresh,
                 None => Decision::Reset, // tables exist but no Store Version: dev-build store
                 Some(v) if v > target_store_version => {
@@ -531,22 +524,17 @@ impl Store {
                 Some(v) if v < crate::version::STORE_MIGRATION_FLOOR => Decision::Reset,
                 Some(v) if v < target_store_version => Decision::Migrate(v),
                 Some(_) => Decision::Current,
-            };
-            decision
+            }
         };
 
         // ── 2. Read-write open; every change below is transactional. ───────
         let mut conn = rusqlite::Connection::open(&path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
 
-        // Schema — created if absent. Runs before the reset wipe so the
-        // DELETEs below always have their tables (a dev-build store may
-        // predate tables added later).
-        ensure_schema(&conn)?;
-
         match decision {
             Decision::Fresh => {
                 outcome.created = true;
+                ensure_schema(&conn)?;
                 let tx = conn.transaction()?;
                 meta_set(&tx, META_STORE_VERSION, target_store_version)?;
                 meta_set(&tx, META_E2E_VERSION, current_e2e)?;
@@ -568,10 +556,17 @@ impl Store {
                 tx.commit()?;
             }
             Decision::Migrate(from) => {
+                // Deliberately NO ensure_schema here: the store has an older
+                // shape, and creating current-shape tables before the steps
+                // run would defeat them. The steps own the schema.
                 outcome.migrated_from = Some(from);
                 run_migrations(&mut conn, from, target_store_version, migrations)?;
             }
-            Decision::Current => {}
+            Decision::Current => {
+                // Defensive no-op for a current store (every statement is
+                // IF NOT EXISTS); guards against a partially created file.
+                ensure_schema(&conn)?;
+            }
         }
 
         // ── 5. End-to-End Version bump: re-seal the outbox (ADR-0034 §1). ──
@@ -597,9 +592,8 @@ impl Store {
         // versioned: the Store Version keys survive (they describe the
         // format, not the group). Everything else, the dedup table and the
         // sequence high-water mark included, goes.
-        self.conn.execute_batch(&format!(
-            "BEGIN; {WIPE_DATA_SQL} COMMIT;"
-        ))?;
+        self.conn
+            .execute_batch(&format!("BEGIN; {WIPE_DATA_SQL} COMMIT;"))?;
         Ok(())
     }
 
@@ -1878,11 +1872,17 @@ mod versioning_tests {
     // ── Chained migrations ───────────────────────────────────────────────────
 
     fn step_1_to_2(tx: &rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error> {
-        tx.execute("INSERT INTO meta (key, value) VALUES ('step_1_to_2', 1)", [])?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('step_1_to_2', 1)",
+            [],
+        )?;
         Ok(())
     }
     fn step_2_to_3(tx: &rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error> {
-        tx.execute("INSERT INTO meta (key, value) VALUES ('step_2_to_3', 1)", [])?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('step_2_to_3', 1)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -1891,8 +1891,14 @@ mod versioning_tests {
         let dir = tmp_dir();
         make_v1_store(dir.path(), "ns");
         let steps: &[(u32, Migration)] = &[(1, step_1_to_2), (2, step_2_to_3)];
-        let (s, outcome) = Store::open_inner(dir.path(), "ns", 3, crate::version::END_TO_END_VERSION, steps)
-            .expect("migrate");
+        let (s, outcome) = Store::open_inner(
+            dir.path(),
+            "ns",
+            3,
+            crate::version::END_TO_END_VERSION,
+            steps,
+        )
+        .expect("migrate");
         assert_eq!(outcome.migrated_from, Some(1));
         assert_eq!(meta_get(&s.conn, META_STORE_VERSION).unwrap(), Some(3));
         // Every step ran, in order.
@@ -1907,16 +1913,20 @@ mod versioning_tests {
         let dir = tmp_dir();
         make_v1_store(dir.path(), "ns");
         // No steps registered: v1 -> v2 has no path.
-        let err = match Store::open_inner(dir.path(), "ns", 2, crate::version::END_TO_END_VERSION, &[]) {
-            Ok(_) => panic!("no migration path should fail"),
-            Err(e) => e,
-        };
+        let err =
+            match Store::open_inner(dir.path(), "ns", 2, crate::version::END_TO_END_VERSION, &[]) {
+                Ok(_) => panic!("no migration path should fail"),
+                Err(e) => e,
+            };
         assert!(matches!(err, StoreError::MigrationFailed { from: 1, .. }));
         assert_eq!(raw_meta_get(dir.path(), "ns", META_STORE_VERSION), Some(1));
     }
 
     fn step_writes_then_fails(tx: &rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error> {
-        tx.execute("INSERT INTO meta (key, value) VALUES ('partial_step', 1)", [])?;
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES ('partial_step', 1)",
+            [],
+        )?;
         Err(rusqlite::Error::InvalidQuery)
     }
 
@@ -1928,7 +1938,13 @@ mod versioning_tests {
         let dir = tmp_dir();
         make_v1_store(dir.path(), "ns");
         let crashy: &[(u32, Migration)] = &[(1, step_writes_then_fails)];
-        let err = match Store::open_inner(dir.path(), "ns", 2, crate::version::END_TO_END_VERSION, crashy) {
+        let err = match Store::open_inner(
+            dir.path(),
+            "ns",
+            2,
+            crate::version::END_TO_END_VERSION,
+            crashy,
+        ) {
             Ok(_) => panic!("step should fail"),
             Err(e) => e,
         };
@@ -1938,8 +1954,14 @@ mod versioning_tests {
         assert_eq!(raw_meta_get(dir.path(), "ns", "partial_step"), None);
         // The next open retries — with a working step it completes.
         let fixed: &[(u32, Migration)] = &[(1, step_1_to_2)];
-        let (s, outcome) = Store::open_inner(dir.path(), "ns", 2, crate::version::END_TO_END_VERSION, fixed)
-            .expect("retry succeeds");
+        let (s, outcome) = Store::open_inner(
+            dir.path(),
+            "ns",
+            2,
+            crate::version::END_TO_END_VERSION,
+            fixed,
+        )
+        .expect("retry succeeds");
         assert_eq!(outcome.migrated_from, Some(1));
         assert_eq!(meta_get(&s.conn, META_STORE_VERSION).unwrap(), Some(2));
     }
@@ -1955,10 +1977,12 @@ mod versioning_tests {
         let dir = tmp_dir();
         make_v1_store(dir.path(), "ns");
         {
-            let conn =
-                rusqlite::Connection::open(dir.path().join("trueseal_ns.db")).unwrap();
-            conn.execute("DELETE FROM meta WHERE key IN ('store_version', 'e2e_version')", [])
-                .unwrap();
+            let conn = rusqlite::Connection::open(dir.path().join("trueseal_ns.db")).unwrap();
+            conn.execute(
+                "DELETE FROM meta WHERE key IN ('store_version', 'e2e_version')",
+                [],
+            )
+            .unwrap();
         }
         let (s, outcome) = Store::open_with_outcome(dir.path(), "ns").expect("open resets");
         assert!(outcome.reset);
@@ -1981,13 +2005,11 @@ mod versioning_tests {
         let path = dir.path().join("trueseal_ns.db");
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute(
-                "UPDATE meta SET value = 99 WHERE key = 'store_version'",
-                [],
-            )
-            .unwrap();
+            conn.execute("UPDATE meta SET value = 99 WHERE key = 'store_version'", [])
+                .unwrap();
             // Checkpoint so the main file holds every byte, then hash it.
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
         }
         let before = sha256_file(&path);
         let err = match Store::open_with_outcome(dir.path(), "ns") {
@@ -2019,8 +2041,8 @@ mod versioning_tests {
         s.save_keypair(&kp).expect("save");
         let group_id = oid(9);
         let genesis = GroupManifest::new(group_id, 0, vec![member(&kp, "me")], &kp.signing);
-        let child = GroupManifest::update(&genesis, vec![member(&kp, "me")], &kp.signing)
-            .expect("update");
+        let child =
+            GroupManifest::update(&genesis, vec![member(&kp, "me")], &kp.signing).expect("update");
         let mut log = PersistentLog::new(s);
         log.append(&oid(1), 1, b"hello sync body".to_vec());
         log.append_control(
@@ -2055,7 +2077,7 @@ mod versioning_tests {
         let s2 = Store::open(dir, ns).expect("reopen");
         s2.save_group_manifest(&child).expect("save manifest");
         let mut log2 = PersistentLog::new(s2);
-        log2.commit_membership(crate::operation_log::MembershipCommit {
+        let _ = log2.commit_membership(crate::operation_log::MembershipCommit {
             manifest: child.encode(),
             held: vec![(genesis.hash(), true), (child.hash(), true)],
             pending_changes: vec![],
@@ -2098,7 +2120,10 @@ mod versioning_tests {
             MIGRATIONS,
         )
         .expect("open reseals");
-        assert_eq!(outcome.resealed_from_e2e, Some(crate::version::END_TO_END_VERSION));
+        assert_eq!(
+            outcome.resealed_from_e2e,
+            Some(crate::version::END_TO_END_VERSION)
+        );
         assert_eq!(
             meta_get(&s.conn, META_E2E_VERSION).unwrap(),
             Some(crate::version::END_TO_END_VERSION as i64 + 1)
@@ -2114,13 +2139,15 @@ mod versioning_tests {
         let new_e2e = crate::version::END_TO_END_VERSION + 1;
         let (genesis_blob, _, _) = outbox_row(dir.path(), "ns", 3);
         let (child_blob, _, _) = outbox_row(dir.path(), "ns", 4);
-        let Message::GroupManifest { manifest: new_genesis } =
-            Message::decode(&genesis_blob).unwrap()
+        let Message::GroupManifest {
+            manifest: new_genesis,
+        } = Message::decode(&genesis_blob).unwrap()
         else {
             panic!("seq 3 is a manifest");
         };
-        let Message::GroupManifest { manifest: new_child } =
-            Message::decode(&child_blob).unwrap()
+        let Message::GroupManifest {
+            manifest: new_child,
+        } = Message::decode(&child_blob).unwrap()
         else {
             panic!("seq 4 is a manifest");
         };
@@ -2133,13 +2160,20 @@ mod versioning_tests {
         new_genesis
             .verify_signature_for_version(crate::version::END_TO_END_VERSION)
             .expect_err("genesis no longer verifies under the old version");
-        assert_ne!(new_genesis.hash(), genesis.hash(), "re-sign changes the hash");
+        assert_ne!(
+            new_genesis.hash(),
+            genesis.hash(),
+            "re-sign changes the hash"
+        );
         assert_eq!(
             new_child.parent,
             Some(new_genesis.hash()),
             "child parent remapped to the new genesis hash"
         );
-        assert_eq!(new_child.version, child.version, "logical version unchanged");
+        assert_eq!(
+            new_child.version, child.version,
+            "logical version unchanged"
+        );
         assert_eq!(new_child.members, child.members, "members unchanged");
 
         // Stored current manifest: re-written to the re-signed child.
@@ -2184,8 +2218,7 @@ mod versioning_tests {
         let dir = tmp_dir();
         let (_kp, genesis, _child) = queue_all_kinds(dir.path(), "ns");
         {
-            let conn =
-                rusqlite::Connection::open(dir.path().join("trueseal_ns.db")).unwrap();
+            let conn = rusqlite::Connection::open(dir.path().join("trueseal_ns.db")).unwrap();
             conn.execute("UPDATE outbox SET delivered = 1 WHERE sequence = 3", [])
                 .unwrap();
         }
@@ -2218,8 +2251,7 @@ mod versioning_tests {
         // Corrupt the queued genesis: re-sign it with a DIFFERENT device's
         // key, so the migration's resign_for_version refuses (UnknownIssuer).
         {
-            let conn =
-                rusqlite::Connection::open(dir.path().join("trueseal_ns.db")).unwrap();
+            let conn = rusqlite::Connection::open(dir.path().join("trueseal_ns.db")).unwrap();
             let other = DeviceKeypair::generate();
             let foreign = GroupManifest::new(
                 genesis.group_id,

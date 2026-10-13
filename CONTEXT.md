@@ -160,6 +160,9 @@ _Avoid_: migration guide, breaking-change notice
 The format version of Session State, recorded in the store itself. Each TrueSeal Release migrates any older preview Store Version forward, and refuses to open a store written by a newer release (ADR-0032).
 _Avoid_: schema version, DB version
 
+**Upgrade promise**:
+Opening Session State written by any earlier preview release migrates it forward, in chained single-transaction steps; a crash mid-migration leaves the old store intact and the next start retries (ADR-0032). An End-to-End Version upgrade re-seals every queued outbox entry in the migration transaction — Sync included, keeping its Message ID and Sender Timestamp — so nothing queued is lost (ADR-0034). A store written by a newer release is refused with `storeTooNew`, bytes unchanged. The only wipe-on-upgrade is a Store Reset release, which needs the product owner's approval and reports `storeReset`. G6 upgrade fixtures: `trueseal-cli emit-fixture --dir <dir> --state <member-with-outbox|dedup-in-use>`; Pending Join / Leaving / Destroying fixtures are emitted by driving a real session in the e2e scenario drivers.
+
 **Store Reset**:
 A TrueSeal Release, declared in its release notes, that cannot migrate older Session State. Opening an older store wipes the namespace, generates a fresh identity and reports `statusChanged(notJoined, storeReset)`, so every group whose devices upgrade must pair again. Requires the product owner's approval (ADR-0032).
 _Avoid_: wipe (when it means this upgrade case), migration failure
