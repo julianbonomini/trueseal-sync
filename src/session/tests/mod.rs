@@ -12,6 +12,7 @@ mod manifest_persist;
 mod manifest_restore;
 mod member_events;
 mod members;
+mod membership_convergence;
 mod nk_push;
 mod offline;
 mod outbox;

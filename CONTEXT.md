@@ -101,7 +101,7 @@ Soft Removal of the local Device by itself. The Device stays in a Leaving state 
 _Avoid_: unpair, sign out, disconnect
 
 **Pending Membership Change**:
-A membership change (an admission, a removal or a Leave) that its issuer keeps until the group's manifest reflects it or a deliberate later change supersedes it. If a concurrent manifest overwrites the change, the issuer re-applies it on top. This is how concurrent membership changes converge without the app redoing anything.
+A membership change (an admission, a removal or a Leave) that its issuer keeps until the group's manifest reflects it or a deliberate later change supersedes it. If a concurrent manifest overwrites the change, the issuer re-applies it on top. This is how concurrent membership changes converge without the app redoing anything. While concurrent changes settle, member events can flicker — a device can briefly see a member leave and rejoin — so apps should render the current member list, not treat individual events as permanent facts (ADR-0027).
 _Avoid_: membership intent, membership op
 
 **Maximum Group Size**:
