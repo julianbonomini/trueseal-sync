@@ -554,11 +554,13 @@ impl OperationLog for PersistentLog {
                  ON CONFLICT(id) DO UPDATE SET data=excluded.data",
                 rusqlite::params![manifest],
             )?;
-            tx.execute(
-                "INSERT INTO held_manifests (hash, included_self) VALUES (?1, ?2)
-                 ON CONFLICT(hash) DO UPDATE SET included_self=excluded.included_self",
-                rusqlite::params![held.0.as_slice(), held.1 as i64],
-            )?;
+            for (hash, included_self) in &held {
+                tx.execute(
+                    "INSERT INTO held_manifests (hash, included_self) VALUES (?1, ?2)
+                     ON CONFLICT(hash) DO UPDATE SET included_self=excluded.included_self",
+                    rusqlite::params![hash.as_slice(), *included_self as i64],
+                )?;
+            }
             if pending_changes.is_empty() {
                 tx.execute("DELETE FROM pending_changes", [])?;
             } else {
@@ -703,7 +705,7 @@ mod tests {
         let mut log = PersistentLog::new(s);
         log.commit_membership(MembershipCommit {
             manifest: b"m".to_vec(),
-            held: ([1u8; 32], true),
+            held: vec![([1u8; 32], true)],
             pending_changes: b"changes".to_vec(),
             leaving: Some(b"refs".to_vec()),
             outbox: vec![],
@@ -1206,7 +1208,7 @@ mod tests {
             let mut log = PersistentLog::new(s);
             log.commit_membership(MembershipCommit {
                 manifest: b"manifest-v2".to_vec(),
-                held: ([7u8; 32], true),
+                held: vec![([7u8; 32], true)],
                 pending_changes: b"change-set".to_vec(),
                 leaving: Some(b"leave-refs".to_vec()),
                 outbox: vec![(oid(9), 3, b"\x04m".to_vec())],
@@ -1242,7 +1244,7 @@ mod tests {
         let mut log = PersistentLog::new(s);
         log.commit_membership(MembershipCommit {
             manifest: b"m1".to_vec(),
-            held: ([1u8; 32], true),
+            held: vec![([1u8; 32], true)],
             pending_changes: b"changes".to_vec(),
             leaving: Some(b"refs".to_vec()),
             outbox: vec![],
@@ -1250,7 +1252,7 @@ mod tests {
         .expect("commit 1");
         log.commit_membership(MembershipCommit {
             manifest: b"m2".to_vec(),
-            held: ([2u8; 32], false),
+            held: vec![([2u8; 32], false)],
             pending_changes: Vec::new(),
             leaving: None,
             outbox: vec![],
@@ -1279,7 +1281,7 @@ mod tests {
         log.record_handled("tsm1_a", now_secs());
         log.commit_membership(MembershipCommit {
             manifest: b"m".to_vec(),
-            held: ([1u8; 32], true),
+            held: vec![([1u8; 32], true)],
             pending_changes: b"changes".to_vec(),
             leaving: Some(b"refs".to_vec()),
             outbox: vec![(oid(2), 4, b"ctrl".to_vec())],

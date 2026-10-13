@@ -43,11 +43,14 @@ pub enum OutboxKind {
 pub struct MembershipCommit {
     /// The encoded GroupManifest being installed as the current view.
     pub manifest: Vec<u8>,
-    /// `(hash of the installed manifest, includes_self)` — recorded in the
-    /// held-manifest history (ADR-0027: a device counts itself removed only
-    /// when the excluding manifest's `parent` is a manifest it holds or has
-    /// held that includes it).
-    pub held: ([u8; 32], bool),
+    /// `(hash, includes_self)` records for the held-manifest history
+    /// (ADR-0027: a device counts itself removed only when the excluding
+    /// manifest's `parent` is a manifest it holds or has held that includes
+    /// it). Usually one entry — the installed manifest. When an accepted
+    /// manifest is immediately re-applied upon, BOTH the intermediate and
+    /// the final manifest are recorded: the device held both, and a
+    /// removal built on the intermediate is a deliberate removal.
+    pub held: Vec<([u8; 32], bool)>,
     /// The full replacement Pending Membership Change set; empty = none.
     pub pending_changes: Vec<u8>,
     /// `Some(record)` sets/replaces the Leaving record (entering Leaving or
@@ -380,7 +383,9 @@ impl OperationLog for MemLog {
         } = commit;
         // MemLog owns no manifest row (persistence is the Store's job);
         // the held record, change set and entries are the in-memory state.
-        self.held.insert(held.0, held.1);
+        for (hash, included_self) in held {
+            self.held.insert(hash, included_self);
+        }
         self.pending_changes = pending_changes;
         if let Some(record) = leaving {
             self.leaving = Some(record);

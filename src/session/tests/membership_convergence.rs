@@ -233,6 +233,114 @@ fn concurrent_admissions_converge_on_every_member() {
     );
 }
 
+/// ADR-0027: the admit-vs-remove tie — A admits C while B removes D at
+/// the same version. The loser's change (whichever it is) re-applies on
+/// the winner, and every member converges on the identical manifest with
+/// BOTH intents reflected: C a member, D not.
+#[test]
+fn concurrent_admit_and_remove_converge_on_every_member() {
+    let a = DeviceKeypair::generate();
+    let b = DeviceKeypair::generate();
+    let c = DeviceKeypair::generate();
+    let d = DeviceKeypair::generate();
+
+    let (session_a, relay_a, _ia) = scripted_session(&a);
+    let (session_b, relay_b, _ib) = scripted_session(&b);
+    // v1 = {A, B, D} — D is a member so B can remove it.
+    let v1 = GroupManifest::new(
+        new_group_id(),
+        1,
+        vec![member_of(&a), member_of(&b), member_of(&d)],
+        &SigningKey::from_bytes(&a.signing.to_bytes()),
+    );
+    session_a.set_manifest(v1.clone());
+    session_b.set_manifest(v1.clone());
+
+    // A admits C; B removes D — concurrently at version 2.
+    session_a.pairing_token();
+    assert!(session_a
+        .accept_pair(c.public_key(), c.signing_public_key())
+        .expect("A admits C"));
+    session_b
+        .remove_member(d.signing_public_key())
+        .expect("B removes D");
+
+    let v2a = manifest_of(&session_a); // {A, B, C, D}
+    let v2b = manifest_of(&session_b); // {A, B}
+    assert_eq!(v2a.version, 2);
+    assert_eq!(v2b.version, 2);
+    assert!(v2a.contains_signing_pub(&c.signing_public_key().0));
+    assert!(!v2b.contains_signing_pub(&d.signing_public_key().0));
+
+    // Cross-deliver. The lower hash wins; the loser accepts it and
+    // re-applies its change on top as v3.
+    deliver_manifest(&relay_b, 1, &v2a, &b, &a, 1);
+    deliver_manifest(&relay_a, 2, &v2b, &a, &b, 1);
+
+    let a_won = v2a.hash() < v2b.hash();
+    let winner = if a_won { &v2a } else { &v2b };
+    let (loser_session, loser_device) = if a_won {
+        (&session_b, &b)
+    } else {
+        (&session_a, &a)
+    };
+    let (winner_session, winner_relay, winner_device) = if a_won {
+        (&session_a, &relay_a, &a)
+    } else {
+        (&session_b, &relay_b, &b)
+    };
+
+    wait_for(
+        || {
+            loser_session
+                .manifest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.version == 3)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    );
+    let v3 = manifest_of(loser_session);
+    assert_eq!(
+        v3.parent,
+        Some(winner.hash()),
+        "re-application builds on the winner"
+    );
+    assert!(
+        v3.contains_signing_pub(&c.signing_public_key().0),
+        "the admission survives the tie (re-applied or satisfied)"
+    );
+    assert!(
+        !v3.contains_signing_pub(&d.signing_public_key().0),
+        "the removal survives the tie (re-applied or satisfied)"
+    );
+
+    // Deliver the re-application to the winner: both converge identically.
+    deliver_manifest(winner_relay, 3, &v3, winner_device, loser_device, 2);
+    wait_for(
+        || {
+            winner_session
+                .manifest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.hash() == v3.hash())
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    );
+    assert_eq!(
+        manifest_of(&session_a).hash(),
+        manifest_of(&session_b).hash(),
+        "admit-vs-remove converges on the identical manifest on every member"
+    );
+    let final_m = manifest_of(&session_a);
+    assert!(final_m.contains_signing_pub(&c.signing_public_key().0));
+    assert!(!final_m.contains_signing_pub(&d.signing_public_key().0));
+}
+
 /// ADR-0027: a Pending Membership Change survives an issuer restart (and
 /// the offline period before it) and is re-applied when the concurrent
 /// manifest finally arrives.
@@ -618,6 +726,148 @@ fn falsely_removed_device_cannot_issue_membership_changes() {
     );
 }
 
+/// Regression (review P2): when an accepted manifest is immediately
+/// re-applied upon, BOTH the intermediate and the final manifest enter the
+/// held history. A removal built on the intermediate is a deliberate
+/// removal — the device held it and it included the device. Pre-fix only
+/// the final hash was recorded, so this removal was misclassified as a
+/// false removal: no wipe, and the device kept a zombie view of a group
+/// that had deliberately removed it.
+#[test]
+fn removal_built_on_intermediate_manifest_is_deliberate() {
+    let a = DeviceKeypair::generate();
+    let b = DeviceKeypair::generate();
+    let c = DeviceKeypair::generate();
+    let d = DeviceKeypair::generate();
+    let e = DeviceKeypair::generate();
+
+    let removed = Arc::new(Mutex::new(0u32));
+    let r = removed.clone();
+    let relay_kp = make_relay_kp();
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let relay_a = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    let (_nk_rx, nk) = nk_push_channel();
+    let session_a = TruesealSession::connect_full(
+        pipe_client,
+        relay_pub(&relay_kp),
+        clone_kp(&a),
+        |_, _, _| {},
+        Box::new(MemLog::new()),
+        move || *r.lock().unwrap() += 1,
+        |_| {},
+        || {},
+        nk.factory(),
+    )
+    .expect("A");
+    let a_signing_before = session_a.signing_pub();
+
+    // v1 = {A, B, C}. A admits E (pending change); B concurrently admits D.
+    let v1 = GroupManifest::new(
+        new_group_id(),
+        1,
+        vec![member_of(&a), member_of(&b), member_of(&c)],
+        &SigningKey::from_bytes(&a.signing.to_bytes()),
+    );
+    session_a.set_manifest(v1.clone());
+    session_a.pairing_token();
+    assert!(session_a
+        .accept_pair(e.public_key(), e.signing_public_key())
+        .expect("A admits E"));
+    let v2a = manifest_of(&session_a); // {A, B, C, E}
+
+    let b_sk = SigningKey::from_bytes(&b.signing.to_bytes());
+    let mut w = GroupManifest::update(
+        &v1,
+        vec![member_of(&a), member_of(&b), member_of(&c), member_of(&d)],
+        &b_sk,
+    )
+    .expect("W");
+    let mut attempts = 0;
+    while w.hash() >= v2a.hash() {
+        attempts += 1;
+        let renamed = ManifestMember {
+            name: format!("{}-w{attempts}", member_of(&d).name),
+            ..member_of(&d)
+        };
+        w = GroupManifest::update(
+            &v1,
+            vec![member_of(&a), member_of(&b), member_of(&c), renamed],
+            &b_sk,
+        )
+        .expect("W retry");
+        assert!(attempts < 200, "tie-break should resolve quickly");
+    }
+    // W wins the tie: A accepts it and immediately re-applies Admit(E) on
+    // top — W is the INTERMEDIATE manifest A held.
+    deliver_manifest(&relay_a, 1, &w, &a, &b, 1);
+    wait_for(
+        || {
+            session_a
+                .manifest
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.version == 3)
+                .unwrap_or(false)
+        },
+        Duration::from_secs(5),
+    );
+    let v3 = manifest_of(&session_a);
+    assert_eq!(v3.parent, Some(w.hash()));
+
+    // C removes A, building on the INTERMEDIATE W (C never saw the
+    // re-application). X must win its tie against A's v3.
+    let c_sk = SigningKey::from_bytes(&c.signing.to_bytes());
+    let d_in_w = w
+        .members
+        .iter()
+        .find(|m| m.signing_pub == d.signing_public_key())
+        .cloned()
+        .expect("D in W");
+    let mut x = GroupManifest::update(
+        &w,
+        vec![member_of(&b), member_of(&c), d_in_w.clone()],
+        &c_sk,
+    )
+    .expect("X removes A on W");
+    let mut attempts = 0;
+    while x.hash() >= v3.hash() {
+        attempts += 1;
+        let renamed = ManifestMember {
+            name: format!("{}-x{attempts}", d_in_w.name),
+            ..d_in_w.clone()
+        };
+        x = GroupManifest::update(&w, vec![member_of(&b), member_of(&c), renamed], &c_sk)
+            .expect("X retry");
+        assert!(attempts < 200, "tie-break should resolve quickly");
+    }
+    assert_eq!(
+        x.parent,
+        Some(w.hash()),
+        "the removal builds on the intermediate"
+    );
+    assert!(!x.contains_signing_pub(&a_signing_before.0));
+
+    deliver_manifest(&relay_a, 2, &x, &a, &c, 2);
+
+    // Deliberate removal: wipe, rotate, removed event.
+    wait_for(|| *removed.lock().unwrap() >= 1, Duration::from_secs(5));
+    wait_for(
+        || session_a.manifest.lock().unwrap().is_none(),
+        Duration::from_secs(5),
+    );
+    assert_ne!(
+        session_a.signing_pub(),
+        a_signing_before,
+        "deliberate removal rotates the identity"
+    );
+    assert_eq!(
+        session_a.group_status(),
+        GroupStatus::NotJoined,
+        "back to NotJoined"
+    );
+}
+
 // ── Leave ───────────────────────────────────────────────────────────────────
 
 /// ADR-0027: Leave enters the persisted Leaving state (no Sync sends),
@@ -756,6 +1006,81 @@ fn leave_resumes_after_crash_and_completes() {
     assert!(log.leaving().is_none());
     assert!(log.undelivered_entries().is_empty());
     assert!(log.pending_membership_changes().is_none());
+}
+
+/// ADR-0027 crash point: a crash AFTER the Relay accepted every Leave
+/// push but BEFORE the completion ran resumes at construction — a Leaving
+/// record whose refs are already drained completes immediately, even
+/// offline.
+#[test]
+fn leave_completes_at_construction_when_refs_drained_pre_crash() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let a = DeviceKeypair::generate();
+    let b = DeviceKeypair::generate();
+    let b_signing_before = b.signing_public_key();
+    let v1 = genesis_ab(&a, &b);
+
+    // Phase 1: stage the post-acceptance, pre-completion store state
+    // directly (a live session's pump would race the staging): the Leave
+    // manifest is persisted, the Leaving record references outbox entries
+    // that are already gone — delivered rows are deleted on relay
+    // acceptance (ADR-0026) — and the crash hit before the completion ran.
+    let leave_manifest = GroupManifest::update(
+        &v1,
+        vec![member_of(&a)],
+        &SigningKey::from_bytes(&b.signing.to_bytes()),
+    )
+    .expect("leave manifest");
+    {
+        let store = Store::open(dir.path(), "ns").expect("store");
+        let mut log = PersistentLog::new(store);
+        let record = super::super::LeavingRecord {
+            refs: vec![([9u8; 32], 0)], // never written = already delivered
+        };
+        log.commit_membership(crate::operation_log::MembershipCommit {
+            manifest: leave_manifest.encode(),
+            held: vec![(leave_manifest.hash(), false)],
+            pending_changes: Vec::new(),
+            leaving: Some(record.encode()),
+            outbox: Vec::new(),
+        })
+        .expect("stage leave");
+        // CRASH.
+    }
+
+    // Phase 2: still offline. Construction sees the Leaving record with
+    // drained refs and completes the Leave immediately — the wipe does not
+    // wait for a reconnect.
+    let store = Store::open(dir.path(), "ns").expect("store reopen");
+    let seeded = store.load_group_manifest().expect("load");
+    let log = PersistentLog::new(store);
+    let manifest_slot: Arc<Mutex<Option<GroupManifest>>> = Arc::new(Mutex::new(seeded));
+    let session_b2 = TruesealSession::connect_background(
+        relay_pub(&make_relay_kp()),
+        clone_kp(&b),
+        |_, _, _| {},
+        Box::new(log),
+        manifest_slot,
+        || {},
+        |_| {},
+        || {},
+        || -> Result<MemPipeSimple, String> { Err("offline".into()) },
+        || -> Result<MemPipeSimple, String> { Err("offline".into()) },
+        Some(Duration::from_millis(50)),
+        None,
+    )
+    .expect("B phase 2");
+    assert_eq!(
+        session_b2.group_status(),
+        GroupStatus::NotJoined,
+        "crash after acceptance, before completion: resumes at construction"
+    );
+    assert_ne!(
+        session_b2.signing_pub(),
+        b_signing_before,
+        "identity rotated"
+    );
+    assert!(session_b2.manifest.lock().unwrap().is_none());
 }
 
 // ── Maximum Group Size ──────────────────────────────────────────────────────

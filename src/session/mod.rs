@@ -886,7 +886,7 @@ pub(super) fn build_subscribe_handler(
                 // re-delivers the manifest.
                 let commit = crate::operation_log::MembershipCommit {
                     manifest: incoming.encode(),
-                    held: (incoming.hash(), true),
+                    held: vec![(incoming.hash(), true)],
                     pending_changes: Vec::new(),
                     leaving: None,
                     outbox: Vec::new(),
@@ -1017,7 +1017,7 @@ pub(super) fn build_subscribe_handler(
                 // the Leave still completes.
                 let commit = crate::operation_log::MembershipCommit {
                     manifest: incoming.encode(),
-                    held: (incoming.hash(), false),
+                    held: vec![(incoming.hash(), false)],
                     pending_changes: Vec::new(),
                     leaving: None,
                     outbox: Vec::new(),
@@ -1207,10 +1207,22 @@ pub(super) fn build_subscribe_handler(
 
             let commit = crate::operation_log::MembershipCommit {
                 manifest: final_manifest.encode(),
-                held: (
-                    final_manifest.hash(),
-                    final_manifest.contains_signing_pub(&local_signing_pub),
-                ),
+                // Both the accepted `incoming` AND the re-applied final
+                // manifest enter the held history (review P2): the device
+                // held the intermediate too, so a removal built on it is a
+                // deliberate removal, not a false one. (Equal hashes when
+                // there was no re-application — recorded once.)
+                held: {
+                    let mut held = vec![(incoming.hash(), true)];
+                    let final_entry = (
+                        final_manifest.hash(),
+                        final_manifest.contains_signing_pub(&local_signing_pub),
+                    );
+                    if final_entry.0 != incoming.hash() {
+                        held.push(final_entry);
+                    }
+                    held
+                },
                 pending_changes: PendingChange::encode_set(&new_changes),
                 leaving: leaving_update.clone(),
                 outbox: reapplied_outbox,
@@ -2611,7 +2623,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             .unwrap_or_else(|e| e.into_inner())
             .commit_membership(crate::operation_log::MembershipCommit {
                 manifest: new_manifest.encode(),
-                held: (carrier, true),
+                held: vec![(carrier, true)],
                 pending_changes: PendingChange::encode_set(&change_set),
                 leaving: None,
                 outbox,
@@ -2794,7 +2806,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             .unwrap_or_else(|e| e.into_inner())
             .commit_membership(crate::operation_log::MembershipCommit {
                 manifest: new_manifest.encode(),
-                held: (carrier, true),
+                held: vec![(carrier, true)],
                 pending_changes: PendingChange::encode_set(&change_set),
                 leaving: None,
                 outbox,
@@ -2896,7 +2908,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             .unwrap_or_else(|e| e.into_inner())
             .commit_membership(crate::operation_log::MembershipCommit {
                 manifest: leave_manifest.encode(),
-                held: (carrier, false),
+                held: vec![(carrier, false)],
                 pending_changes: PendingChange::encode_set(&change_set),
                 leaving: Some(record.encode()),
                 outbox: refs,
@@ -2958,7 +2970,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             let pending = log.pending_membership_changes().unwrap_or_default();
             let _ = log.commit_membership(crate::operation_log::MembershipCommit {
                 manifest: m.encode(),
-                held: (m.hash(), includes_self),
+                held: vec![(m.hash(), includes_self)],
                 pending_changes: pending,
                 leaving: None,
                 outbox: Vec::new(),
