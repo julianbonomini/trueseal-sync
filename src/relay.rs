@@ -338,6 +338,21 @@ pub fn build_push_blob(
     Ok(frame(MsgType::Push, &body))
 }
 
+/// Clears `is_connected` when the run thread exits by ANY path — a clean
+/// receive error or a panic unwinding through an app callback. Only the
+/// Sync handler is panic-wrapped (handler attempts, ADR-0026); a panic in a
+/// control-plane callback (e.g. `on_manifest_changed` writing to the app's
+/// database) unwinds this thread. Without the guard the `is_connected`
+/// store would be skipped, and the reconnect loop — which polls it — would
+/// never engage: delivery wedges silently, forever, with no signal.
+struct DisconnectGuard(Arc<AtomicBool>);
+
+impl Drop for DisconnectGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// The actual event loop: runs in a dedicated thread that owns the Session.
 /// Interleaves push sends (from the channel) with receive processing.
 fn run_loop<T: Read + Write + Send + 'static>(
@@ -348,6 +363,9 @@ fn run_loop<T: Read + Write + Send + 'static>(
     my_noise_priv: [u8; 32],
     is_connected: Arc<AtomicBool>,
 ) {
+    // On ANY exit — clean or unwinding — signal that the relay connection
+    // has been lost.
+    let _disconnect_guard = DisconnectGuard(is_connected);
     // We need to interleave: check for pending pushes, then do one receive.
     // Since receive() blocks until a message arrives, we wrap the session in a
     // thread pair: one blocking-receive thread + one push-sender thread, both
@@ -540,8 +558,8 @@ fn run_loop<T: Read + Write + Send + 'static>(
             }
         }
     }
-    // Signal that the relay connection has been lost.
-    is_connected.store(false, Ordering::Release);
+    // The disconnect signal fires from the DisconnectGuard on every exit
+    // path, including a panic unwinding through an app callback.
 }
 
 // ── Convenience constructor for TCP connections ──────────────────────────────
