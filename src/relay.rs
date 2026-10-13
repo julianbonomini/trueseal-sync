@@ -955,6 +955,14 @@ impl RelayClient<TcpStream> {
     /// FFI and CLI run every session in: a blocking receive would hold the
     /// session lock for the whole `read()` syscall and starve concurrent
     /// sends.
+    ///
+    /// WARNING (SYNC-6): a client connected this way has NO message handler
+    /// registered — an inbound Deliver frame processed before a handler
+    /// exists is acked and dropped, losing the message. Production paths
+    /// must register the handler before the receive loop starts (the
+    /// `connect` variants that take the handler up front, as `connect_full`
+    /// and `connect_background` do). This convenience exists for tests and
+    /// push-only clients.
     pub fn connect_tcp(
         addr: &str,
         relay_pub: NoisePublicKey,

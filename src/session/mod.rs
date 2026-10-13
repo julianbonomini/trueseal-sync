@@ -1949,6 +1949,13 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
     /// rotation still happens in memory on a deliberate removal or completed
     /// Leave; the callback is only for persisting the fresh keypair, which
     /// MemLog-backed and test sessions don't need.
+    ///
+    /// WARNING (SYNC-7): this path does NOT restore the persisted manifest
+    /// before connecting — the session starts with an empty manifest slot
+    /// and the member filter is bypassed for anything that arrives in the
+    /// window before a manifest lands. Production must use
+    /// [`Self::connect_background`] (or `connect_full_rotating`), which
+    /// caller-seeds the slot from the store before the connection starts.
     #[allow(clippy::too_many_arguments)]
     pub fn connect_full(
         transport: T,
@@ -2269,6 +2276,11 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
 
     /// `connect_with_reconnect` without identity-rotation persistence (see
     /// [`Self::connect_full`]).
+    ///
+    /// WARNING (SYNC-7): like `connect_full`, this path starts with an empty
+    /// manifest slot — production must use [`Self::connect_background`]
+    /// (or the `_rotating` variants), which caller-seeds the persisted
+    /// manifest before the reconnect loop spawns.
     #[allow(clippy::too_many_arguments)]
     pub fn connect_with_reconnect(
         transport: T,
