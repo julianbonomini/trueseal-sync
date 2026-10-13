@@ -461,11 +461,13 @@ impl OperationLog for PersistentLog {
         recipient: &[u8; 32],
         sequence: u64,
         encoded_pair: Vec<u8>,
-    ) {
+    ) -> Result<(), String> {
         // ADR-0023: the Pending Join record and the queued Pair commit in
         // ONE transaction. A crash leaves either the whole prior state
         // (NotJoined — the caller retries joinGroup) or the whole new state
-        // (PendingJoin with its Pair queued).
+        // (PendingJoin with its Pair queued). A store failure propagates
+        // (B8 review F3): the caller leaves the in-memory state untouched
+        // and reports a typed error instead of hanging in PendingJoin.
         let result = (|| -> Result<(), rusqlite::Error> {
             let tx = self.store.conn.transaction()?;
             tx.execute(
@@ -486,9 +488,7 @@ impl OperationLog for PersistentLog {
             )?;
             tx.commit()
         })();
-        if let Err(e) = result {
-            warn!("[trueseal-sync] begin_pending_join failed (seq={sequence}): {e}");
-        }
+        result.map_err(|e| format!("begin_pending_join failed (seq={sequence}): {e}"))
     }
 
     fn pending_join(&self) -> Option<Vec<u8>> {
@@ -938,7 +938,7 @@ mod tests {
             let s = Store::open(dir.path(), "ns").expect("open");
             let mut log = PersistentLog::new(s);
             assert!(log.pending_join().is_none(), "fresh store: no pending join");
-            log.begin_pending_join(b"pending-record", &oid(7), 3, b"\x01pair".to_vec());
+            log.begin_pending_join(b"pending-record", &oid(7), 3, b"\x01pair".to_vec()).unwrap();
         }
         let s2 = Store::open(dir.path(), "ns").expect("reopen");
         let log2 = PersistentLog::new(s2);
@@ -961,8 +961,8 @@ mod tests {
         let dir = tmp_dir();
         let s = Store::open(dir.path(), "ns").expect("open");
         let mut log = PersistentLog::new(s);
-        log.begin_pending_join(b"old-anchor", &oid(7), 3, b"pair-old".to_vec());
-        log.begin_pending_join(b"new-anchor", &oid(8), 4, b"pair-new".to_vec());
+        log.begin_pending_join(b"old-anchor", &oid(7), 3, b"pair-old".to_vec()).unwrap();
+        log.begin_pending_join(b"new-anchor", &oid(8), 4, b"pair-new".to_vec()).unwrap();
         assert_eq!(
             log.pending_join().as_deref(),
             Some(b"new-anchor".as_slice())
@@ -984,7 +984,7 @@ mod tests {
         {
             let s = Store::open(dir.path(), "ns").expect("open");
             let mut log = PersistentLog::new(s);
-            log.begin_pending_join(b"pending", &oid(7), 3, b"pair".to_vec());
+            log.begin_pending_join(b"pending", &oid(7), 3, b"pair".to_vec()).unwrap();
             log.clear_pending_join();
         }
         let s2 = Store::open(dir.path(), "ns").expect("reopen");
@@ -1001,7 +1001,7 @@ mod tests {
         let dir = tmp_dir();
         let s = Store::open(dir.path(), "ns").expect("open");
         let mut log = PersistentLog::new(s);
-        log.begin_pending_join(b"pending", &oid(7), 3, b"pair".to_vec());
+        log.begin_pending_join(b"pending", &oid(7), 3, b"pair".to_vec()).unwrap();
         assert!(log.pending_join().is_some());
         drop(log);
         let s2 = Store::open(dir.path(), "ns").expect("open2");

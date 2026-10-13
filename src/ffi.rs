@@ -54,6 +54,10 @@ pub enum SessionError {
     /// per namespace (ADR-0023; `alreadyInGroup` in ADR-0028's error list).
     #[error("already in a group")]
     AlreadyInGroup,
+    /// A durable write failed — the operation did not commit and no
+    /// in-memory state changed. The caller may retry.
+    #[error("store write failed: {msg}")]
+    StoreFailed { msg: String },
 }
 
 /// Where the local Device stands in its namespace's Sync Group (ADR-0023,
@@ -97,6 +101,7 @@ impl From<CoreSessionError> for SessionError {
             CoreSessionError::PayloadTooLarge { max } => SessionError::PayloadTooLarge { max },
             CoreSessionError::ManifestVersionExhausted => SessionError::ManifestVersionExhausted,
             CoreSessionError::AlreadyInGroup => SessionError::AlreadyInGroup,
+            CoreSessionError::Store(msg) => SessionError::StoreFailed { msg },
         }
     }
 }

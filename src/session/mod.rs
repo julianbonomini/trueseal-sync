@@ -81,6 +81,12 @@ pub enum SessionError {
     /// (ADR-0023). (`alreadyInGroup` in ADR-0028's error list.)
     #[error("already in a group")]
     AlreadyInGroup,
+    /// A durable write failed (B8 review F3). The operation did not commit:
+    /// no in-memory state was changed, and the caller may retry. Without
+    /// surfacing this, a failed `begin_pending_join` would leave a join
+    /// hanging forever in PendingJoin with its Pair never queued.
+    #[error("store write failed: {0}")]
+    Store(String),
 }
 
 /// Where the local Device stands in its namespace's Sync Group (ADR-0023,
@@ -921,10 +927,14 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             }
         };
         let seq = self.next_seq();
+        // B8 review F3: propagate a store failure — the in-memory Pending
+        // Join is set ONLY after the durable record + queued Pair commit,
+        // so a failed join leaves the device honestly NotJoined.
         self.op_log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .begin_pending_join(&pending.encode(), &initiator_noise, seq, msg.encode());
+            .begin_pending_join(&pending.encode(), &initiator_noise, seq, msg.encode())
+            .map_err(SessionError::Store)?;
         *self.pending_join.lock().unwrap_or_else(|e| e.into_inner()) = Some(pending);
         self.kick.kick();
         Ok(())

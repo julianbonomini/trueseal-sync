@@ -1396,3 +1396,104 @@ fn two_concurrent_accepts_exactly_one_succeeds() {
         members.len()
     );
 }
+
+/// A failing op-log: every durable write works EXCEPT `begin_pending_join`,
+/// which reports a store failure. Models a disk-full / locked-SQLite join.
+struct FailingJoinLog {
+    inner: MemLog,
+}
+
+impl FailingJoinLog {
+    fn new() -> Self {
+        Self {
+            inner: MemLog::new(),
+        }
+    }
+}
+
+impl OperationLog for FailingJoinLog {
+    fn append_entry(&mut self, entry: crate::operation_log::LogEntry) {
+        self.inner.append_entry(entry);
+    }
+    fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64) {
+        self.inner.mark_delivered(object_id, sequence);
+    }
+    fn remove(&mut self, object_id: &[u8; 32], sequence: u64) {
+        self.inner.remove(object_id, sequence);
+    }
+    fn undelivered_entries(&self) -> Vec<crate::operation_log::LogEntry> {
+        self.inner.undelivered_entries()
+    }
+    fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<crate::operation_log::LogEntry> {
+        self.inner.entries_from(object_id, sequence)
+    }
+    fn max_sequence(&self) -> Option<u64> {
+        self.inner.max_sequence()
+    }
+    fn record_sequence(&mut self, sequence: u64) {
+        self.inner.record_sequence(sequence);
+    }
+    fn is_handled(&self, message_id: &str) -> bool {
+        self.inner.is_handled(message_id)
+    }
+    fn record_handled(&mut self, message_id: &str, now: u64) {
+        self.inner.record_handled(message_id, now);
+    }
+    fn begin_pending_join(
+        &mut self,
+        _pending: &[u8],
+        _recipient: &[u8; 32],
+        _sequence: u64,
+        _encoded_pair: Vec<u8>,
+    ) -> Result<(), String> {
+        Err("disk is full".into())
+    }
+    fn pending_join(&self) -> Option<Vec<u8>> {
+        self.inner.pending_join()
+    }
+    fn clear_pending_join(&mut self) {
+        self.inner.clear_pending_join();
+    }
+}
+
+/// A store failure on join surfaces a typed error and leaves NO in-memory
+/// Pending Join behind (B8 review F3): before the fix the SQLite error was
+/// swallowed and the device hung forever in PendingJoin with its Pair
+/// never queued.
+#[test]
+fn join_group_store_failure_is_a_typed_error_without_pending_state() {
+    let relay_kp = make_relay_kp();
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let _relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+
+    let device = DeviceKeypair::generate();
+    let session = TruesealSession::<MemPipe>::connect_full(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        |_, _, _| {},
+        Box::new(FailingJoinLog::new()),
+        || {},
+        |_| {},
+        || {},
+        || Err("push factory unused".into()),
+    )
+    .expect("session");
+
+    // A well-formed token (the session's own is fine — the store fails
+    // before any network step matters).
+    let token = session.pairing_token();
+
+    let err = session
+        .join_group(&token)
+        .expect_err("a failed begin_pending_join must surface");
+    assert!(
+        matches!(err, SessionError::Store(ref msg) if msg.contains("disk is full")),
+        "expected SessionError::Store, got {err:?}"
+    );
+    assert_eq!(
+        session.group_status(),
+        GroupStatus::NotJoined,
+        "no in-memory Pending Join survives a failed durable write"
+    );
+}
