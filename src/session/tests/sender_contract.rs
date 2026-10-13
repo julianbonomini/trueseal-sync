@@ -276,6 +276,7 @@ fn reconnect_clears_backoff_and_retries_immediately() {
         Arc::new(AtomicBool::new(false)),
         Box::new(|| {}),
         Box::new(|| {}),
+        Arc::new(AtomicBool::new(false)),
     );
 
     // Queue one entry and kick the pump: the first attempt fails (no ack)

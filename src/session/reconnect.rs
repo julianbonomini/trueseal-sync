@@ -20,7 +20,7 @@ use super::{
 /// Polls for relay disconnect, backs off, reconnects, and replays the outbox.
 /// Runs in a background thread spawned by `connect_with_reconnect`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
+pub(super) fn reconnect_loop<T: crate::relay::Severable>(
     client: Arc<Mutex<RelayClient<T>>>,
     op_log: Arc<Mutex<Box<dyn OperationLog>>>,
     relay_pub: NoisePublicKey,
@@ -42,6 +42,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     leaving: Arc<Mutex<Option<LeavingRecord>>>,
     on_identity_rotated: Arc<dyn Fn(crate::device::DeviceKeypair) + Send + Sync + 'static>,
     rotation_pending: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
     on_connection_changed: Arc<dyn Fn(bool) + Send + Sync + 'static>,
@@ -49,13 +50,15 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     let mut backoff = cap.min(Duration::from_secs(1));
     let mut was_connected = false; // track last-known state to detect transitions
                                    // ADR-0029: a Destroying device STAYS connected (its Revokes must reach
-                                   // the Relay) — the loop no longer exits on Destroy Group. In fact it
-                                   // has no exit condition at all: the thread runs until the process
-                                   // ends, keeping post-destroy connectivity so the device can pair again
-                                   // with its fresh identity (the same pump/reconnect threads also outlive
-                                   // Leave and Soft Removal wipes for the same reason). A formal shutdown
-                                   // signal (join on close()) is SYNC-15 (#107) scope.
+                                   // the Relay) — the loop does not exit on Destroy Group, Leave or
+                                   // Soft Removal: the device keeps connectivity so it can pair again
+                                   // with its fresh identity. The ONE exit condition is `close()`
+                                   // (SYNC-15, #107): the shutdown flag ends the loop, and the FFI
+                                   // reports `closed` for every later call.
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         std::thread::sleep(Duration::from_millis(50));
         let connected = client
             .lock()
@@ -76,7 +79,17 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             (on_connection_changed)(false);
         }
 
-        std::thread::sleep(backoff);
+        // Interruptible backoff: sleep in 50 ms slices so `close()` exits
+        // this thread promptly instead of up to `cap` (30 s) later.
+        let mut remaining = backoff;
+        while remaining > Duration::ZERO {
+            if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            let slice = remaining.min(Duration::from_millis(50));
+            std::thread::sleep(slice);
+            remaining -= slice;
+        }
         backoff = (backoff * 2).min(cap);
 
         let transport = match (factory)() {

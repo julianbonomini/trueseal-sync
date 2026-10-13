@@ -123,6 +123,12 @@ impl From<CoreSessionError> for SessionError {
             CoreSessionError::AlreadyInGroup => SessionError::AlreadyInGroup,
             CoreSessionError::Store(msg) => SessionError::StoreFailed { msg },
             CoreSessionError::GroupFull { max } => SessionError::GroupFull { max },
+            // The canonical reshape (SYNC-15) makes `closed` a first-class
+            // typed case; until the new surface lands, map it honestly
+            // rather than into the PushFailed catch-all.
+            CoreSessionError::Closed => SessionError::PushFailed {
+                msg: "session is closed".into(),
+            },
         }
     }
 }

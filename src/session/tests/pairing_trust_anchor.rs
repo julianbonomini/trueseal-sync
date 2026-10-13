@@ -638,7 +638,7 @@ fn join_group_with_existing_manifest_fails_already_in_group() {
 /// A manifest for the member-filter tests: the session's own keys plus the
 /// scripted sender. (Local helper — `membership` takes the keypair, which
 /// is already inside the session here.)
-fn membership_ref<T: std::io::Read + std::io::Write + Send + 'static>(
+fn membership_ref<T: crate::relay::Severable>(
     session: &TruesealSession<T>,
     sender: &SigningKeypair,
 ) -> GroupManifest {

@@ -119,7 +119,7 @@ pub(super) fn backoff_delay(config: &SenderConfig, failures: u32) -> Duration {
 ///   swapped for the disconnected stub and the reconnect loop redials with
 ///   the fresh keys.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn spawn_sender<T: Read + Write + Send + 'static>(
+pub(super) fn spawn_sender<T: crate::relay::Severable>(
     client: Arc<Mutex<RelayClient<T>>>,
     op_log: Arc<Mutex<Box<dyn OperationLog>>>,
     keys: Arc<Mutex<KeyState>>,
@@ -133,6 +133,7 @@ pub(super) fn spawn_sender<T: Read + Write + Send + 'static>(
     rotation_pending: Arc<AtomicBool>,
     on_leave_complete: Box<dyn Fn() + Send>,
     on_destroy_complete: Box<dyn Fn() + Send>,
+    shutdown: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         sender_loop(
@@ -149,12 +150,13 @@ pub(super) fn spawn_sender<T: Read + Write + Send + 'static>(
             rotation_pending,
             on_leave_complete,
             on_destroy_complete,
+            shutdown,
         );
     });
 }
 
 #[allow(clippy::too_many_arguments)]
-fn sender_loop<T: Read + Write + Send + 'static>(
+fn sender_loop<T: crate::relay::Severable>(
     client: Arc<Mutex<RelayClient<T>>>,
     op_log: Arc<Mutex<Box<dyn OperationLog>>>,
     keys: Arc<Mutex<KeyState>>,
@@ -168,10 +170,17 @@ fn sender_loop<T: Read + Write + Send + 'static>(
     rotation_pending: Arc<AtomicBool>,
     on_leave_complete: Box<dyn Fn() + Send>,
     on_destroy_complete: Box<dyn Fn() + Send>,
+    shutdown: Arc<AtomicBool>,
 ) {
     let mut backoffs: HashMap<[u8; 32], RecipientBackoff> = HashMap::new();
     let mut was_connected = false;
     loop {
+        // close() (SYNC-15, ADR-0028): the pump exits on the shutdown flag.
+        // close() kicks, so this is observed immediately, not on the next
+        // poll; entries in the outbox stay queued for the next session.
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
         // ADR-0027: the identity rotated (deliberate removal or a completed
         // Leave) — drop the old-key Receive Session so the reconnect loop
         // rebinds with the fresh keys. The old client drops here; its Drop

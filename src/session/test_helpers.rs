@@ -89,6 +89,14 @@ impl io::Read for MemPipe {
     }
 }
 
+impl crate::relay::Severable for MemPipe {
+    /// Severing a MemPipe makes THIS end read EOF, like a socket shutdown.
+    fn sever_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let closed = self.closed.clone();
+        Arc::new(move || closed.store(true, std::sync::atomic::Ordering::Release))
+    }
+}
+
 impl io::Write for MemPipe {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.write_buf.lock().unwrap().extend_from_slice(buf);
@@ -476,8 +484,8 @@ pub(super) fn run_pairing_ceremony<T, U>(
     admitter: &super::TruesealSession<T>,
     joiner: &super::TruesealSession<U>,
 ) where
-    T: std::io::Read + std::io::Write + Send + 'static,
-    U: std::io::Read + std::io::Write + Send + 'static,
+    T: crate::relay::Severable,
+    U: crate::relay::Severable,
 {
     let req: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let r = req.clone();

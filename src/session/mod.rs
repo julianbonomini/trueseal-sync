@@ -92,6 +92,11 @@ pub enum SessionError {
     /// anything is issued; the Pairing Window stays open.
     #[error("group is full: maximum {max} members")]
     GroupFull { max: u32 },
+    /// The session was closed (`close()`, ADR-0028): the connection and
+    /// the handlers are stopped, Session State is kept, and every later
+    /// call fails with this. (`closed` in ADR-0028's error list.)
+    #[error("session is closed")]
+    Closed,
 }
 
 /// The Maximum Group Size: 32 members (ADR-0027; `maxGroupSize` in
@@ -634,7 +639,7 @@ fn drop_oversize_outbox_entries(
 /// Owns the relay connection, sequence counter, signing keypair, pairing state,
 /// and current GroupManifest.
 /// Transport-generic so tests can inject in-memory pipes.
-pub struct TruesealSession<T: Read + Write + Send + 'static> {
+pub struct TruesealSession<T: crate::relay::Severable> {
     client: Arc<Mutex<RelayClient<T>>>,
     keys: Arc<Mutex<KeyState>>,
     sequence: Arc<Mutex<u64>>,
@@ -697,6 +702,10 @@ pub struct TruesealSession<T: Read + Write + Send + 'static> {
     /// Receive Session to the fresh keys (an old-key session could never
     /// receive the manifests a re-pair brings).
     rotation_pending: Arc<AtomicBool>,
+    /// Set by `close()` (ADR-0028): the reconnect loop and the sender pump
+    /// exit, the receive client is severed, and every state-changing call
+    /// fails with `Closed`. Session State is untouched.
+    shutdown: Arc<AtomicBool>,
 }
 
 /// Wipe the group state and rotate the identity (ADR-0027: deliberate
@@ -1619,7 +1628,50 @@ fn load_pending_join(op_log: &Arc<Mutex<Box<dyn OperationLog>>>) -> Option<Pendi
     }
 }
 
-impl<T: Read + Write + Send + 'static> TruesealSession<T> {
+impl<T: crate::relay::Severable> TruesealSession<T> {
+    /// Close the session (ADR-0028): stop the connection and the handlers
+    /// but keep Session State. The reconnect loop and the sender pump exit
+    /// (woken immediately, not on the next poll), the receive client is
+    /// severed — its Noise session's closed flag interrupts a receive
+    /// blocked in WouldBlock retry — and every state-changing call fails
+    /// with [`SessionError::Closed`] from here on. In-flight handlers run
+    /// to completion; their Blobs are then handled by the usual dispatch
+    /// (the receive loop exits on the next frame at the latest). A Blob
+    /// whose ack could not be sent is re-delivered on the next `open()` —
+    /// the at-least-once contract is unaffected.
+    ///
+    /// Idempotent. The object is not reusable after `close()`; starting
+    /// again means constructing a new session on the same namespace.
+    pub fn close(&self) {
+        if self.shutdown.swap(true, Ordering::AcqRel) {
+            return; // already closed
+        }
+        // Wake the pump so it notices the flag now rather than on its next
+        // poll, and sever the receive client. Replacing it with the stub
+        // drops the old client, whose Drop closes the Noise session — the
+        // receive thread unblocks and the run loop exits (DisconnectGuard
+        // marks the link down).
+        self.kick.kick();
+        let old = {
+            let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *guard, RelayClient::disconnected())
+        };
+        old.close();
+    }
+
+    /// True after [`Self::close()`].
+    pub fn is_closed(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// The shared `Closed` guard for state-changing methods.
+    fn check_open(&self) -> Result<(), SessionError> {
+        if self.is_closed() {
+            return Err(SessionError::Closed);
+        }
+        Ok(())
+    }
+
     /// Current noise public key for this session.
     pub fn noise_pub(&self) -> NoisePublicKey {
         self.keys
@@ -1680,6 +1732,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// cannot be decoded or predates the Pairing Secret (ADR-0022 clean
     /// break). `cancel_join` abandons the wait.
     pub fn join_group(&self, token: &str) -> Result<(), SessionError> {
+        self.check_open()?;
         if self
             .destroying
             .lock()
@@ -1735,6 +1788,9 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// means a crash in between restarts as still-pending — visible,
     /// cancellable, and safe (the anchor only narrows what is accepted).
     pub fn cancel_join(&self) {
+        if self.is_closed() {
+            return;
+        }
         self.op_log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1925,6 +1981,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let on_identity_rotated: Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static> =
             Arc::new(on_identity_rotated);
         let rotation_pending = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         // SYNC-6 (#98): the handler is built first and registered inside
         // connect, before the receive loop starts reading. A Blob queued in
@@ -2097,6 +2154,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             rotation_pending.clone(),
             Box::new(on_leave_complete),
             Box::new(on_destroy_complete),
+            shutdown.clone(),
         );
 
         // SYNC-8 (#100): drop oversize entries persisted by pre-fix builds —
@@ -2129,6 +2187,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             leaving,
             on_identity_rotated,
             rotation_pending,
+            shutdown,
         })
     }
 
@@ -2214,6 +2273,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let leaving_arc = session.leaving.clone();
         let on_ir_arc = session.on_identity_rotated.clone();
         let rotation_pending_arc = session.rotation_pending.clone();
+        let shutdown_arc = session.shutdown.clone();
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
         let on_cc: Arc<dyn Fn(bool) + Send + Sync + 'static> = on_connection_changed
             .map(|f| -> Arc<dyn Fn(bool) + Send + Sync + 'static> { Arc::new(f) })
@@ -2241,6 +2301,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 leaving_arc,
                 on_ir_arc,
                 rotation_pending_arc,
+                shutdown_arc,
                 transport_factory,
                 cap,
                 on_cc,
@@ -2393,6 +2454,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let on_identity_rotated: Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static> =
             Arc::new(on_identity_rotated);
         let rotation_pending = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         // ADR-0029: a crash after the Destroying commit or mid-wipe
         // resumes here — a Destroying record whose Revoke refs are already
@@ -2519,6 +2581,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             rotation_pending.clone(),
             Box::new(on_leave_complete),
             Box::new(on_destroy_complete),
+            shutdown.clone(),
         );
 
         let session = Self {
@@ -2543,6 +2606,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             leaving: leaving.clone(),
             on_identity_rotated: on_identity_rotated.clone(),
             rotation_pending: rotation_pending.clone(),
+            shutdown: shutdown.clone(),
         };
 
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
@@ -2572,6 +2636,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 leaving,
                 on_identity_rotated,
                 rotation_pending,
+                shutdown,
                 transport_factory,
                 cap,
                 on_cc,
@@ -2594,6 +2659,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// deletes delivered rows. `Ok(())` means "durably queued" — the caller
     /// must not retry (ADR-0017); observing failures is optional.
     pub fn push_sync(&self, blob: Vec<u8>) -> Result<(), SessionError> {
+        self.check_open()?;
         if self
             .destroying
             .lock()
@@ -2725,6 +2791,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Leave is abandoned. Pending `Sync` sends and Pending Membership
     /// Changes drop without reporting, as removal does.
     pub fn destroy_group(&self) -> Result<(), SessionError> {
+        self.check_open()?;
         if self
             .destroying
             .lock()
@@ -2808,6 +2875,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// window opened mid-Destroy could only admit a joiner into a group
     /// every other device has already dropped.
     pub fn pairing_token(&self) -> Result<String, SessionError> {
+        self.check_open()?;
         if self
             .destroying
             .lock()
@@ -2845,6 +2913,9 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     }
 
     pub fn cancel_pairing(&self) {
+        if self.is_closed() {
+            return;
+        }
         // Same lock order as `pairing_token` and the inbound handler
         // (pairing → pending_members): the window close and the clear of
         // its pending requests are one observation.
@@ -2875,6 +2946,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         noise_pub: NoisePublicKey,
         signing_pub: SigningPublicKey,
     ) -> Result<bool, SessionError> {
+        self.check_open()?;
         // A Destroying device admits no one (ADR-0029): the group is
         // ending and no other device would honour the admission.
         if self
@@ -3101,6 +3173,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Clears the pairing window on success (single-use window).
     /// Errors: see [`Self::accept_pair`] (`GroupFull`, `Store`, ...).
     pub fn accept_member(&self, token: &str) -> Result<bool, SessionError> {
+        self.check_open()?;
         let pending = self
             .pending_members
             .lock()
@@ -3124,6 +3197,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Returns `SessionError::NotInGroup` if no manifest is set.
     /// Returns `SessionError::MemberNotFound` if `target` is not in the current manifest.
     pub fn remove_member(&self, target: SigningPublicKey) -> Result<(), SessionError> {
+        self.check_open()?;
         // Lock discipline: keys copied out and released before the manifest
         // lock (the handler locks manifest → keys).
         let (self_noise, self_signing, signing_key) = {
@@ -3235,6 +3309,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Errors: `NotInGroup` when not a member, `GroupDestroyed`,
     /// `ManifestVersionExhausted`, `Store` (nothing changed in memory).
     pub fn leave_group(&self) -> Result<(), SessionError> {
+        self.check_open()?;
         if self
             .destroying
             .lock()
@@ -3344,6 +3419,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Returns `SessionError::NotInGroup` if no manifest is set.
     /// Returns `SessionError::MemberNotFound` if no member with that id exists.
     pub fn remove_member_by_id(&self, id: &str) -> Result<(), SessionError> {
+        self.check_open()?;
         let target = {
             let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
             let m = guard.as_ref().ok_or(SessionError::NotInGroup)?;
