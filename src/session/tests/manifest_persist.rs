@@ -25,12 +25,11 @@ fn manifest_persists_across_session_restart() {
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
     let (nk_rx1, nk1) = nk_push_channel();
-    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx1, true);
+    // Bidirectional: B's Pair rides B→A, the manifest rides A→B (ADR-0023).
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx1);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
-    let b_noise = device_b.public_key();
-    let b_signing = device_b.signing_public_key();
 
     // Save private bytes so we can reconstruct in Phase 3 (DeviceKeypair is not Clone).
     let a_noise_priv = device_a.noise.private();
@@ -65,7 +64,7 @@ fn manifest_persists_across_session_restart() {
     .expect("session A");
 
     // B connects second, persists received manifests.
-    let _session_b = TruesealSession::connect_full(
+    let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -80,10 +79,10 @@ fn manifest_persists_across_session_restart() {
     )
     .expect("session B");
 
-    // A opens pairing window and admits B.
-    let _token = session_a.pairing_token();
-    let admitted = session_a.accept_pair(b_noise, b_signing);
-    assert!(admitted, "accept_pair must return true when window is open");
+    // ADR-0023: the real ceremony — B asks to join (Pairing Secret), A
+    // admits the Join Request. B accepts A's manifest through the anchored
+    // first-manifest gate, then persists it via on_manifest_changed.
+    run_pairing_ceremony(&session_a, &session_b);
 
     // Wait until B has received and persisted the GroupManifest.
     wait_for(
@@ -122,7 +121,7 @@ fn manifest_persists_across_session_restart() {
 
     // ── Phase 3: drop old sessions, create new sessions, restore manifests ───
     drop(session_a);
-    drop(_session_b);
+    drop(session_b);
 
     // New relay for the restored sessions.
     let (pipe_a2_client, pipe_a2_relay) = mem_pipe_pair();

@@ -14,6 +14,13 @@ use crate::device::DeviceKeypair;
 use crate::message::Message;
 
 use super::super::test_helpers::*;
+
+/// Extract the Pairing Secret from a Pairing Token (ADR-0023) so a
+/// hand-built Pair passes the admitter's secret check.
+fn token_secret(token: &str) -> [u8; 32] {
+    let (_, _, secret, _) = crate::message::decode_pairing_token(token).expect("token decodes");
+    secret
+}
 use super::super::TruesealSession;
 
 /// Repro variant 5, ported from `repro/joiner-manifest-hijack`:
@@ -45,13 +52,14 @@ fn pair_signing_pub_must_match_envelope_signer() {
     let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let r = requests.clone();
     session_a.set_on_member_request(move |token, _| r.lock().unwrap().push(token));
-    let _ = session_a.pairing_token();
+    let token = session_a.pairing_token();
 
     session_m
         .push_message(
             &Message::Pair {
                 noise_pub: m_noise.0,
                 signing_pub: x_signing.0,
+                secret: token_secret(&token),
             },
             a_noise,
         )
@@ -106,7 +114,7 @@ fn replayed_pair_payload_under_different_signer_is_dropped() {
     let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let r = requests.clone();
     session_a.set_on_member_request(move |token, _| r.lock().unwrap().push(token));
-    let _ = session_a.pairing_token();
+    let token = session_a.pairing_token();
 
     // M replays B's Pair payload inside an Envelope signed by M.
     session_m
@@ -114,6 +122,7 @@ fn replayed_pair_payload_under_different_signer_is_dropped() {
             &Message::Pair {
                 noise_pub: b_noise.0,
                 signing_pub: b_signing.0,
+                secret: token_secret(&token),
             },
             a_noise,
         )
@@ -159,13 +168,14 @@ fn matched_pair_still_raises_join_request_and_admits() {
     let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
     let r = requests.clone();
     session_a.set_on_member_request(move |token, _| r.lock().unwrap().push(token));
-    let _ = session_a.pairing_token();
+    let token = session_a.pairing_token();
 
     session_m
         .push_message(
             &Message::Pair {
                 noise_pub: m_noise.0,
                 signing_pub: m_signing.0,
+                secret: token_secret(&token),
             },
             a_noise,
         )

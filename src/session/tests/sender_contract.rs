@@ -666,6 +666,7 @@ fn control_entry_never_expires() {
     let pair = Message::Pair {
         noise_pub: [1u8; 32],
         signing_pub: [2u8; 32],
+        secret: [3u8; 32],
     };
     session
         .op_log
@@ -898,7 +899,7 @@ fn lost_ack_replays_and_recipient_dedups_end_to_end() {
 
     let b_received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(vec![]));
     let br = b_received.clone();
-    let _session_b = TruesealSession::connect(
+    let session_b = TruesealSession::connect(
         pipe_b_client,
         relay_pub_key,
         device_b,
@@ -910,6 +911,10 @@ fn lost_ack_replays_and_recipient_dedups_end_to_end() {
         nk.factory(),
     )
     .expect("B connects");
+    // ADR-0023: B must hold the manifest or it drops the Sync.
+    session_b.set_manifest(make_two_member_manifest(
+        a_noise, a_signing, &a_sk, b_noise, b_signing,
+    ));
 
     session_a
         .push_sync(b"exactly once".to_vec())

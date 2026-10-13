@@ -9,12 +9,41 @@ use std::time::Duration;
 
 use crate::device::DeviceKeypair;
 use crate::envelope::{Envelope, SigningKeypair};
+use crate::keys::{NoisePublicKey, SigningPublicKey};
+use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
+use crate::member::member_name;
 use crate::message::Message;
 use crate::operation_log::MemLog;
 use crate::relay::{frame, MsgType};
 
 use super::super::test_helpers::*;
 use super::super::TruesealSession;
+
+/// ADR-0023: a manifestless device drops every Sync. Build the two-member
+/// genesis (device + scripted sender) so these plumbing tests run as group
+/// members — they are about early delivery, not pairing.
+fn membership(device: &DeviceKeypair, sender: &SigningKeypair) -> GroupManifest {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&device.signing.to_bytes());
+    let self_sp = device.signing_public_key();
+    let sender_sp = sender.public_key();
+    GroupManifest::new(
+        new_group_id(),
+        1,
+        vec![
+            ManifestMember {
+                noise_pub: device.public_key(),
+                signing_pub: self_sp,
+                name: member_name(&self_sp),
+            },
+            ManifestMember {
+                noise_pub: NoisePublicKey([9u8; 32]),
+                signing_pub: SigningPublicKey(sender.public_key_bytes()),
+                name: member_name(&sender_sp),
+            },
+        ],
+        &sk,
+    )
+}
 
 /// Build the Deliver frame body ([blob_id: 8][envelope]) for a Sync message
 /// addressed to `device`, signed by `sender`.
@@ -59,10 +88,12 @@ fn queued_blob_reaches_handler_on_first_connect() {
         });
     }
 
+    let manifest = membership(&device, &sender);
+
     let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(vec![]));
     let rc = received.clone();
 
-    let _session = TruesealSession::<MemPipe>::connect_full(
+    let session = TruesealSession::<MemPipe>::connect_full(
         pipe_client,
         relay_pub,
         device,
@@ -76,6 +107,7 @@ fn queued_blob_reaches_handler_on_first_connect() {
         || Err("push factory unused in early-deliver test".into()),
     )
     .expect("session");
+    session.set_manifest(manifest);
 
     wait_for(
         || {
@@ -134,6 +166,8 @@ fn queued_blob_reaches_handler_after_reconnect() {
     let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(vec![]));
     let rc = received.clone();
 
+    let manifest = membership(&device, &sender);
+
     let _session = TruesealSession::<MemPipe>::connect_background(
         relay_pub,
         device,
@@ -141,7 +175,7 @@ fn queued_blob_reaches_handler_after_reconnect() {
             rc.lock().unwrap().push(msg);
         },
         Box::new(MemLog::new()),
-        Arc::new(Mutex::new(None)),
+        Arc::new(Mutex::new(Some(manifest))),
         || {},
         |_| {},
         || {},

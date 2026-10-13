@@ -77,6 +77,24 @@ pub enum SessionError {
     /// wrap. Membership is exhausted; the group's Devices must pair again.
     #[error("manifest version exhausted: cannot issue a new version")]
     ManifestVersionExhausted,
+    /// `join_group` while a manifest exists — one Sync Group per namespace
+    /// (ADR-0023). (`alreadyInGroup` in ADR-0028's error list.)
+    #[error("already in a group")]
+    AlreadyInGroup,
+}
+
+/// Where the local Device stands in its namespace's Sync Group (ADR-0023,
+/// ADR-0028). `Leaving` arrives with membership convergence (SYNC-9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupStatus {
+    /// No Group Manifest and no Pending Join. No manifest is accepted and
+    /// every `Sync`/`Revoke` is dropped.
+    NotJoined,
+    /// Asked to join via a Pairing Token; waiting to be admitted. Only a
+    /// first manifest anchored to the token's signing key is accepted.
+    PendingJoin,
+    /// Holds a Group Manifest.
+    Member,
 }
 
 impl From<crate::relay::RelayError> for SessionError {
@@ -94,12 +112,65 @@ impl From<crate::relay::RelayError> for SessionError {
 
 /// An open pairing window — present means open, absent means closed.
 /// Lifetime is caller-controlled: open on `pairing_token()`, closed on
-/// `accept_pair()` (single-use) or explicit `cancel_pairing()` (ADR-0021).
-pub(super) struct PairingWindow;
+/// `accept_pair()` (single-use), explicit `cancel_pairing()`, or process
+/// end (ADR-0021, ADR-0023).
+///
+/// Carries this window's single-use Pairing Secret: a `Pair` must prove
+/// knowledge of it, so the Relay — which never sees the Pairing Token —
+/// cannot raise a Join Request. In memory only: a restart spends the
+/// secret (ADR-0023 rejected persisting the window).
+pub(super) struct PairingWindow {
+    secret: [u8; 32],
+}
 
 impl PairingWindow {
     fn is_open(&self) -> bool {
         true
+    }
+}
+
+/// Constant-time equality for Pairing Secrets. The comparison result is
+/// not observable to the Relay (the secret travels inside addressed
+/// encryption), but pairing code should not grow a timing side channel.
+fn secret_matches(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for i in 0..32 {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+/// The joiner's durable record that it asked to join via a specific
+/// Pairing Token and is waiting to be admitted (ADR-0023). Persisted in
+/// Session State alongside the queued `Pair`, in one transaction. Has no
+/// timer; ends when a valid first manifest arrives or the caller cancels.
+///
+/// Encoding: `initiator_noise(32) || initiator_signing(32) || secret(32)`.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct PendingJoin {
+    pub initiator_noise_pub: NoisePublicKey,
+    pub initiator_signing_pub: SigningPublicKey,
+    pub secret: [u8; 32],
+}
+
+impl PendingJoin {
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(96);
+        out.extend_from_slice(&self.initiator_noise_pub.0);
+        out.extend_from_slice(&self.initiator_signing_pub.0);
+        out.extend_from_slice(&self.secret);
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != 96 {
+            return None;
+        }
+        Some(Self {
+            initiator_noise_pub: NoisePublicKey(bytes[0..32].try_into().ok()?),
+            initiator_signing_pub: SigningPublicKey(bytes[32..64].try_into().ok()?),
+            secret: bytes[64..96].try_into().ok()?,
+        })
     }
 }
 
@@ -237,6 +308,34 @@ const HANDLER_BACKOFF: [Duration; 4] = [
     Duration::from_millis(800),
 ];
 
+/// Map a failed manifest verification to its Delivery Issue (ADR-0034
+/// §2/§3, SYNC-5):
+///
+/// - Regression (an older or identical version) is BENIGN STALE: a relay
+///   re-delivery, a hostile-relay replay, or the loser of concurrent
+///   issuance (ADR-0027 orders by (version, hash)). Replays of control
+///   messages must be harmless AND unreported — every resend would
+///   otherwise spam the issue stream. → no issue.
+/// - Unauthenticated bytes (bad signature, undecodable) are
+///   `unreadable(malformed)`.
+/// - Everything else is authenticated-but-unacceptable — an over-bound
+///   jump, u64::MAX (SYNC-10), an unknown issuer, a foreign group id —
+///   and raises `unauthorized`, the case ADR-0034 keeps separate for
+///   exactly this.
+fn manifest_rejection_issue(err: crate::manifest::ManifestError) -> Option<DeliveryIssue> {
+    use crate::manifest::ManifestError as ME;
+    match err {
+        ME::VersionRegression { .. } => None,
+        ME::DecodeFailed(_) | ME::InvalidLength { .. } | ME::InvalidSignature => {
+            Some(DeliveryIssue::Unreadable(UnreadableReason::Malformed))
+        }
+        ME::VersionJumpTooLarge { .. }
+        | ME::VersionExhausted
+        | ME::UnknownIssuer
+        | ME::GroupIdMismatch => Some(DeliveryIssue::Unauthorized),
+    }
+}
+
 /// Extract a human-readable message from a caught panic payload.
 fn panic_message(payload: Box<dyn Any + Send>) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
@@ -348,6 +447,10 @@ pub struct TruesealSession<T: Read + Write + Send + 'static> {
     issue_sink: Arc<Mutex<IssueSink>>,
     /// Wakes the sender pump when a new entry is queued (ADR-0026).
     kick: Arc<sender::Kick>,
+    /// The Pending Join (ADR-0023): set by `join_group`, cleared by
+    /// `cancel_join` and by acceptance of the first manifest. Seeded from
+    /// the op log at construction so it survives restarts.
+    pending_join: Arc<Mutex<Option<PendingJoin>>>,
 }
 
 /// Builds the full manifest-aware subscribe handler.
@@ -358,6 +461,7 @@ pub struct TruesealSession<T: Read + Write + Send + 'static> {
 pub(super) fn build_subscribe_handler(
     keys: Arc<Mutex<KeyState>>,
     manifest: Arc<Mutex<Option<GroupManifest>>>,
+    pending_join: Arc<Mutex<Option<PendingJoin>>>,
     on_removed_from_group: Arc<dyn Fn() + Send + Sync + 'static>,
     on_manifest_changed: Arc<dyn Fn(&GroupManifest) + Send + Sync + 'static>,
     on_group_destroyed: Arc<dyn Fn() + Send + Sync + 'static>,
@@ -376,6 +480,7 @@ pub(super) fn build_subscribe_handler(
         if let Message::Pair {
             noise_pub,
             signing_pub,
+            secret,
         } = &msg
         {
             // SYNC-4 (#96): the Pair body's signing_pub must equal the key
@@ -384,32 +489,47 @@ pub(super) fn build_subscribe_handler(
             // or pair a victim's signing key with its own routing address
             // (manifest-trust hijack, repro variant 5). Drop silently before
             // any Join Request is raised; the blob is still acked as handled.
-            // This check stays once SYNC-3 adds the Pairing Secret proof —
-            // both are required (ADR-0023 Consequences).
             if *signing_pub != author_signing_pub {
                 return;
             }
-            let window_open = pairing
+            // ADR-0023: the Pair must prove knowledge of the open window's
+            // Pairing Secret — only a party that saw the Pairing Token
+            // out-of-band can know it, and the token is the one channel the
+            // Relay never sees. A relay-injected Pair, a wrong secret and a
+            // replayed spent secret are all dropped SILENTLY: the Relay can
+            // mint arbitrary well-formed Pairs, so reporting each one would
+            // let it flood the Delivery Issue stream.
+            let secret_ok = pairing
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
-                .map(|w| w.is_open())
+                .map(|w| w.is_open() && secret_matches(secret, &w.secret))
                 .unwrap_or(false);
-            if window_open {
+            if !secret_ok {
+                return;
+            }
+            // Repeat Pairs from the same joiner keys deduplicate into one
+            // request (ADR-0023) — a relay re-delivery must not raise a
+            // second Join Request.
+            {
+                let mut pending = pending_members.lock().unwrap_or_else(|e| e.into_inner());
+                if pending
+                    .values()
+                    .any(|p| p.noise_pub.0 == *noise_pub && p.signing_pub.0 == *signing_pub)
+                {
+                    return;
+                }
                 use base64::Engine as _;
                 let token_bytes: [u8; 16] = rand::random();
                 let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
                 let name = member_name(&SigningPublicKey(*signing_pub));
-                pending_members
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(
-                        token.clone(),
-                        PendingMember {
-                            noise_pub: NoisePublicKey(*noise_pub),
-                            signing_pub: SigningPublicKey(*signing_pub),
-                        },
-                    );
+                pending.insert(
+                    token.clone(),
+                    PendingMember {
+                        noise_pub: NoisePublicKey(*noise_pub),
+                        signing_pub: SigningPublicKey(*signing_pub),
+                    },
+                );
                 on_member_request
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -418,81 +538,124 @@ pub(super) fn build_subscribe_handler(
             return;
         }
 
-        // ── Manifest-based inbound filtering ──────────────────────────────────
-        {
-            let guard = manifest.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(ref m) = *guard {
-                if !m.contains_signing_pub(&author_signing_pub) {
-                    return; // not a member — discard
-                }
-            }
-        }
-
-        // ── Revoke ────────────────────────────────────────────────────────────
-        if let Message::Revoke = &msg {
-            let in_group = {
-                let guard = manifest.lock().unwrap_or_else(|e| e.into_inner());
-                guard
-                    .as_ref()
-                    .map(|m| m.contains_signing_pub(&author_signing_pub))
-                    .unwrap_or(false)
-            };
-            if in_group {
-                *manifest.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                destroyed.store(true, Ordering::Release);
-                (on_group_destroyed)();
-            }
-            return;
-        }
-
-        // ── GroupManifest update ───────────────────────────────────────────────
+        // ── GroupManifest (before the member filter: the FIRST manifest is
+        // gated by the Pending Join, not by membership — ADR-0023) ────────
         if let Message::GroupManifest { manifest: incoming } = &msg {
-            let local_signing_pub = keys.lock().unwrap_or_else(|e| e.into_inner()).signing_pub.0;
-            let mut guard = manifest.lock().unwrap_or_else(|e| e.into_inner());
-            let verdict = match *guard {
-                None => incoming.verify(None),
-                Some(ref current) => incoming.verify(Some(current)),
+            let (local_signing_pub, local_noise_pub) = {
+                let ks = keys.lock().unwrap_or_else(|e| e.into_inner());
+                (ks.signing_pub.0, ks.noise_pub.0)
             };
-            // A manifest that fails verification is acked and dropped. The
-            // report depends on WHY it failed (ADR-0034 §2/§3, SYNC-5):
-            //
-            // - Regression (an older or identical version) is BENIGN STALE:
-            //   a relay re-delivery, a hostile-relay replay, or the loser of
-            //   concurrent issuance (ADR-0027 orders by (version, hash)).
-            //   Replays of control messages must be harmless AND unreported
-            //   — every resend would otherwise spam the issue stream.
-            // - Unauthenticated bytes (bad signature, undecodable) are
-            //   `unreadable(malformed)`.
-            // - Everything else is authenticated-but-unacceptable — an
-            //   over-bound jump, u64::MAX (SYNC-10), an unknown issuer, a
-            //   foreign group id — and raises `unauthorized`, the case
-            //   ADR-0034 keeps separate for exactly this.
-            // The lock is released before the sink fires, as with every
-            // callback in this handler.
-            if let Err(err) = verdict {
-                use crate::manifest::ManifestError as ME;
-                let rejected_version = incoming.version;
-                let issue = match err {
-                    ME::VersionRegression { .. } => None,
-                    ME::DecodeFailed(_) | ME::InvalidLength { .. } | ME::InvalidSignature => {
-                        Some(DeliveryIssue::Unreadable(UnreadableReason::Malformed))
+            let mut guard = manifest.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                // ADR-0023: a device with neither a Group Manifest nor a
+                // Pending Join accepts no manifest. A Pending Join accepts
+                // a first manifest only if it is signed by the token's
+                // signing key, the Envelope signer is that same key, and
+                // the joiner's own keys are among the members. A failure
+                // keeps the Pending Join and is reported — a first manifest
+                // is never routine traffic, so a rejection is worth telling
+                // the app about (G3 observes the typed issue).
+                let mut pending_guard = pending_join.lock().unwrap_or_else(|e| e.into_inner());
+                let rejection: Option<DeliveryIssue> = match pending_guard.as_ref() {
+                    None => Some(DeliveryIssue::Unauthorized),
+                    Some(p) => {
+                        if author_signing_pub != p.initiator_signing_pub.0
+                            || incoming.issued_by != p.initiator_signing_pub.0
+                        {
+                            Some(DeliveryIssue::Unauthorized)
+                        } else {
+                            match incoming.verify(None) {
+                                Err(err) => manifest_rejection_issue(err),
+                                Ok(()) => match incoming
+                                    .members
+                                    .iter()
+                                    .find(|m| m.signing_pub.0 == local_signing_pub)
+                                {
+                                    // The joiner's OWN keys must be listed —
+                                    // both of them, or routing would point at
+                                    // someone else's noise key.
+                                    Some(m) if m.noise_pub.0 == local_noise_pub => None,
+                                    _ => Some(DeliveryIssue::Unauthorized),
+                                },
+                            }
+                        }
                     }
-                    ME::VersionJumpTooLarge { .. }
-                    | ME::VersionExhausted
-                    | ME::UnknownIssuer
-                    | ME::GroupIdMismatch => Some(DeliveryIssue::Unauthorized),
                 };
+                if let Some(issue) = rejection {
+                    drop(pending_guard);
+                    drop(guard);
+                    warn!(
+                        "[trueseal-sync] rejected first GroupManifest v{}: trust-anchor check failed",
+                        incoming.version
+                    );
+                    issue_sink
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .fire(issue);
+                    return;
+                }
+
+                // Accepted. Install the manifest, then clear the Pending
+                // Join — persist-first ordering (ADR-0023 Crash points):
+                // on_manifest_changed writes the manifest to Session State
+                // before the record is cleared, so a crash in between is
+                // self-healed at construction (a manifest implies the join
+                // completed). The Blob is acked after this handler returns,
+                // so a crash before the ack re-delivers the manifest.
+                *guard = Some(incoming.clone());
+                let joined: Vec<(String, String)> = incoming
+                    .members
+                    .iter()
+                    .filter(|m| m.signing_pub.0 != local_signing_pub)
+                    .map(|m| (member_id(&m.signing_pub), member_name(&m.signing_pub)))
+                    .collect();
+                *pending_guard = None;
+                drop(pending_guard);
+                drop(guard);
+
+                (on_manifest_changed)(incoming);
+                op_log
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear_pending_join();
+                {
+                    let mut sink = on_member_joined.lock().unwrap_or_else(|e| e.into_inner());
+                    for (id, name) in joined {
+                        sink.fire(id, name);
+                    }
+                }
+                return;
+            }
+
+            // An update to an existing manifest: the Envelope signer must
+            // be a current member (the member filter's job for the update
+            // path, now that the manifest branch runs before the filter).
+            if !guard
+                .as_ref()
+                .expect("invariant: checked is_some above")
+                .contains_signing_pub(&author_signing_pub)
+            {
+                return;
+            }
+
+            // A manifest that fails verification is acked and dropped. The
+            // report depends on WHY it failed (ADR-0034 §2/§3, SYNC-5) —
+            // see manifest_rejection_issue. The lock is released before the
+            // sink fires, as with every callback in this handler.
+            if let Err(err) = incoming.verify(guard.as_ref()) {
+                let rejected_version = incoming.version;
+                let issue = manifest_rejection_issue(err);
                 drop(guard);
                 match issue {
                     None => {
                         // Benign stale manifests are routine (concurrent
                         // issuance), so this logs at debug, not warn.
                         log::debug!(
-                            "[trueseal-sync] ignoring stale GroupManifest v{rejected_version}: {err}"
+                            "[trueseal-sync] ignoring stale GroupManifest v{rejected_version}"
                         );
                     }
                     Some(issue) => {
-                        warn!("[trueseal-sync] rejected GroupManifest v{rejected_version}: {err}");
+                        warn!("[trueseal-sync] rejected GroupManifest v{rejected_version}");
                         issue_sink
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
@@ -553,6 +716,40 @@ pub(super) fn build_subscribe_handler(
 
             if excluded {
                 (on_removed_from_group)();
+            }
+            return;
+        }
+
+        // ── Manifest-based inbound filtering (Sync, Revoke) ────────────────────
+        {
+            let guard = manifest.lock().unwrap_or_else(|e| e.into_inner());
+            match *guard {
+                Some(ref m) => {
+                    if !m.contains_signing_pub(&author_signing_pub) {
+                        return; // not a member — discard
+                    }
+                }
+                // ADR-0023: a device with no manifest drops every Sync and
+                // Revoke. This closes the pre-SYNC-3 fail-open gap (the
+                // filter used to be skipped entirely without a manifest).
+                // Routine internet garbage — no report.
+                None => return,
+            }
+        }
+
+        // ── Revoke ────────────────────────────────────────────────────────────
+        if let Message::Revoke = &msg {
+            let in_group = {
+                let guard = manifest.lock().unwrap_or_else(|e| e.into_inner());
+                guard
+                    .as_ref()
+                    .map(|m| m.contains_signing_pub(&author_signing_pub))
+                    .unwrap_or(false)
+            };
+            if in_group {
+                *manifest.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                destroyed.store(true, Ordering::Release);
+                (on_group_destroyed)();
             }
             return;
         }
@@ -618,6 +815,24 @@ pub(super) fn build_subscribe_handler(
     }
 }
 
+/// Load and decode the persisted Pending Join (ADR-0023). A corrupt record
+/// fails closed — cleared and treated as absent, so no manifest is accepted
+/// on the strength of unreadable bytes.
+fn load_pending_join(op_log: &Arc<Mutex<Box<dyn OperationLog>>>) -> Option<PendingJoin> {
+    let mut log = op_log.lock().unwrap_or_else(|e| e.into_inner());
+    match log.pending_join() {
+        None => None,
+        Some(bytes) => match PendingJoin::decode(&bytes) {
+            Some(p) => Some(p),
+            None => {
+                warn!("[trueseal-sync] undecodable Pending Join record — clearing (fail closed)");
+                log.clear_pending_join();
+                None
+            }
+        },
+    }
+}
+
 impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Current noise public key for this session.
     pub fn noise_pub(&self) -> NoisePublicKey {
@@ -661,27 +876,97 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         }
     }
 
-    /// Send a `Pair` message to the initiator identified by `token`.
-    /// Called by the joining device after scanning a QR code or receiving the token.
-    /// Returns `SessionError::InvalidToken` if the token cannot be decoded.
+    /// Ask to join the Sync Group of the initiator identified by `token`
+    /// (ADR-0023, joiner state machine: `NotJoined → PendingJoin`).
+    ///
+    /// The token is the trust anchor: this device will accept a first
+    /// manifest only if it is signed by the token's signing key, the
+    /// Envelope signer is that same key, and this device's keys are members.
+    ///
+    /// The Pending Join and its `Pair` (carrying the token's Pairing
+    /// Secret) are persisted and queued in ONE durable transaction, so the
+    /// request survives restarts and retries follow the outbox (ADR-0026).
+    /// `Ok(())` means durably queued — the caller must not retry.
+    ///
+    /// Returns `SessionError::AlreadyInGroup` if a manifest exists (one
+    /// Sync Group per namespace). A second call while pending REPLACES the
+    /// Pending Join. Returns `SessionError::InvalidToken` if the token
+    /// cannot be decoded or predates the Pairing Secret (ADR-0022 clean
+    /// break). `cancel_join` abandons the wait.
     pub fn join_group(&self, token: &str) -> Result<(), SessionError> {
-        let (initiator_noise, _initiator_signing, _initiator_name) =
+        if self.destroyed.load(Ordering::Acquire) {
+            return Err(SessionError::GroupDestroyed);
+        }
+        if self
+            .manifest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            return Err(SessionError::AlreadyInGroup);
+        }
+        let (initiator_noise, initiator_signing, secret, _initiator_name) =
             crate::message::decode_pairing_token(token).map_err(|_| SessionError::InvalidToken)?;
-        let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-        let msg = Message::Pair {
-            noise_pub: ks.noise_pub.0,
-            signing_pub: ks.signing_pub.0,
+        let pending = PendingJoin {
+            initiator_noise_pub: NoisePublicKey(initiator_noise),
+            initiator_signing_pub: SigningPublicKey(initiator_signing),
+            secret,
         };
-        drop(ks);
-        self.push_message(&msg, NoisePublicKey(initiator_noise))
-            .map_err(|e| match e {
-                // Preserve the typed refusal (ADR-0022) instead of erasing it
-                // into a string, mirroring push_message.
-                SessionError::RelayVersionUnsupported { min, max } => {
-                    SessionError::RelayVersionUnsupported { min, max }
-                }
-                other => SessionError::PushFailed(other.to_string()),
-            })
+        let msg = {
+            let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
+            Message::Pair {
+                noise_pub: ks.noise_pub.0,
+                signing_pub: ks.signing_pub.0,
+                secret,
+            }
+        };
+        let seq = self.next_seq();
+        self.op_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin_pending_join(&pending.encode(), &initiator_noise, seq, msg.encode());
+        *self.pending_join.lock().unwrap_or_else(|e| e.into_inner()) = Some(pending);
+        self.kick.kick();
+        Ok(())
+    }
+
+    /// Abandon a Pending Join (ADR-0023: `cancelJoin()` moves the device
+    /// back to `notJoined`). The manifest gate closes immediately. The
+    /// already-queued `Pair` stays in the outbox — if it is delivered, the
+    /// initiator may admit this device, but the resulting manifest fails
+    /// the (now absent) anchor's checks and is dropped.
+    ///
+    /// Crash window: clearing the durable record before the in-memory slot
+    /// means a crash in between restarts as still-pending — visible,
+    /// cancellable, and safe (the anchor only narrows what is accepted).
+    pub fn cancel_join(&self) {
+        self.op_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear_pending_join();
+        *self.pending_join.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Where this device stands in its namespace's Sync Group (ADR-0023,
+    /// ADR-0028). `Leaving` arrives with membership convergence (SYNC-9).
+    pub fn group_status(&self) -> GroupStatus {
+        if self
+            .manifest
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            GroupStatus::Member
+        } else if self
+            .pending_join
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+        {
+            GroupStatus::PendingJoin
+        } else {
+            GroupStatus::NotJoined
+        }
     }
 
     // ── Constructors ──────────────────────────────────────────────────────────
@@ -771,6 +1056,12 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let op_log: Arc<Mutex<Box<dyn OperationLog>>> = Arc::new(Mutex::new(op_log));
         let issue_sink = Arc::new(Mutex::new(IssueSink::new()));
 
+        // ADR-0023: restore the Pending Join — it survives restarts.
+        // connect_full always starts without a manifest (tests and the
+        // CLI's fresh sessions), so no self-heal is needed here.
+        let pending_join: Arc<Mutex<Option<PendingJoin>>> =
+            Arc::new(Mutex::new(load_pending_join(&op_log)));
+
         // SYNC-6 (#98): the handler is built first and registered inside
         // connect, before the receive loop starts reading. A Blob queued in
         // the inbox while this device was offline arrives the moment the
@@ -778,6 +1069,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let handler = build_subscribe_handler(
             keys_cb,
             manifest_cb,
+            pending_join.clone(),
             on_rfg_cb,
             on_mc_cb,
             on_gd_cb,
@@ -862,6 +1154,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             max_payload_bytes: AtomicUsize::new(PROTOCOL_SIZE_LIMIT),
             issue_sink,
             kick,
+            pending_join,
         })
     }
 
@@ -905,6 +1198,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let on_mj_arc = session.on_member_joined.clone();
         let on_ml_arc = session.on_member_left.clone();
         let issue_sink_arc = session.issue_sink.clone();
+        let pending_join_arc = session.pending_join.clone();
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
         let on_cc: Arc<dyn Fn(bool) + Send + Sync + 'static> = on_connection_changed
             .map(|f| -> Arc<dyn Fn(bool) + Send + Sync + 'static> { Arc::new(f) })
@@ -927,6 +1221,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 on_mj_arc,
                 on_ml_arc,
                 issue_sink_arc,
+                pending_join_arc,
                 transport_factory,
                 cap,
                 on_cc,
@@ -991,6 +1286,26 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let op_log_arc: Arc<Mutex<Box<dyn OperationLog>>> = Arc::new(Mutex::new(op_log));
         let issue_sink = Arc::new(Mutex::new(IssueSink::new()));
 
+        // ADR-0023: restore the Pending Join — it survives restarts. A
+        // caller-seeded manifest (SYNC-7) means the join completed; a
+        // leftover record is the crash window between "manifest persisted"
+        // and "pending cleared" (ADR-0023 Crash points) — self-heal it.
+        let pending_join: Arc<Mutex<Option<PendingJoin>>> = {
+            let loaded = load_pending_join(&op_log_arc);
+            let healed = if loaded.is_some()
+                && manifest.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+            {
+                op_log_arc
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear_pending_join();
+                None
+            } else {
+                loaded
+            };
+            Arc::new(Mutex::new(healed))
+        };
+
         // SYNC-8 (#100): drop oversize entries persisted by pre-fix builds —
         // they can never be delivered and would replay forever (ADR-0025).
         // The reports buffer in the sink until the first subscriber registers.
@@ -1042,6 +1357,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             max_payload_bytes: AtomicUsize::new(PROTOCOL_SIZE_LIMIT),
             issue_sink: issue_sink.clone(),
             kick,
+            pending_join: pending_join.clone(),
         };
 
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
@@ -1066,6 +1382,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 on_member_joined,
                 on_member_left,
                 issue_sink,
+                pending_join,
                 transport_factory,
                 cap,
                 on_cc,
@@ -1229,12 +1546,27 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     // ── Pairing ───────────────────────────────────────────────────────────────
 
     /// Opens a pairing window and returns a base64url token encoding
-    /// `noise_pub || signing_pub || device_name`.
-    /// The token is single-use and expires when the window closes.
+    /// a version byte, `noise_pub || signing_pub || secret || device_name`
+    /// (ADR-0023). A fresh single-use Pairing Secret is generated per
+    /// window; the window and its pending requests live in memory only, so
+    /// a restart or `cancel_pairing()` spends the secret. The token dies
+    /// when the window closes.
+    ///
+    /// Documented limitation (ADR-0023): anyone who sees the token while
+    /// the window is open can request to join — the admitting user must
+    /// confirm the device in front of them. Member names are labels, not
+    /// authentication.
     pub fn pairing_token(&self) -> String {
-        *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = Some(PairingWindow);
+        let secret: [u8; 32] = rand::random();
+        *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = Some(PairingWindow { secret });
+        // A new window must not inherit requests raised under a spent
+        // secret — its pending requests live and die with the window.
+        self.pending_members
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
-        crate::message::pairing_token(&ks.noise_pub.0, &ks.signing_pub.0)
+        crate::message::pairing_token(&ks.noise_pub.0, &ks.signing_pub.0, &secret)
     }
 
     pub fn cancel_pairing(&self) {
@@ -1341,6 +1673,14 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         // Store the new manifest.
         *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_manifest.clone());
         (self.on_manifest_changed)(&new_manifest);
+
+        // The window is single-use (ADR-0023): every other pending request
+        // belonged to the spent secret — drop them so a later window cannot
+        // admit a stale request.
+        self.pending_members
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
 
         // Fire onMemberJoined for the newly admitted device.
         self.on_member_joined

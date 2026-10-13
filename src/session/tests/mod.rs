@@ -16,6 +16,7 @@ mod offline;
 mod outbox;
 mod pair_signer_binding;
 mod pairing;
+mod pairing_trust_anchor;
 mod panic_safety;
 mod push;
 mod remove_member;

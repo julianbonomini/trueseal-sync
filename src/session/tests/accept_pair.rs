@@ -74,12 +74,11 @@ fn accept_pair_sends_manifest_to_new_member() {
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
     let (nk_rx, nk) = nk_push_channel();
-    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx, true);
+    // Bidirectional: B's Pair rides B→A, the manifest rides A→B (ADR-0023).
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let device_b = DeviceKeypair::generate();
-    let b_noise = device_b.public_key();
-    let b_signing = device_b.signing_public_key();
 
     let session_a = TruesealSession::connect(
         pipe_a_client,
@@ -90,10 +89,7 @@ fn accept_pair_sends_manifest_to_new_member() {
     )
     .expect("session A");
 
-    let b_manifest_received: Arc<Mutex<Option<crate::manifest::GroupManifest>>> =
-        Arc::new(Mutex::new(None));
-    let _bmr = b_manifest_received.clone();
-    let _session_b = TruesealSession::connect_full(
+    let session_b = TruesealSession::connect_full(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -106,10 +102,11 @@ fn accept_pair_sends_manifest_to_new_member() {
     )
     .expect("session B");
     // Watch B's manifest directly.
-    let b_manifest_arc = _session_b.manifest.clone();
+    let b_manifest_arc = session_b.manifest.clone();
 
-    let _token = session_a.pairing_token();
-    session_a.accept_pair(b_noise, b_signing);
+    // ADR-0023: the new member receives the manifest only through the
+    // anchored first-manifest gate, after actually asking to join.
+    run_pairing_ceremony(&session_a, &session_b);
 
     wait_for(
         || b_manifest_arc.lock().unwrap().is_some(),
@@ -172,7 +169,8 @@ fn accept_pair_extends_existing_manifest() {
     let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
     let (pipe_c_client, pipe_c_relay) = mem_pipe_pair();
     let (nk_rx, nk) = nk_push_channel();
-    spawn_routing_relay(&relay_kp, pipe_a_relay, pipe_c_relay, nk_rx, true);
+    // Bidirectional: C's Pair rides C→A, the manifest rides A→C (ADR-0023).
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_c_relay, nk_rx);
 
     let device_a = DeviceKeypair::generate();
     let a_noise = device_a.public_key();
@@ -180,8 +178,6 @@ fn accept_pair_extends_existing_manifest() {
     let a_sk = SigningKey::from_bytes(&device_a.signing.to_bytes());
 
     let device_c = DeviceKeypair::generate();
-    let c_noise = device_c.public_key();
-    let c_signing = device_c.signing_public_key();
 
     // Give A an existing {A, dummy_B} manifest (version 1).
     let dummy_b_noise = NoisePublicKey([0xBB; 32]);
@@ -198,24 +194,23 @@ fn accept_pair_extends_existing_manifest() {
     .expect("session A");
     session_a.set_manifest(v1);
 
-    let c_manifest_arc = {
-        let _session_c = TruesealSession::connect_full(
-            pipe_c_client,
-            relay_pub,
-            device_c,
-            |_, _, _| {},
-            Box::new(MemLog::new()),
-            || {},
-            |_| {},
-            || {},
-            nk.factory(),
-        )
-        .expect("session C");
-        _session_c.manifest.clone()
-    };
+    let session_c = TruesealSession::connect_full(
+        pipe_c_client,
+        relay_pub,
+        device_c,
+        |_, _, _| {},
+        Box::new(MemLog::new()),
+        || {},
+        |_| {},
+        || {},
+        nk.factory(),
+    )
+    .expect("session C");
+    let c_manifest_arc = session_c.manifest.clone();
 
-    let _token = session_a.pairing_token();
-    session_a.accept_pair(c_noise, c_signing);
+    // ADR-0023: C must actually ask to join (Pairing Secret + Pending Join)
+    // — a bare accept_pair no longer installs anything on C's side.
+    run_pairing_ceremony(&session_a, &session_c);
 
     wait_for(
         || c_manifest_arc.lock().unwrap().is_some(),
@@ -253,8 +248,6 @@ fn new_member_bootstrap_can_send_to_existing_members() {
     let b_noise = device_b.public_key();
     let b_signing = device_b.signing_public_key();
     let _b_sk = SigningKey::from_bytes(&device_b.signing.to_bytes());
-    let c_noise = device_c.public_key();
-    let c_signing = device_c.signing_public_key();
 
     // A and B already form a 2-member group.
     let session_a = TruesealSession::connect(
@@ -294,9 +287,9 @@ fn new_member_bootstrap_can_send_to_existing_members() {
     )
     .expect("session C");
 
-    // A opens pairing window and admits C.
-    let _token = session_a.pairing_token();
-    session_a.accept_pair(c_noise, c_signing);
+    // ADR-0023: C asks to join (Pairing Secret + Pending Join); A admits
+    // via the Join Request. A bare accept_pair would leave C manifestless.
+    run_pairing_ceremony(&session_a, &session_c);
 
     // C must receive the bootstrap GroupManifest from A before it can push.
     wait_for(

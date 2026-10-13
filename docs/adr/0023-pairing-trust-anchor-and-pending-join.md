@@ -1,6 +1,6 @@
 # Pairing is anchored to the Pairing Token on both sides
 
-Status: accepted (decided 2026-09-29 in [trueseal-roadmap#5](https://github.com/julianbonomini/trueseal-roadmap/issues/5); not yet implemented)
+Status: accepted (decided 2026-09-29 in [trueseal-roadmap#5](https://github.com/julianbonomini/trueseal-roadmap/issues/5)); implemented in SYNC-3 (issue #95)
 
 A joining Device trusts exactly one key: the initiator signing key carried in the Pairing Token it received out-of-band. It holds a persisted **Pending Join** and accepts its first Group Manifest only if that manifest is signed by the token's signing key, the Envelope signer is that same key, and the joiner's own keys are among the members. The group ID and version can be anything (joining an existing group lands at N+1). The token also carries a random, single-use **Pairing Secret**. A `Pair` must prove it knows the secret, so only someone who saw the token can raise a member request. A device with no manifest and no Pending Join never accepts a manifest, and a device with no manifest drops every `Sync` and `Revoke`.
 
@@ -31,6 +31,9 @@ We need this because of [trueseal-roadmap#4](https://github.com/julianbonomini/t
 ## Consequences
 
 - This is a wire change to the Pairing Token and the `Pair` message, covered by the clean break in ADR-0022. It also adds new Session State (the Pending Join) and a new caller-visible join state and event. Exact API names belong to the SDK API shape work.
+- Wire formats as implemented (SYNC-3). Pairing Token: `base64url(0x02 || noise_pub || signing_pub || secret[32] || name)`; pre-SYNC-3 tokens are refused on decode. `Pair` body: `0x01 || noise_pub || signing_pub || secret[32]`, exact length; the secret travels inside the addressed encryption, so the Relay never sees it and cannot mint a valid request. The admitter compares in constant time.
+- Pending Join persistence: the record (`initiator_noise || initiator_signing || secret`) and the queued `Pair` commit in one SQLite transaction in the outbox database. Admission persists the manifest (via `on_manifest_changed`) before clearing the record; a crash between the two is self-healed at construction — a manifest implies the join completed.
+- Bad Pairs (relay-injected, wrong secret, spent secret) are dropped silently: the Relay can mint arbitrary well-formed Pairs, so a report per bad Pair would let it flood the Delivery Issue stream. Rejected first manifests do report (`unauthorized`, or `unreadable(malformed)` for unauthenticated bytes) — a first manifest is never routine traffic.
 - Binding the `Pair` `signing_pub` to the Envelope signer is a separate defect fix, and it is required alongside this.
 - Durable delivery of the admission manifest depends on the delivery contract ([trueseal-roadmap#7](https://github.com/julianbonomini/trueseal-roadmap/issues/7)). Until then, a lost manifest leaves the joiner pending.
 - Documented limitation: anyone who sees the Pairing Token while the window is open can request to join. The admitting user must confirm the device in front of them. Member names are labels, not authentication.

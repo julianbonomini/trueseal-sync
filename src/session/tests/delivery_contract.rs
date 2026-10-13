@@ -4,116 +4,20 @@
 //! single Delivery Issue stream.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::delivery_issue::DeliveryIssue;
 use crate::device::DeviceKeypair;
-use crate::envelope::{Envelope, SigningKeypair};
-use crate::keys::{NoisePublicKey, SigningPublicKey};
+use crate::envelope::SigningKeypair;
 use crate::manifest::{new_group_id, GroupManifest, ManifestMember};
 use crate::member::member_name;
 use crate::message::{message_id, Message};
 use crate::operation_log::MemLog;
-use crate::relay::{frame, parse, MsgType};
 use crate::store::{PersistentLog, Store};
 
 use super::super::test_helpers::*;
 use super::super::TruesealSession;
-
-/// A scripted relay for recipient-contract tests: accepts the XX session,
-/// records every frame the client sends, and delivers envelopes on demand.
-struct ScriptedRelay {
-    client_frames: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
-    deliver_tx: mpsc::Sender<(u64, Vec<u8>)>,
-}
-
-impl ScriptedRelay {
-    fn spawn(pipe: MemPipe, relay_kp: &trueseal_noise::keypair::Keypair) -> Self {
-        let client_frames = Arc::new(Mutex::new(Vec::<(u8, Vec<u8>)>::new()));
-        let (deliver_tx, deliver_rx) = mpsc::channel::<(u64, Vec<u8>)>();
-        let frames_clone = client_frames.clone();
-        let relay_kp2 =
-            trueseal_noise::keypair::Keypair::new(relay_kp.private(), relay_kp.public_key);
-        std::thread::spawn(move || {
-            let session = crate::version::testutil::xx_accept_after_prefix(pipe, relay_kp2)
-                .expect("relay accept");
-            let session = Arc::new(session);
-            let send_session = session.clone();
-            std::thread::spawn(move || {
-                for (blob_id, env_bytes) in deliver_rx {
-                    let mut body = blob_id.to_be_bytes().to_vec();
-                    body.extend_from_slice(&env_bytes);
-                    if send_session.send(&frame(MsgType::Deliver, &body)).is_err() {
-                        break;
-                    }
-                }
-            });
-            while let Ok(raw) = session.receive() {
-                if let Some((t, body)) = parse(&raw) {
-                    frames_clone.lock().unwrap().push((t as u8, body.to_vec()));
-                }
-            }
-        });
-        ScriptedRelay {
-            client_frames,
-            deliver_tx,
-        }
-    }
-
-    /// Deliver an envelope built from `msg`, addressed to `recipient` and
-    /// signed by `sender` with Envelope sequence `seq`.
-    fn deliver(
-        &self,
-        blob_id: u64,
-        msg: &Message,
-        recipient: NoisePublicKey,
-        sender: &SigningKeypair,
-        seq: u64,
-    ) {
-        let plaintext = msg.encode();
-        let payload = crate::crypto::encrypt(recipient, sender.public_key_bytes(), &plaintext);
-        let env = Envelope::build(seq, vec![], recipient, sender, payload);
-        self.deliver_raw(blob_id, env.encode());
-    }
-
-    fn deliver_raw(&self, blob_id: u64, envelope_bytes: Vec<u8>) {
-        self.deliver_tx
-            .send((blob_id, envelope_bytes))
-            .expect("relay alive");
-    }
-
-    /// Blob ids the client acked, in order.
-    fn deliver_acks(&self) -> Vec<u64> {
-        self.client_frames
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(t, _)| *t == MsgType::DeliverAck as u8)
-            .filter_map(|(_, b)| b.as_slice().try_into().ok().map(u64::from_be_bytes))
-            .collect()
-    }
-}
-
-/// Rebuild a SigningKeypair from raw bytes (SigningKeypair is not Clone).
-fn signing_keypair(bytes: &[u8; 32]) -> SigningKeypair {
-    SigningKeypair::from_signing_key(ed25519_dalek::SigningKey::from_bytes(bytes))
-}
-
-fn pub_of(bytes: &[u8; 32]) -> [u8; 32] {
-    ed25519_dalek::SigningKey::from_bytes(bytes)
-        .verifying_key()
-        .to_bytes()
-}
-
-fn signing_member(signing_bytes: &[u8; 32], noise: [u8; 32]) -> ManifestMember {
-    let sp = SigningPublicKey(pub_of(signing_bytes));
-    ManifestMember {
-        noise_pub: NoisePublicKey(noise),
-        signing_pub: sp,
-        name: member_name(&sp),
-    }
-}
 
 /// A duplicate delivery (same Envelope, new blob id) is acked silently and
 /// the handler runs once. This is the crash-between-dedup-and-ack recovery
@@ -126,6 +30,7 @@ fn duplicate_delivery_is_acked_silently_and_handler_runs_once() {
 
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    let manifest = membership(&device, &sender);
 
     let device_pub = device.public_key();
     let handled: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
@@ -146,6 +51,7 @@ fn duplicate_delivery_is_acked_silently_and_handler_runs_once() {
         || Err("push factory unused".into()),
     )
     .expect("session");
+    session.set_manifest(manifest);
     let issues: Arc<Mutex<Vec<DeliveryIssue>>> = Arc::new(Mutex::new(vec![]));
     let issues_cb = issues.clone();
     session.subscribe_delivery_issues(move |i| issues_cb.lock().unwrap().push(i));
@@ -180,6 +86,7 @@ fn handler_failing_five_times_gives_up_and_blob_is_acked() {
 
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    let manifest = membership(&device, &sender);
 
     let device_pub = device.public_key();
     let attempts: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
@@ -201,6 +108,7 @@ fn handler_failing_five_times_gives_up_and_blob_is_acked() {
         || Err("push factory unused".into()),
     )
     .expect("session");
+    session.set_manifest(manifest);
     let issues: Arc<Mutex<Vec<DeliveryIssue>>> = Arc::new(Mutex::new(vec![]));
     let issues_cb = issues.clone();
     session.subscribe_delivery_issues(move |i| issues_cb.lock().unwrap().push(i));
@@ -259,6 +167,7 @@ fn handler_succeeding_on_retry_is_not_reported_and_deduped() {
 
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    let manifest = membership(&device, &sender);
 
     let device_pub = device.public_key();
     let attempts: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
@@ -282,6 +191,7 @@ fn handler_succeeding_on_retry_is_not_reported_and_deduped() {
         || Err("push factory unused".into()),
     )
     .expect("session");
+    session.set_manifest(manifest);
     let issues: Arc<Mutex<Vec<DeliveryIssue>>> = Arc::new(Mutex::new(vec![]));
     let issues_cb = issues.clone();
     session.subscribe_delivery_issues(move |i| issues_cb.lock().unwrap().push(i));
@@ -329,6 +239,7 @@ fn dedup_record_survives_restart_and_prevents_rehandling() {
     // First "process": handle the message, then die without the relay
     // having seen... anything about the dedup record (it lives locally).
     let device_pub = device.public_key();
+    let manifest = membership(&device, &sender);
     {
         let (pipe_client, pipe_relay) = mem_pipe_pair();
         let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
@@ -353,6 +264,7 @@ fn dedup_record_survives_restart_and_prevents_rehandling() {
             || Err("push factory unused".into()),
         )
         .expect("session");
+        _session.set_manifest(manifest.clone());
         relay.deliver(1, &msg, device_pub, &sender, 11);
         wait_for(|| relay.deliver_acks() == vec![1], Duration::from_secs(3));
         assert_eq!(handled.load(Ordering::SeqCst), 1);
@@ -382,6 +294,7 @@ fn dedup_record_survives_restart_and_prevents_rehandling() {
         || Err("push factory unused".into()),
     )
     .expect("session");
+    _session.set_manifest(manifest);
     relay.deliver(2, &msg, device_pub, &sender, 11);
     wait_for(|| relay.deliver_acks() == vec![2], Duration::from_secs(3));
     assert_eq!(
@@ -406,6 +319,7 @@ fn crash_before_dedup_commit_rehandles_on_redelivery() {
         body: b"handled, then crash before the dedup commit".to_vec(),
     };
     let device_pub = device.public_key();
+    let manifest = membership(&device, &sender);
 
     // First "process": the handler runs and the Blob is acked — then the
     // process dies BEFORE the dedup record reaches durable storage (the
@@ -433,6 +347,7 @@ fn crash_before_dedup_commit_rehandles_on_redelivery() {
             || Err("push factory unused".into()),
         )
         .expect("session");
+        _session.set_manifest(manifest.clone());
         relay.deliver(1, &msg, device_pub, &sender, 11);
         wait_for(|| relay.deliver_acks() == vec![1], Duration::from_secs(3));
         assert_eq!(
@@ -467,6 +382,7 @@ fn crash_before_dedup_commit_rehandles_on_redelivery() {
         || Err("push factory unused".into()),
     )
     .expect("session");
+    _session.set_manifest(manifest);
     relay.deliver(2, &msg, device_pub, &sender, 11);
     wait_for(|| relay.deliver_acks() == vec![2], Duration::from_secs(3));
     assert_eq!(
@@ -665,7 +581,8 @@ fn member_request_arriving_before_registration_flushes_on_registration() {
         || Err("push factory unused".into()),
     )
     .expect("session");
-    let _token = session.pairing_token(); // open the window
+    let token = session.pairing_token(); // open the window
+    let (_, _, secret, _) = crate::message::decode_pairing_token(&token).expect("token decodes");
 
     // The Pair arrives BEFORE any member-request handler is registered.
     relay.deliver(
@@ -673,6 +590,7 @@ fn member_request_arriving_before_registration_flushes_on_registration() {
         &Message::Pair {
             noise_pub: joiner_noise,
             signing_pub: joiner_signing,
+            secret,
         },
         device_pub,
         &joiner_kp,
@@ -749,9 +667,10 @@ fn per_sender_order_is_preserved() {
     let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
 
     let device_pub = device.public_key();
+    let manifest = membership(&device, &sender);
     let received: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(vec![]));
     let received_cb = received.clone();
-    let _session = TruesealSession::<MemPipe>::connect_full(
+    let session = TruesealSession::<MemPipe>::connect_full(
         pipe_client,
         relay_pub(&relay_kp),
         device,
@@ -765,6 +684,7 @@ fn per_sender_order_is_preserved() {
         || Err("push factory unused".into()),
     )
     .expect("session");
+    session.set_manifest(manifest);
 
     for (blob_id, seq) in [(1u64, 1u64), (2, 2), (3, 3)] {
         relay.deliver(

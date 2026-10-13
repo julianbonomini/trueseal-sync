@@ -416,6 +416,164 @@ pub(super) fn spawn_bidirectional_relay_parallel(
     });
 }
 
+/// Run the ADR-0023 pairing ceremony end to end: the admitter opens a
+/// Pairing Window, the joiner calls `join_group` with the token (Pairing
+/// Secret included), the admitter accepts the resulting Join Request.
+/// Returns once the admitter has admitted; the joiner's first-manifest
+/// acceptance is asynchronous (the manifest rides the outbox).
+pub(super) fn run_pairing_ceremony<T, U>(
+    admitter: &super::TruesealSession<T>,
+    joiner: &super::TruesealSession<U>,
+) where
+    T: std::io::Read + std::io::Write + Send + 'static,
+    U: std::io::Read + std::io::Write + Send + 'static,
+{
+    let req: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let r = req.clone();
+    admitter.set_on_member_request(move |token, _| *r.lock().unwrap() = Some(token));
+    let token = admitter.pairing_token();
+    joiner
+        .join_group(&token)
+        .expect("join_group durably queues the Pair");
+    wait_for(
+        || req.lock().unwrap().is_some(),
+        std::time::Duration::from_secs(5),
+    );
+    let t = req.lock().unwrap().clone().expect("a Join Request arrived");
+    assert!(
+        admitter.accept_member(&t),
+        "accept_member admits the waiting joiner"
+    );
+}
+
+// ── Scripted relay + membership helpers (shared by contract and adversarial
+// tests) ─────────────────────────────────────────────────────────────────
+
+/// A scripted relay for recipient-contract tests: accepts the XX session,
+/// records every frame the client sends, and delivers envelopes on demand.
+pub(super) struct ScriptedRelay {
+    client_frames: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
+    deliver_tx: mpsc::Sender<(u64, Vec<u8>)>,
+}
+
+impl ScriptedRelay {
+    pub(super) fn spawn(pipe: MemPipe, relay_kp: &Keypair) -> Self {
+        let client_frames = Arc::new(Mutex::new(Vec::<(u8, Vec<u8>)>::new()));
+        let (deliver_tx, deliver_rx) = mpsc::channel::<(u64, Vec<u8>)>();
+        let frames_clone = client_frames.clone();
+        let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
+        std::thread::spawn(move || {
+            let session = xx_accept_after_prefix(pipe, relay_kp2).expect("relay accept");
+            let session = Arc::new(session);
+            let send_session = session.clone();
+            std::thread::spawn(move || {
+                for (blob_id, env_bytes) in deliver_rx {
+                    let mut body = blob_id.to_be_bytes().to_vec();
+                    body.extend_from_slice(&env_bytes);
+                    if send_session.send(&frame(MsgType::Deliver, &body)).is_err() {
+                        break;
+                    }
+                }
+            });
+            while let Ok(raw) = session.receive() {
+                if let Some((t, body)) = parse(&raw) {
+                    frames_clone.lock().unwrap().push((t as u8, body.to_vec()));
+                }
+            }
+        });
+        ScriptedRelay {
+            client_frames,
+            deliver_tx,
+        }
+    }
+
+    /// Deliver an envelope built from `msg`, addressed to `recipient` and
+    /// signed by `sender` with Envelope sequence `seq`.
+    pub(super) fn deliver(
+        &self,
+        blob_id: u64,
+        msg: &crate::message::Message,
+        recipient: NoisePublicKey,
+        sender: &crate::envelope::SigningKeypair,
+        seq: u64,
+    ) {
+        let plaintext = msg.encode();
+        let payload = crate::crypto::encrypt(recipient, sender.public_key_bytes(), &plaintext);
+        let env = crate::envelope::Envelope::build(seq, vec![], recipient, sender, payload);
+        self.deliver_raw(blob_id, env.encode());
+    }
+
+    pub(super) fn deliver_raw(&self, blob_id: u64, envelope_bytes: Vec<u8>) {
+        self.deliver_tx
+            .send((blob_id, envelope_bytes))
+            .expect("relay alive");
+    }
+
+    /// Blob ids the client acked, in order.
+    pub(super) fn deliver_acks(&self) -> Vec<u64> {
+        self.client_frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(t, _)| *t == MsgType::DeliverAck as u8)
+            .filter_map(|(_, b)| b.as_slice().try_into().ok().map(u64::from_be_bytes))
+            .collect()
+    }
+}
+
+/// Rebuild a SigningKeypair from raw bytes (SigningKeypair is not Clone).
+pub(super) fn signing_keypair(bytes: &[u8; 32]) -> crate::envelope::SigningKeypair {
+    crate::envelope::SigningKeypair::from_signing_key(ed25519_dalek::SigningKey::from_bytes(bytes))
+}
+
+pub(super) fn pub_of(bytes: &[u8; 32]) -> [u8; 32] {
+    ed25519_dalek::SigningKey::from_bytes(bytes)
+        .verifying_key()
+        .to_bytes()
+}
+
+pub(super) fn signing_member(
+    signing_bytes: &[u8; 32],
+    noise: [u8; 32],
+) -> crate::manifest::ManifestMember {
+    let sp = crate::keys::SigningPublicKey(pub_of(signing_bytes));
+    crate::manifest::ManifestMember {
+        noise_pub: NoisePublicKey(noise),
+        signing_pub: sp,
+        name: crate::member::member_name(&sp),
+    }
+}
+
+/// ADR-0023: a manifestless device drops every Sync. Build the two-member
+/// genesis (device + scripted sender) so plumbing tests can run as group
+/// members. `set_manifest` bypasses the first-manifest gate on purpose —
+/// these tests are not about pairing.
+pub(super) fn membership(
+    device: &crate::device::DeviceKeypair,
+    sender: &crate::envelope::SigningKeypair,
+) -> crate::manifest::GroupManifest {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&device.signing.to_bytes());
+    let self_sp = device.signing_public_key();
+    let sender_sp = sender.public_key();
+    crate::manifest::GroupManifest::new(
+        crate::manifest::new_group_id(),
+        1,
+        vec![
+            crate::manifest::ManifestMember {
+                noise_pub: device.public_key(),
+                signing_pub: self_sp,
+                name: crate::member::member_name(&self_sp),
+            },
+            crate::manifest::ManifestMember {
+                noise_pub: NoisePublicKey([9u8; 32]),
+                signing_pub: crate::keys::SigningPublicKey(sender.public_key_bytes()),
+                name: crate::member::member_name(&sender_sp),
+            },
+        ],
+        &sk,
+    )
+}
+
 /// Spin-polls `cond` until it returns `true` or `timeout` elapses.
 /// Replaces `sleep + assert` patterns — reacts to the actual event, not a fixed delay.
 /// Panics with a descriptive message on timeout.
