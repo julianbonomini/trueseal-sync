@@ -29,8 +29,12 @@ use super::make_two_member_manifest;
 enum Verdict {
     /// Record the push and confirm persistence (ADR-0019).
     Ack,
-    /// Record the push and permanently refuse it (relay Error frame).
-    Error,
+    /// Record the push and refuse it with a relay Error frame. `None` is
+    /// the legacy reasonless body (pre-RELAY-5 relays, kept well-formed by
+    /// the ADR-0008 amendment); `Some(code)` is a typed reason byte — bit
+    /// 7 set marks a temporary refusal (0x81 inboxFull, 0x82 rateLimited,
+    /// 0x83 unavailable, 0x84 internal).
+    Error(Option<u8>),
     /// Record the push, then drop the connection WITHOUT an ack — the
     /// "crash after the relay persisted but before the ack" case: the
     /// sender must retry and the recipient dedups the re-delivery.
@@ -97,8 +101,9 @@ impl ScriptedPushRelay {
                         Verdict::Ack => {
                             let _ = sess.send(&frame(MsgType::Ack, &[]));
                         }
-                        Verdict::Error => {
-                            let _ = sess.send(&frame(MsgType::Error, &[]));
+                        Verdict::Error(code) => {
+                            let body = code.map(|c| vec![c]).unwrap_or_default();
+                            let _ = sess.send(&frame(MsgType::Error, &body));
                         }
                         Verdict::Close => {
                             // Drop without a word.
@@ -324,13 +329,17 @@ fn reconnect_clears_backoff_and_retries_immediately() {
 
 /// A permanent refusal raises `sendFailed` and is never retried (issue
 /// completion criterion): the entry is deleted, so nothing is left to retry.
+/// This stub sends the LEGACY reasonless Error body — the pre-RELAY-5 relay
+/// layout — so it also pins the backward-compatible mapping (ADR-0026: an
+/// untyped refusal reports `sendFailed(malformed)`).
 #[test]
 fn permanent_refusal_raises_send_failed_and_is_never_retried() {
     let relay_kp = make_relay_kp();
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let (nk_rx, nk) = nk_push_channel();
-    // Every push is permanently refused.
-    let relay = ScriptedPushRelay::spawn(pipe_relay, &relay_kp, nk_rx, vec![], Verdict::Error);
+    // Every push is refused with the legacy reasonless Error body.
+    let relay =
+        ScriptedPushRelay::spawn(pipe_relay, &relay_kp, nk_rx, vec![], Verdict::Error(None));
 
     let device = DeviceKeypair::generate();
     let recipient = DeviceKeypair::generate();
@@ -457,6 +466,155 @@ fn temporary_failure_retries_while_connected() {
         open_seq(&pushes[0].1, &recipient),
         open_seq(&pushes[1].1, &recipient),
         "both pushes carry the same sequence — one message, two attempts"
+    );
+}
+
+/// A TYPED temporary refusal (relay Error with reason 0x84 internal — bit
+/// 7 set, relay ADR-0008 amended by RELAY-5) is NOT a message-loss event:
+/// the pump backs off and retries while connected, the entry survives, and
+/// no `sendFailed` fires (ADR-0026 retry classes; B20b — the pre-typed
+/// mapping dropped the entry permanently).
+#[test]
+fn temporary_refusal_backs_off_and_retries() {
+    let relay_kp = make_relay_kp();
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
+    // First push: typed temporary refusal (0x84 internal). Then default: Ack.
+    let relay = ScriptedPushRelay::spawn(
+        pipe_relay,
+        &relay_kp,
+        nk_rx,
+        vec![Verdict::Error(Some(0x84))],
+        Verdict::Ack,
+    );
+
+    let device = DeviceKeypair::generate();
+    let recipient = DeviceKeypair::generate();
+    let d_noise = device.public_key();
+    let d_signing = device.signing_public_key();
+    let d_sk = SigningKey::from_bytes(&device.signing.to_bytes());
+    let session = TruesealSession::connect(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("connect");
+    session.set_manifest(make_two_member_manifest(
+        d_noise,
+        d_signing,
+        &d_sk,
+        recipient.public_key(),
+        recipient.signing_public_key(),
+    ));
+    let issues: Arc<Mutex<Vec<DeliveryIssue>>> = Arc::new(Mutex::new(vec![]));
+    let issues_cb = issues.clone();
+    session.subscribe_delivery_issues(move |i| issues_cb.lock().unwrap().push(i));
+
+    session.push_sync(b"retry me".to_vec()).expect("queued");
+
+    // The retry lands after one backoff interval and the entry is delivered.
+    wait_for(
+        || {
+            session
+                .op_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .undelivered_entries()
+                .is_empty()
+        },
+        Duration::from_secs(5),
+    );
+    let pushes = relay.pushes();
+    assert_eq!(
+        pushes.len(),
+        2,
+        "the entry was retried after the temporary refusal, then delivered"
+    );
+    assert_eq!(
+        open_seq(&pushes[0].1, &recipient),
+        open_seq(&pushes[1].1, &recipient),
+        "both pushes carry the same sequence — one message, two attempts"
+    );
+    assert!(
+        !issues
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|i| matches!(i, DeliveryIssue::SendFailed { .. })),
+        "a temporary refusal never raises sendFailed"
+    );
+}
+
+/// A TYPED permanent refusal for size (relay Error with reason 0x01
+/// tooLarge, relay ADR-0008 amended by RELAY-5) reports
+/// `sendFailed(tooLarge)` — the same reason the client-side size check
+/// reports — not the generic `malformed` (ADR-0026: a size refusal is
+/// permanent and typed, ADR-0025).
+#[test]
+fn permanent_too_large_refusal_reports_too_large() {
+    let relay_kp = make_relay_kp();
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
+    // Every push is refused with the typed tooLarge reason.
+    let relay = ScriptedPushRelay::spawn(
+        pipe_relay,
+        &relay_kp,
+        nk_rx,
+        vec![],
+        Verdict::Error(Some(0x01)),
+    );
+
+    let device = DeviceKeypair::generate();
+    let recipient = DeviceKeypair::generate();
+    let d_noise = device.public_key();
+    let d_signing = device.signing_public_key();
+    let d_signing_pub = d_signing.0;
+    let d_sk = SigningKey::from_bytes(&device.signing.to_bytes());
+    let session = TruesealSession::connect(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        |_, _, _| {},
+        nk.factory(),
+    )
+    .expect("connect");
+    session.set_manifest(make_two_member_manifest(
+        d_noise,
+        d_signing,
+        &d_sk,
+        recipient.public_key(),
+        recipient.signing_public_key(),
+    ));
+    let issues: Arc<Mutex<Vec<DeliveryIssue>>> = Arc::new(Mutex::new(vec![]));
+    let issues_cb = issues.clone();
+    session.subscribe_delivery_issues(move |i| issues_cb.lock().unwrap().push(i));
+
+    // First send on a fresh log consumes sequence 0.
+    session.push_sync(b"refused".to_vec()).expect("queued");
+
+    let expected_mid = message_id(&d_signing_pub, 0);
+    wait_for(
+        || {
+            issues.lock().unwrap().iter().any(|i| {
+                matches!(
+                    i,
+                    DeliveryIssue::SendFailed {
+                        message_id,
+                        reason: SendFailedReason::TooLarge,
+                    } if *message_id == expected_mid
+                )
+            })
+        },
+        Duration::from_secs(3),
+    );
+    // Past several backoff cycles: pushed exactly once — the entry is gone.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(
+        relay.pushes().len(),
+        1,
+        "a permanently refused entry is never retried"
     );
 }
 

@@ -35,9 +35,12 @@ pub enum SendFailedReason {
     /// outbox entries written by a build from before the `send()` check, or
     /// when the serialised Envelope cannot fit one Noise frame.
     TooLarge,
-    /// The relay permanently refused the push (Error frame, ADR-0026). The
-    /// relay's Error codes are untyped today; RELAY-5 adds reason codes and
-    /// this reason may then split.
+    /// The relay permanently refused the push (Error frame, ADR-0026).
+    /// Covers the relay's `malformed` reason code, an unknown permanent
+    /// code, and the legacy reasonless Error body of pre-RELAY-5 relays
+    /// (ADR-0026's documented mapping for an untyped refusal). The relay's
+    /// `tooLarge` code splits to `TooLarge`; temporary codes never reach
+    /// this stream — they back off and retry.
     Malformed,
     /// A `Sync` entry still undelivered 30 days after `send()` (ADR-0026).
     /// Control-plane entries never expire.

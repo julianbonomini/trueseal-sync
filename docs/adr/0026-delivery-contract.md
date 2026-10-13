@@ -4,7 +4,7 @@ Status: accepted (decided 2026-09-29 in [trueseal-roadmap#7](https://github.com/
 
 Implementation notes (SYNC-5):
 - The dedup table keeps a handled Message ID for 60 days from the handling time. ADR-0034 §2's refinement ("the later of the handling time and the Sender Timestamp") lands with the sealed Sender Timestamp in SYNC-12; the Envelope carries no timestamp yet.
-- The relay's refusal codes are untyped today, so a permanent refusal reports `sendFailed(malformed)`; RELAY-5's typed Error codes may split the reason.
+- The relay's refusal codes were untyped at implementation time, so a permanent refusal reported `sendFailed(malformed)`. RELAY-5 (relay ADR-0008 amendment) added typed Error reason codes, and the client now classifies them (B20b): a permanent code fails the entry typed — `tooLarge` (0x01) reports `sendFailed(tooLarge)`, `malformed` (0x02), an unknown permanent code, or a legacy reasonless body report `sendFailed(malformed)` — and a temporary code (bit 7 set: `inboxFull`, `rateLimited`, `unavailable`, `internal`, or a future temporary code) backs off and retries while connected, so a transient relay-internal failure never drops a queued message. Unknown codes classify by bit 7 alone, keeping the taxonomy forward-compatible.
 - The in-memory handler backoff between the 5 attempts is 100/200/400/800 ms; a hung handler stalls the session's delivery, as specified.
 - A Revoke is queued through the outbox before the destroyed flag is set, and the sender pump drains it while connected. The durable Destroying state that survives a restart is SYNC-11 (ADR-0029), as this ADR defers.
 
