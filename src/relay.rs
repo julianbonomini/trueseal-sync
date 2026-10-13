@@ -684,22 +684,23 @@ fn run_loop<T: Severable>(
     let (heartbeat_stop_tx, heartbeat_stop_rx) = mpsc::channel::<()>();
     let _heartbeat_stop_tx = heartbeat_stop_tx;
     let last_inbound_heartbeat = last_inbound.clone();
-    std::thread::spawn(move || loop {
-        match heartbeat_stop_rx.recv_timeout(timeouts.heartbeat) {
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            // Sender dropped (run loop exiting) — leave immediately.
-            _ => break,
-        }
-        let age = now_millis().saturating_sub(last_inbound_heartbeat.load(Ordering::Acquire));
-        if age > timeouts.liveness.as_millis() as u64 {
-            (sever)();
-            break;
-        }
-        if session_for_heartbeat
-            .send(&frame(MsgType::Heartbeat, &[]))
-            .is_err()
+    // `while let` on the timeout arm: any other outcome (sender dropped
+    // — the run loop is exiting — or a spurious send) ends the thread.
+    std::thread::spawn(move || {
+        while let Err(mpsc::RecvTimeoutError::Timeout) =
+            heartbeat_stop_rx.recv_timeout(timeouts.heartbeat)
         {
-            break;
+            let age = now_millis().saturating_sub(last_inbound_heartbeat.load(Ordering::Acquire));
+            if age > timeouts.liveness.as_millis() as u64 {
+                (sever)();
+                break;
+            }
+            if session_for_heartbeat
+                .send(&frame(MsgType::Heartbeat, &[]))
+                .is_err()
+            {
+                break;
+            }
         }
     });
 
