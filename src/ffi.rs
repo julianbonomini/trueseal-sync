@@ -50,6 +50,32 @@ pub enum SessionError {
     /// Membership is exhausted; the group's Devices must pair again.
     #[error("manifest version exhausted: cannot issue a new version")]
     ManifestVersionExhausted,
+    /// `joinGroup` while already holding a Group Manifest — one Sync Group
+    /// per namespace (ADR-0023; `alreadyInGroup` in ADR-0028's error list).
+    #[error("already in a group")]
+    AlreadyInGroup,
+}
+
+/// Where the local Device stands in its namespace's Sync Group (ADR-0023,
+/// ADR-0028). `Leaving` arrives with membership convergence (SYNC-9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum GroupStatus {
+    /// No Group Manifest and no Pending Join.
+    NotJoined,
+    /// Asked to join via a Pairing Token; waiting to be admitted.
+    PendingJoin,
+    /// Holds a Group Manifest.
+    Member,
+}
+
+impl From<crate::session::GroupStatus> for GroupStatus {
+    fn from(s: crate::session::GroupStatus) -> Self {
+        match s {
+            crate::session::GroupStatus::NotJoined => GroupStatus::NotJoined,
+            crate::session::GroupStatus::PendingJoin => GroupStatus::PendingJoin,
+            crate::session::GroupStatus::Member => GroupStatus::Member,
+        }
+    }
 }
 
 impl From<CoreSessionError> for SessionError {
@@ -70,6 +96,7 @@ impl From<CoreSessionError> for SessionError {
             }
             CoreSessionError::PayloadTooLarge { max } => SessionError::PayloadTooLarge { max },
             CoreSessionError::ManifestVersionExhausted => SessionError::ManifestVersionExhausted,
+            CoreSessionError::AlreadyInGroup => SessionError::AlreadyInGroup,
         }
     }
 }
@@ -307,22 +334,45 @@ impl TruesealFfiSession {
         Ok(Arc::new(Self { inner }))
     }
 
-    /// Opens a pairing window and returns an opaque base64url token.
+    /// Opens a pairing window and returns an opaque base64url token carrying a
+    /// fresh single-use Pairing Secret (ADR-0023): only a party that saw this
+    /// token out-of-band can raise a Join Request.
     /// The window stays open until either `acceptMember()` is called (single-use:
     /// the window closes after the first accept) or the caller explicitly calls
     /// `cancelPairing()`. There is no auto-expiry — the caller controls lifetime
     /// by closing the pairing UI and calling `cancelPairing()` on dismiss (ADR-0021).
-    /// The token encodes `noise_pub || signing_pub || device_name` — pass it to
-    /// the peer's `joinGroup(token)` call.
+    /// The token encodes a version byte, `noise_pub || signing_pub || secret ||
+    /// device_name` — pass it to the peer's `joinGroup(token)` call.
+    ///
+    /// Documented limitation (ADR-0023): anyone who sees the token while the
+    /// window is open can request to join — confirm the device in front of you.
     pub fn pairing_token(&self) -> String {
         self.inner.pairing_token()
     }
 
     /// Join a group as the responding device by decoding the initiator's `token`
-    /// and sending a `Pair` message with this device's public keys.
-    /// Returns `SessionError::InvalidToken` if the token is malformed.
+    /// and durably queueing a `Pair` message with this device's public keys and
+    /// the token's Pairing Secret (ADR-0023). The device moves to
+    /// `GroupStatus::PendingJoin` and accepts only a first manifest anchored to
+    /// the token's signing key. `Ok` means durably queued — do not retry.
+    ///
+    /// Returns `SessionError::AlreadyInGroup` if a manifest exists; a second
+    /// call while pending replaces the Pending Join. Returns
+    /// `SessionError::InvalidToken` if the token is malformed or predates the
+    /// Pairing Secret.
     pub fn join_group(&self, token: String) -> Result<(), SessionError> {
         self.inner.join_group(&token).map_err(SessionError::from)
+    }
+
+    /// Abandon a Pending Join (ADR-0023): the device moves back to
+    /// `GroupStatus::NotJoined` and no manifest will be accepted.
+    pub fn cancel_join(&self) {
+        self.inner.cancel_join();
+    }
+
+    /// Where this device stands in its namespace's Sync Group (ADR-0028).
+    pub fn group_status(&self) -> GroupStatus {
+        self.inner.group_status().into()
     }
 
     /// Register the callback fired when a `Pair` message arrives within an open pairing window.

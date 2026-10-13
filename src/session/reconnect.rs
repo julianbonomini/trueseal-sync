@@ -12,7 +12,7 @@ use crate::message::Message;
 use crate::operation_log::OperationLog;
 use crate::relay::RelayClient;
 
-use super::{EventSink, IssueSink, KeyState, PendingMember};
+use super::{EventSink, IssueSink, KeyState, PendingJoin, PendingMember};
 
 /// Polls for relay disconnect, backs off, reconnects, and replays the outbox.
 /// Runs in a background thread spawned by `connect_with_reconnect`.
@@ -33,6 +33,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     on_member_joined: Arc<Mutex<EventSink>>,
     on_member_left: Arc<Mutex<EventSink>>,
     issue_sink: Arc<Mutex<IssueSink>>,
+    pending_join: Arc<Mutex<Option<PendingJoin>>>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
     on_connection_changed: Arc<dyn Fn(bool) + Send + Sync + 'static>,
@@ -85,6 +86,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
         let handler = super::build_subscribe_handler(
             keys.clone(),
             manifest.clone(),
+            pending_join.clone(),
             on_removed_from_group.clone(),
             on_manifest_changed.clone(),
             on_group_destroyed.clone(),

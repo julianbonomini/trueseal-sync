@@ -416,6 +416,36 @@ pub(super) fn spawn_bidirectional_relay_parallel(
     });
 }
 
+/// Run the ADR-0023 pairing ceremony end to end: the admitter opens a
+/// Pairing Window, the joiner calls `join_group` with the token (Pairing
+/// Secret included), the admitter accepts the resulting Join Request.
+/// Returns once the admitter has admitted; the joiner's first-manifest
+/// acceptance is asynchronous (the manifest rides the outbox).
+pub(super) fn run_pairing_ceremony<T, U>(
+    admitter: &super::TruesealSession<T>,
+    joiner: &super::TruesealSession<U>,
+) where
+    T: std::io::Read + std::io::Write + Send + 'static,
+    U: std::io::Read + std::io::Write + Send + 'static,
+{
+    let req: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let r = req.clone();
+    admitter.set_on_member_request(move |token, _| *r.lock().unwrap() = Some(token));
+    let token = admitter.pairing_token();
+    joiner
+        .join_group(&token)
+        .expect("join_group durably queues the Pair");
+    wait_for(
+        || req.lock().unwrap().is_some(),
+        std::time::Duration::from_secs(5),
+    );
+    let t = req.lock().unwrap().clone().expect("a Join Request arrived");
+    assert!(
+        admitter.accept_member(&t),
+        "accept_member admits the waiting joiner"
+    );
+}
+
 /// Spin-polls `cond` until it returns `true` or `timeout` elapses.
 /// Replaces `sleep + assert` patterns — reacts to the actual event, not a fixed delay.
 /// Panics with a descriptive message on timeout.

@@ -45,7 +45,7 @@ fn two_sessions_can_exchange_sync_message() {
 
     let received: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
     let rx = received.clone();
-    let _session_b = TruesealSession::connect(
+    let session_b = TruesealSession::connect(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -55,6 +55,11 @@ fn two_sessions_can_exchange_sync_message() {
         nk.factory(),
     )
     .expect("session B");
+    // ADR-0023: a manifestless device drops every Sync — B must hold the
+    // manifest too (this test is about push plumbing, not pairing).
+    session_b.set_manifest(make_two_member_manifest(
+        a_noise, a_signing, &a_sk, b_noise, b_signing,
+    ));
 
     session_a
         .push_sync(b"hello from A".to_vec())
@@ -192,7 +197,7 @@ fn on_message_receives_sender_signing_pub() {
 
     let received: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
     let rx = received.clone();
-    let _session_b = TruesealSession::connect(
+    let session_b = TruesealSession::connect(
         pipe_b_client,
         relay_pub,
         device_b,
@@ -202,6 +207,14 @@ fn on_message_receives_sender_signing_pub() {
         nk.factory(),
     )
     .expect("session B");
+    // ADR-0023: B must hold the manifest or it drops the Sync.
+    session_b.set_manifest(make_two_member_manifest(
+        a_noise,
+        a_signing_pub,
+        &a_sk,
+        b_noise,
+        b_signing,
+    ));
 
     session_a.push_sync(b"hello".to_vec()).expect("push");
     wait_for(

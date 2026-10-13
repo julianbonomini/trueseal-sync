@@ -115,6 +115,33 @@ fn signing_member(signing_bytes: &[u8; 32], noise: [u8; 32]) -> ManifestMember {
     }
 }
 
+/// ADR-0023: a manifestless device drops every Sync. Build the two-member
+/// genesis (device + scripted sender) so these delivery-contract tests run
+/// as group members — they exercise dedup/retries/acks, not pairing.
+/// `set_manifest` bypasses the first-manifest gate on purpose.
+fn membership(device: &DeviceKeypair, sender: &SigningKeypair) -> GroupManifest {
+    let sk = ed25519_dalek::SigningKey::from_bytes(&device.signing.to_bytes());
+    let self_sp = device.signing_public_key();
+    let sender_sp = sender.public_key();
+    GroupManifest::new(
+        new_group_id(),
+        1,
+        vec![
+            ManifestMember {
+                noise_pub: device.public_key(),
+                signing_pub: self_sp,
+                name: member_name(&self_sp),
+            },
+            ManifestMember {
+                noise_pub: NoisePublicKey([9u8; 32]),
+                signing_pub: SigningPublicKey(sender.public_key_bytes()),
+                name: member_name(&sender_sp),
+            },
+        ],
+        &sk,
+    )
+}
+
 /// A duplicate delivery (same Envelope, new blob id) is acked silently and
 /// the handler runs once. This is the crash-between-dedup-and-ack recovery
 /// path: the re-delivery is recognised by its Message ID.
@@ -126,6 +153,7 @@ fn duplicate_delivery_is_acked_silently_and_handler_runs_once() {
 
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    let manifest = membership(&device, &sender);
 
     let device_pub = device.public_key();
     let handled: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
@@ -146,6 +174,7 @@ fn duplicate_delivery_is_acked_silently_and_handler_runs_once() {
         || Err("push factory unused".into()),
     )
     .expect("session");
+    session.set_manifest(manifest);
     let issues: Arc<Mutex<Vec<DeliveryIssue>>> = Arc::new(Mutex::new(vec![]));
     let issues_cb = issues.clone();
     session.subscribe_delivery_issues(move |i| issues_cb.lock().unwrap().push(i));
@@ -180,6 +209,7 @@ fn handler_failing_five_times_gives_up_and_blob_is_acked() {
 
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    let manifest = membership(&device, &sender);
 
     let device_pub = device.public_key();
     let attempts: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
@@ -201,6 +231,7 @@ fn handler_failing_five_times_gives_up_and_blob_is_acked() {
         || Err("push factory unused".into()),
     )
     .expect("session");
+    session.set_manifest(manifest);
     let issues: Arc<Mutex<Vec<DeliveryIssue>>> = Arc::new(Mutex::new(vec![]));
     let issues_cb = issues.clone();
     session.subscribe_delivery_issues(move |i| issues_cb.lock().unwrap().push(i));
@@ -259,6 +290,7 @@ fn handler_succeeding_on_retry_is_not_reported_and_deduped() {
 
     let (pipe_client, pipe_relay) = mem_pipe_pair();
     let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    let manifest = membership(&device, &sender);
 
     let device_pub = device.public_key();
     let attempts: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
@@ -282,6 +314,7 @@ fn handler_succeeding_on_retry_is_not_reported_and_deduped() {
         || Err("push factory unused".into()),
     )
     .expect("session");
+    session.set_manifest(manifest);
     let issues: Arc<Mutex<Vec<DeliveryIssue>>> = Arc::new(Mutex::new(vec![]));
     let issues_cb = issues.clone();
     session.subscribe_delivery_issues(move |i| issues_cb.lock().unwrap().push(i));
@@ -329,6 +362,7 @@ fn dedup_record_survives_restart_and_prevents_rehandling() {
     // First "process": handle the message, then die without the relay
     // having seen... anything about the dedup record (it lives locally).
     let device_pub = device.public_key();
+    let manifest = membership(&device, &sender);
     {
         let (pipe_client, pipe_relay) = mem_pipe_pair();
         let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
@@ -353,6 +387,7 @@ fn dedup_record_survives_restart_and_prevents_rehandling() {
             || Err("push factory unused".into()),
         )
         .expect("session");
+        _session.set_manifest(manifest.clone());
         relay.deliver(1, &msg, device_pub, &sender, 11);
         wait_for(|| relay.deliver_acks() == vec![1], Duration::from_secs(3));
         assert_eq!(handled.load(Ordering::SeqCst), 1);
@@ -382,6 +417,7 @@ fn dedup_record_survives_restart_and_prevents_rehandling() {
         || Err("push factory unused".into()),
     )
     .expect("session");
+    _session.set_manifest(manifest);
     relay.deliver(2, &msg, device_pub, &sender, 11);
     wait_for(|| relay.deliver_acks() == vec![2], Duration::from_secs(3));
     assert_eq!(
@@ -406,6 +442,7 @@ fn crash_before_dedup_commit_rehandles_on_redelivery() {
         body: b"handled, then crash before the dedup commit".to_vec(),
     };
     let device_pub = device.public_key();
+    let manifest = membership(&device, &sender);
 
     // First "process": the handler runs and the Blob is acked — then the
     // process dies BEFORE the dedup record reaches durable storage (the
@@ -433,6 +470,7 @@ fn crash_before_dedup_commit_rehandles_on_redelivery() {
             || Err("push factory unused".into()),
         )
         .expect("session");
+        _session.set_manifest(manifest.clone());
         relay.deliver(1, &msg, device_pub, &sender, 11);
         wait_for(|| relay.deliver_acks() == vec![1], Duration::from_secs(3));
         assert_eq!(
@@ -467,6 +505,7 @@ fn crash_before_dedup_commit_rehandles_on_redelivery() {
         || Err("push factory unused".into()),
     )
     .expect("session");
+    _session.set_manifest(manifest);
     relay.deliver(2, &msg, device_pub, &sender, 11);
     wait_for(|| relay.deliver_acks() == vec![2], Duration::from_secs(3));
     assert_eq!(
@@ -751,9 +790,10 @@ fn per_sender_order_is_preserved() {
     let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
 
     let device_pub = device.public_key();
+    let manifest = membership(&device, &sender);
     let received: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(vec![]));
     let received_cb = received.clone();
-    let _session = TruesealSession::<MemPipe>::connect_full(
+    let session = TruesealSession::<MemPipe>::connect_full(
         pipe_client,
         relay_pub(&relay_kp),
         device,
@@ -767,6 +807,7 @@ fn per_sender_order_is_preserved() {
         || Err("push factory unused".into()),
     )
     .expect("session");
+    session.set_manifest(manifest);
 
     for (blob_id, seq) in [(1u64, 1u64), (2, 2), (3, 3)] {
         relay.deliver(
