@@ -32,6 +32,406 @@ fn kind_from_db(v: i64) -> OutboxKind {
 pub enum StoreError {
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    /// The store was written by a newer release (a rollback): its Store
+    /// Version is above what this build supports. Refused — the store is
+    /// not modified, so rolling forward again loses nothing (ADR-0032;
+    /// `storeTooNew` in ADR-0028's error list).
+    #[error("store was written by a newer release (store version {found}, this build supports up to {supported})")]
+    StoreTooNew { found: u32, supported: u32 },
+    /// A migration step failed outright. The old store is intact (the
+    /// step's transaction rolled back); the error surfaces as `storage`
+    /// (ADR-0032).
+    #[error("store migration from version {from} failed: {msg}")]
+    MigrationFailed { from: u32, msg: String },
+    /// The End-to-End Version bump re-seal failed. The transaction rolled
+    /// back: every outbox entry is still at the old version (ADR-0034 §1
+    /// crash behaviour).
+    #[error("outbox re-seal for the End-to-End Version bump failed: {0}")]
+    ResealFailed(String),
+}
+
+/// What [`Store::open_with_outcome`] did to get the store ready (ADR-0032).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OpenOutcome {
+    /// The database was created by this open (no prior tables).
+    pub created: bool,
+    /// Chained migrations ran from this Store Version.
+    pub migrated_from: Option<u32>,
+    /// The store was unmigratable — unversioned (a development build) or
+    /// below the migration floor — and was reset: every table wiped, fresh
+    /// Store Version recorded. The caller reports
+    /// `statusChanged(notJoined, storeReset)`; the object stays usable and
+    /// can pair again (ADR-0032).
+    pub reset: bool,
+    /// An End-to-End Version bump re-seal ran from this version
+    /// (ADR-0034 §1): every queued entry re-sealed, `Sync` included.
+    pub resealed_from_e2e: Option<u32>,
+}
+
+/// One migration step: migrates Store Version `from` to `from + 1`. Every
+/// step runs in ONE database transaction (ADR-0032 Crash behaviour): a
+/// crash leaves the old store intact and the next open retries. Steps stay
+/// in the code for the whole preview, so a release that skips versions
+/// still migrates through every step.
+pub type Migration = fn(&rusqlite::Transaction<'_>) -> Result<(), rusqlite::Error>;
+
+/// The chained migrations, one entry per Store Version step
+/// (`(from_version, step)`). Empty: Store Version 1 is the first preview
+/// format (ADR-0032). When a step is added it never leaves the code.
+const MIGRATIONS: &[(u32, Migration)] = &[];
+
+/// Meta keys for the store's own versioning (ADR-0032). Both survive group
+/// wipes — they describe the store format, not group state.
+const META_STORE_VERSION: &str = "store_version";
+const META_E2E_VERSION: &str = "e2e_version";
+
+/// Deletes every group-state row. The Store Version keys in `meta` are
+/// preserved; the sequence high-water mark is not (a wiped group never
+/// re-uses a sequence number — and a wiped store starts at none).
+const WIPE_DATA_SQL: &str = "
+    DELETE FROM identity;
+    DELETE FROM manifest;
+    DELETE FROM outbox;
+    DELETE FROM handled_messages;
+    DELETE FROM pending_join;
+    DELETE FROM pending_changes;
+    DELETE FROM held_manifests;
+    DELETE FROM leaving;
+    DELETE FROM meta WHERE key NOT IN ('store_version', 'e2e_version');";
+
+fn wipe_tables(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(WIPE_DATA_SQL)
+}
+
+/// Drops every table. The Store Reset uses this — a dev-build store can
+/// predate columns added later, and a reset should produce exactly the
+/// current schema, not a wiped legacy shape.
+const DROP_ALL_SQL: &str = "
+    DROP TABLE IF EXISTS identity;
+    DROP TABLE IF EXISTS manifest;
+    DROP TABLE IF EXISTS outbox;
+    DROP TABLE IF EXISTS handled_messages;
+    DROP TABLE IF EXISTS meta;
+    DROP TABLE IF EXISTS pending_join;
+    DROP TABLE IF EXISTS pending_changes;
+    DROP TABLE IF EXISTS held_manifests;
+    DROP TABLE IF EXISTS leaving;";
+
+/// The schema, created if absent. Plain batch: every statement is
+/// idempotent (`IF NOT EXISTS`), so a crash anywhere leaves a consistent
+/// next open.
+fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS identity (
+             id      INTEGER PRIMARY KEY CHECK (id = 1),
+             noise_secret  BLOB NOT NULL,
+             signing_secret BLOB NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS manifest (
+             id      INTEGER PRIMARY KEY CHECK (id = 1),
+             data    BLOB NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS outbox (
+             object_id  BLOB    NOT NULL,
+             sequence   INTEGER NOT NULL,
+             blob       BLOB    NOT NULL,
+             delivered  INTEGER NOT NULL DEFAULT 0,
+             kind       INTEGER NOT NULL DEFAULT 0,
+             created_at INTEGER NOT NULL DEFAULT 0,
+             UNIQUE(object_id, sequence) ON CONFLICT IGNORE
+         );
+         -- Handled Message IDs kept for the dedup retention window
+         -- (ADR-0026). The library drops re-deliveries itself.
+         CREATE TABLE IF NOT EXISTS handled_messages (
+             message_id TEXT PRIMARY KEY,
+             handled_at INTEGER NOT NULL
+         );
+         -- Singleton metadata. `seq_high_water`: the highest sequence
+         -- ever consumed — survives deletion of delivered outbox rows,
+         -- so a restart never re-uses a sequence number (ADR-0026).
+         -- `store_version` / `e2e_version`: what wrote this store
+         -- (ADR-0032); both survive group wipes.
+         CREATE TABLE IF NOT EXISTS meta (
+             key   TEXT PRIMARY KEY,
+             value INTEGER NOT NULL
+         );
+         -- The Pending Join (ADR-0023): the joiner's durable record that
+         -- it asked to join via a specific Pairing Token. Singleton row;
+         -- the opaque record encodes initiator keys and the Pairing
+         -- Secret. Survives restarts; cleared on admission, cancelJoin
+         -- and wipe.
+         CREATE TABLE IF NOT EXISTS pending_join (
+             id      INTEGER PRIMARY KEY CHECK (id = 1),
+             data    BLOB NOT NULL
+         );
+         -- The Pending Membership Change set (ADR-0027): singleton
+         -- blob, session-owned encoding. Replaced wholesale on every
+         -- membership commit; survives restarts so an offline issuer
+         -- re-applies after reconnecting.
+         CREATE TABLE IF NOT EXISTS pending_changes (
+             id      INTEGER PRIMARY KEY CHECK (id = 1),
+             data    BLOB NOT NULL
+         );
+         -- Held-manifest history (ADR-0027): every manifest this
+         -- device installed, with whether it included the device. The
+         -- deliberate-removal test: an excluding manifest counts only
+         -- when its parent is a held manifest that included the device.
+         CREATE TABLE IF NOT EXISTS held_manifests (
+             hash          BLOB PRIMARY KEY,
+             included_self INTEGER NOT NULL
+         );
+         -- The Leaving record (ADR-0027): the outbox refs the Leave
+         -- waits on before the wipe. Survives restarts — a crash in
+         -- Leaving resumes Leaving.
+         CREATE TABLE IF NOT EXISTS leaving (
+             id      INTEGER PRIMARY KEY CHECK (id = 1),
+             data    BLOB NOT NULL
+         );",
+    )
+}
+
+fn table_exists(conn: &rusqlite::Connection, name: &str) -> Result<bool, rusqlite::Error> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn any_table_exists(conn: &rusqlite::Connection) -> Result<bool, rusqlite::Error> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? != 0)
+}
+
+fn meta_get(conn: &rusqlite::Connection, key: &str) -> Result<Option<i64>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+    if !table_exists(conn, "meta")? {
+        return Ok(None);
+    }
+    conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |row| {
+        row.get::<_, i64>(0)
+    })
+    .optional()
+}
+
+fn meta_set(conn: &rusqlite::Connection, key: &str, value: u32) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value as i64],
+    )?;
+    Ok(())
+}
+
+/// Run the chained migration steps from `from` up to `target`, ONE
+/// transaction per step, bumping the recorded Store Version inside the
+/// step's own transaction (ADR-0032 Crash behaviour): a crash mid-step
+/// rolls the step back — the old store is intact and the next open
+/// retries; a crash between steps leaves a valid intermediate store the
+/// next open resumes from. A step that fails outright rolls back and
+/// raises `storage`.
+fn run_migrations(
+    conn: &mut rusqlite::Connection,
+    from: u32,
+    target: u32,
+    steps: &[(u32, Migration)],
+) -> Result<(), StoreError> {
+    let mut v = from;
+    while v < target {
+        let step = steps
+            .iter()
+            .find(|(step_from, _)| *step_from == v)
+            .map(|(_, step)| *step)
+            .ok_or_else(|| StoreError::MigrationFailed {
+                from: v,
+                msg: format!("no migration path from store version {v} to {target}"),
+            })?;
+        let fail = |e: rusqlite::Error| StoreError::MigrationFailed {
+            from: v,
+            msg: e.to_string(),
+        };
+        let tx = conn.transaction().map_err(fail)?;
+        step(&tx).map_err(fail)?;
+        meta_set(&tx, META_STORE_VERSION, v + 1).map_err(fail)?;
+        tx.commit().map_err(fail)?;
+        v += 1;
+    }
+    Ok(())
+}
+
+/// Re-seal every queued outbox entry for an End-to-End Version bump, in one
+/// transaction (ADR-0034 §1; ADR-0032's crash table applies: a crash leaves
+/// every entry at the old version or every entry at the new one).
+///
+/// What \"re-seal\" means per entry kind, given this build seals Envelopes at
+/// push time from the stored body/message:
+///
+/// - **`Sync`** entries store the application body; the Envelope is sealed at
+///   every push under the current version, stamped at `created_at` — the
+///   `send()` time (ADR-0034 §2). The bump needs no row change: the next
+///   push seals under the new version and the original Sender Timestamp
+///   (and therefore the Message ID and the dedup guarantee) survives.
+/// - **Pair** and **Revoke** carry no inner signature; their Envelope is
+///   sealed at push. No row change.
+/// - **Group Manifest** entries carry the issuer's signature over a domain
+///   that includes the End-to-End Version (ADR-0022), so a queued manifest
+///   must be RE-SIGNED under the new version or upgraded peers reject it.
+///   Re-signing changes the manifest hash, so the old→new remap propagates
+///   to later queued manifests' `parent` links, to the stored current
+///   manifest (only when it is itself one of the re-signed queued
+///   issuances — a delivered manifest's bytes stay, because peers hold
+///   them), and to the held-manifest history rows. Ed25519 is
+///   deterministic, so the stored copy re-signs to identical bytes.
+///
+/// Only UNDELIVERED rows are re-signed: a delivered row's hash may already
+/// be installed at peers. (A crash between relay-accept and the delivered
+/// flag can leave an accepted row flagged undelivered; re-signing it costs
+/// a duplicate-hash race the (version, hash) tie-break and the issuer's
+/// bounded re-application converge — accepted edge.)
+///
+/// Pending Membership Change carriers are deliberately NOT remapped: their
+/// encoding is session-owned, and a stale carrier costs at worst one
+/// redundant re-application (bounded, ADR-0027) in a window peers cannot
+/// actually produce — they never saw the pre-bump hash of an undelivered
+/// manifest.
+fn reseal_outbox_for_e2e_bump(
+    conn: &mut rusqlite::Connection,
+    to_e2e: u32,
+) -> Result<usize, StoreError> {
+    let tx = conn.transaction()?;
+    let resealed = reseal_outbox_rows(&tx, to_e2e)?;
+    meta_set(&tx, META_E2E_VERSION, to_e2e)?;
+    tx.commit()?;
+    Ok(resealed)
+}
+
+fn reseal_outbox_rows(conn: &rusqlite::Connection, to_e2e: u32) -> Result<usize, StoreError> {
+    use crate::message::Message;
+    use std::collections::HashMap;
+
+    let signing_key: Option<ed25519_dalek::SigningKey> = {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT signing_secret FROM identity WHERE id = 1",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
+        .map(|bytes| ed25519_dalek::SigningKey::from_bytes(&bytes))
+    };
+
+    // Snapshot the queued control rows in sequence order.
+    let mut stmt = conn.prepare(
+        "SELECT object_id, sequence, blob FROM outbox
+         WHERE delivered = 0 AND kind = ?1 ORDER BY sequence ASC",
+    )?;
+    let rows: Vec<(Vec<u8>, i64, Vec<u8>)> = stmt
+        .query_map([KIND_CONTROL], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<Result<_, rusqlite::Error>>()?;
+
+    // old manifest hash → (new hash, new encoded Message bytes)
+    let mut remap: HashMap<[u8; 32], ([u8; 32], Vec<u8>)> = HashMap::new();
+    let mut resealed = 0usize;
+    for (oid, seq, blob) in &rows {
+        let msg = match Message::decode(blob) {
+            Ok(m) => m,
+            // Not decodable: the pump already fails such a row permanently
+            // (sendFailed malformed). Not this migration's problem.
+            Err(_) => continue,
+        };
+        let Message::GroupManifest { manifest } = msg else {
+            continue;
+        };
+        let Some(key) = &signing_key else {
+            // Queued manifests without an identity cannot exist through any
+            // code path; skip defensively rather than fail the open.
+            continue;
+        };
+        let old_hash = manifest.hash();
+        if remap.contains_key(&old_hash) {
+            continue;
+        }
+        let parent = manifest
+            .parent
+            .map(|p| remap.get(&p).map(|(h, _)| *h).unwrap_or(p));
+        let re = manifest
+            .resign_for_version(parent, to_e2e, key)
+            .map_err(|e| StoreError::ResealFailed(e.to_string()))?;
+        let new_hash = re.hash();
+        let new_bytes = Message::GroupManifest { manifest: re }.encode();
+        conn.execute(
+            "UPDATE outbox SET blob = ?3 WHERE object_id = ?1 AND sequence = ?2",
+            rusqlite::params![oid, seq, new_bytes],
+        )?;
+        remap.insert(old_hash, (new_hash, new_bytes));
+        resealed += 1;
+    }
+
+    if remap.is_empty() {
+        return Ok(0);
+    }
+
+    // The stored current manifest: re-write it only when it is one of the
+    // re-signed queued issuances (issued offline, never accepted). Ed25519
+    // is deterministic, so the queued re-sign's bytes are exactly right.
+    {
+        use rusqlite::OptionalExtension;
+        let stored: Option<Vec<u8>> = conn
+            .query_row("SELECT data FROM manifest WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if let Some(data) = stored {
+            if let Ok(m) = crate::manifest::GroupManifest::decode(&data) {
+                if let Some((_, new_bytes)) = remap.get(&m.hash()) {
+                    // new_bytes is the encoded Message; the manifest table
+                    // stores the bare manifest encoding.
+                    if let Message::GroupManifest { manifest } =
+                        Message::decode(new_bytes).map_err(|e| {
+                            StoreError::ResealFailed(format!("re-decode: {e}"))
+                        })?
+                    {
+                        conn.execute(
+                            "INSERT INTO manifest (id, data) VALUES (1, ?1)
+                             ON CONFLICT(id) DO UPDATE SET data = excluded.data",
+                            rusqlite::params![manifest.encode()],
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    // Held-manifest history: move rows onto the new hashes, preserving
+    // included_self.
+    for (old_hash, (new_hash, _)) in &remap {
+        use rusqlite::OptionalExtension;
+        let included: Option<i64> = conn
+            .query_row(
+                "SELECT included_self FROM held_manifests WHERE hash = ?1",
+                rusqlite::params![old_hash.as_slice()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(included) = included {
+            conn.execute(
+                "DELETE FROM held_manifests WHERE hash = ?1",
+                rusqlite::params![old_hash.as_slice()],
+            )?;
+            conn.execute(
+                "INSERT OR REPLACE INTO held_manifests (hash, included_self) VALUES (?1, ?2)",
+                rusqlite::params![new_hash.as_slice(), included],
+            )?;
+        }
+    }
+
+    Ok(resealed)
 }
 
 /// Persistent local state for a single trueseal-sync session.
@@ -47,107 +447,143 @@ impl Store {
     /// Open (or create) the database for `namespace` under `base_dir`.
     ///
     /// Idempotent: calling twice with the same args returns equivalent stores.
-    /// Runs all schema migrations in a single transaction on first open.
+    /// Runs the version check, any chained migrations, a Store Reset when the
+    /// store is unmigratable, and the End-to-End bump re-seal (ADR-0032,
+    /// ADR-0034 §1). Discards the outcome; callers that must react to a
+    /// Store Reset or a migration use [`Store::open_with_outcome`].
     pub fn open(base_dir: &Path, namespace: &str) -> Result<Self, StoreError> {
-        let path = base_dir.join(format!("trueseal_{}.db", namespace));
-        let conn = rusqlite::Connection::open(path)?;
+        Self::open_with_outcome(base_dir, namespace).map(|(store, _)| store)
+    }
 
-        // WAL mode for better concurrent read performance
+    /// [`Store::open`] that also reports what the open did (ADR-0032).
+    pub fn open_with_outcome(
+        base_dir: &Path,
+        namespace: &str,
+    ) -> Result<(Self, OpenOutcome), StoreError> {
+        Self::open_inner(
+            base_dir,
+            namespace,
+            crate::version::STORE_VERSION,
+            crate::version::END_TO_END_VERSION,
+            MIGRATIONS,
+        )
+    }
+
+    /// The open state machine (ADR-0032):
+    ///
+    /// 1. **Probe read-only.** The Store Version decides before any byte is
+    ///    written — a store we refuse (`storeTooNew`) keeps its exact bytes,
+    ///    so rolling forward again loses nothing.
+    /// 2. **Fresh**: no tables — create the schema and record Store Version
+    ///    and the End-to-End Version.
+    /// 3. **Unversioned or below the migration floor** (any development-build
+    ///    store): automatic Store Reset — wipe every table and record the
+    ///    versions, in one transaction. A crash mid-wipe rolls back, so the
+    ///    store is still unmigratable and the reset simply runs again.
+    /// 4. **Older but migratable**: run the chained migration steps, each in
+    ///    its own transaction.
+    /// 5. **End-to-End Version bump** (independent of Store Version): re-seal
+    ///    every queued outbox entry in one transaction (ADR-0034 §1).
+    fn open_inner(
+        base_dir: &Path,
+        namespace: &str,
+        target_store_version: u32,
+        current_e2e: u32,
+        migrations: &[(u32, Migration)],
+    ) -> Result<(Self, OpenOutcome), StoreError> {
+        let path = base_dir.join(format!("trueseal_{}.db", namespace));
+        let mut outcome = OpenOutcome::default();
+
+        // ── 1. Read-only probe. Nothing here may write. ────────────────────
+        enum Decision {
+            Fresh,
+            Reset,
+            Migrate(u32),
+            Current,
+        }
+        let decision = if !path.exists() {
+            Decision::Fresh
+        } else {
+            let probe = rusqlite::Connection::open_with_flags(
+                &path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let versioned = table_exists(&probe, "meta")?;
+            let found: Option<u32> = if versioned {
+                // A negative or overflowing stored version is nonsense; read
+                // it as u32::MAX so the store is REFUSED, never reset.
+                meta_get(&probe, META_STORE_VERSION)?
+                    .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+            } else {
+                None
+            };
+            let decision = match found {
+                _ if !versioned && !any_table_exists(&probe)? => Decision::Fresh,
+                None => Decision::Reset, // tables exist but no Store Version: dev-build store
+                Some(v) if v > target_store_version => {
+                    // Refused. The probe wrote nothing; return before the
+                    // read-write open so the file's bytes are untouched.
+                    return Err(StoreError::StoreTooNew {
+                        found: v,
+                        supported: target_store_version,
+                    });
+                }
+                Some(v) if v < crate::version::STORE_MIGRATION_FLOOR => Decision::Reset,
+                Some(v) if v < target_store_version => Decision::Migrate(v),
+                Some(_) => Decision::Current,
+            };
+            decision
+        };
+
+        // ── 2. Read-write open; every change below is transactional. ───────
+        let mut conn = rusqlite::Connection::open(&path)?;
         conn.execute_batch("PRAGMA journal_mode=WAL;")?;
 
-        // Schema — all in one transaction
-        conn.execute_batch(
-            "BEGIN;
-             CREATE TABLE IF NOT EXISTS identity (
-                 id      INTEGER PRIMARY KEY CHECK (id = 1),
-                 noise_secret  BLOB NOT NULL,
-                 signing_secret BLOB NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS manifest (
-                 id      INTEGER PRIMARY KEY CHECK (id = 1),
-                 data    BLOB NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS outbox (
-                 object_id  BLOB    NOT NULL,
-                 sequence   INTEGER NOT NULL,
-                 blob       BLOB    NOT NULL,
-                 delivered  INTEGER NOT NULL DEFAULT 0,
-                 kind       INTEGER NOT NULL DEFAULT 0,
-                 created_at INTEGER NOT NULL DEFAULT 0,
-                 UNIQUE(object_id, sequence) ON CONFLICT IGNORE
-             );
-             -- Handled Message IDs kept for the dedup retention window
-             -- (ADR-0026). The library drops re-deliveries itself.
-             CREATE TABLE IF NOT EXISTS handled_messages (
-                 message_id TEXT PRIMARY KEY,
-                 handled_at INTEGER NOT NULL
-             );
-             -- Singleton metadata. `seq_high_water`: the highest sequence
-             -- ever consumed — survives deletion of delivered outbox rows,
-             -- so a restart never re-uses a sequence number (ADR-0026).
-             CREATE TABLE IF NOT EXISTS meta (
-                 key   TEXT PRIMARY KEY,
-                 value INTEGER NOT NULL
-             );
-             -- The Pending Join (ADR-0023): the joiner's durable record that
-             -- it asked to join via a specific Pairing Token. Singleton row;
-             -- the opaque record encodes initiator keys and the Pairing
-             -- Secret. Survives restarts; cleared on admission, cancelJoin
-             -- and wipe.
-             CREATE TABLE IF NOT EXISTS pending_join (
-                 id      INTEGER PRIMARY KEY CHECK (id = 1),
-                 data    BLOB NOT NULL
-             );
-             -- The Pending Membership Change set (ADR-0027): singleton
-             -- blob, session-owned encoding. Replaced wholesale on every
-             -- membership commit; survives restarts so an offline issuer
-             -- re-applies after reconnecting.
-             CREATE TABLE IF NOT EXISTS pending_changes (
-                 id      INTEGER PRIMARY KEY CHECK (id = 1),
-                 data    BLOB NOT NULL
-             );
-             -- Held-manifest history (ADR-0027): every manifest this
-             -- device installed, with whether it included the device. The
-             -- deliberate-removal test: an excluding manifest counts only
-             -- when its parent is a held manifest that included the device.
-             CREATE TABLE IF NOT EXISTS held_manifests (
-                 hash          BLOB PRIMARY KEY,
-                 included_self INTEGER NOT NULL
-             );
-             -- The Leaving record (ADR-0027): the outbox refs the Leave
-             -- waits on before the wipe. Survives restarts — a crash in
-             -- Leaving resumes Leaving.
-             CREATE TABLE IF NOT EXISTS leaving (
-                 id      INTEGER PRIMARY KEY CHECK (id = 1),
-                 data    BLOB NOT NULL
-             );
-             COMMIT;",
-        )?;
+        // Schema — created if absent. Runs before the reset wipe so the
+        // DELETEs below always have their tables (a dev-build store may
+        // predate tables added later).
+        ensure_schema(&conn)?;
 
-        // Dev-preview schema drift, handled without migration machinery
-        // (Store Versions and chained migrations are SYNC-13 scope): stores
-        // written by builds from before SYNC-5 have an outbox table without
-        // `kind`/`created_at`. Add the columns; rows they contain are all
-        // application `Sync` bodies, and their real queue time is unknown,
-        // so they get a fresh 30-day lease stamped at this open rather than
-        // an instant expiry.
-        let has_kind: bool = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('outbox') WHERE name = 'kind'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        if !has_kind {
-            conn.execute_batch(
-                "ALTER TABLE outbox ADD COLUMN kind INTEGER NOT NULL DEFAULT 0;
-                 ALTER TABLE outbox ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;",
-            )?;
-            conn.execute(
-                "UPDATE outbox SET created_at = ?1 WHERE created_at = 0",
-                rusqlite::params![now_secs() as i64],
-            )?;
+        match decision {
+            Decision::Fresh => {
+                outcome.created = true;
+                let tx = conn.transaction()?;
+                meta_set(&tx, META_STORE_VERSION, target_store_version)?;
+                meta_set(&tx, META_E2E_VERSION, current_e2e)?;
+                tx.commit()?;
+            }
+            Decision::Reset => {
+                // Automatic Store Reset (ADR-0032): wipe every table and
+                // record the versions, atomically. The session layer
+                // regenerates the identity on the next load and reports
+                // `storeReset`.
+                outcome.reset = true;
+                let tx = conn.transaction()?;
+                // Drop + recreate: the reset produces exactly the current
+                // schema even when the old store predates later columns.
+                tx.execute_batch(DROP_ALL_SQL)?;
+                ensure_schema(&tx)?;
+                meta_set(&tx, META_STORE_VERSION, target_store_version)?;
+                meta_set(&tx, META_E2E_VERSION, current_e2e)?;
+                tx.commit()?;
+            }
+            Decision::Migrate(from) => {
+                outcome.migrated_from = Some(from);
+                run_migrations(&mut conn, from, target_store_version, migrations)?;
+            }
+            Decision::Current => {}
         }
 
-        Ok(Self { conn })
+        // ── 5. End-to-End Version bump: re-seal the outbox (ADR-0034 §1). ──
+        let stored_e2e = meta_get(&conn, META_E2E_VERSION)?
+            .map(|v| u32::try_from(v).unwrap_or(current_e2e))
+            .unwrap_or(current_e2e);
+        if stored_e2e < current_e2e {
+            outcome.resealed_from_e2e = Some(stored_e2e);
+            reseal_outbox_for_e2e_bump(&mut conn, current_e2e)?;
+        }
+
+        Ok((Self { conn }, outcome))
     }
 
     /// Wipe all data from all tables.
@@ -157,19 +593,13 @@ impl Store {
     /// Destroy Group every device starts over with a fresh identity, so no
     /// Message ID or sequence from the old group may carry over.
     pub fn wipe(&self) -> Result<(), StoreError> {
-        self.conn.execute_batch(
-            "BEGIN;
-             DELETE FROM identity;
-             DELETE FROM manifest;
-             DELETE FROM outbox;
-             DELETE FROM handled_messages;
-             DELETE FROM meta;
-             DELETE FROM pending_join;
-             DELETE FROM pending_changes;
-             DELETE FROM held_manifests;
-             DELETE FROM leaving;
-             COMMIT;",
-        )?;
+        // Destroy Group / removal wipe group data but keep the store
+        // versioned: the Store Version keys survive (they describe the
+        // format, not the group). Everything else, the dedup table and the
+        // sequence high-water mark included, goes.
+        self.conn.execute_batch(&format!(
+            "BEGIN; {WIPE_DATA_SQL} COMMIT;"
+        ))?;
         Ok(())
     }
 
@@ -1098,7 +1528,14 @@ mod tests {
     /// meta tables exist. Store Versions and chained migrations are SYNC-13
     /// scope; this is the dev-preview drift bridge.
     #[test]
-    fn legacy_outbox_schema_is_upgraded_on_open() {
+    /// ADR-0032: an UNVERSIONED store — anything a development build wrote
+    /// before Store Versions existed, including the pre-SYNC-5 outbox
+    /// schema — is unmigratable. Open resets it automatically: every table
+    /// wiped, Store Version recorded, the store usable again (the object
+    /// reports `storeReset` and can pair again). Before SYNC-13 this test
+    /// expected an ad-hoc in-place schema upgrade; the versioned world
+    /// replaces that with the reset.
+    fn legacy_unversioned_store_is_reset_on_open() {
         let dir = tmp_dir();
         let path = dir.path().join("trueseal_ns.db");
         {
@@ -1116,23 +1553,23 @@ mod tests {
             )
             .expect("legacy schema");
         }
-        let before = now_secs();
-        let s = Store::open(dir.path(), "ns").expect("open upgrades schema");
+        let (s, outcome) = Store::open_with_outcome(dir.path(), "ns").expect("open resets");
+        assert!(outcome.reset, "unversioned store → automatic Store Reset");
+        assert!(!outcome.created);
         let log = PersistentLog::new(s);
-        let entries = log.undelivered_entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].kind, OutboxKind::Sync, "legacy rows are Sync");
-        assert_eq!(entries[0].blob, vec![0xAA, 0xBB]);
         assert!(
-            entries[0].created_at >= before,
-            "legacy rows get a fresh lease, not an instant expiry"
+            log.undelivered_entries().is_empty(),
+            "the reset wiped the legacy rows"
         );
-        // Dedup and meta tables exist and work.
+        // The store is fully usable: schema complete, versioned, working.
         let mut log = log;
         log.record_handled("tsm1_x", now_secs());
         assert!(log.is_handled("tsm1_x"));
         log.record_sequence(5);
         assert_eq!(log.max_sequence(), Some(5));
+        // A second open sees a current, versioned store.
+        let (_s2, outcome2) = Store::open_with_outcome(dir.path(), "ns").expect("reopen");
+        assert_eq!(outcome2, OpenOutcome::default(), "reopen: nothing to do");
     }
 
     /// ADR-0023 crash point: after begin_pending_join commits, a restart
