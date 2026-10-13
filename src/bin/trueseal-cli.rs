@@ -51,6 +51,12 @@ impl<T: Read + Write + Send> Read for SlowStream<T> {
         self.inner.read(&mut buf[..n])
     }
 }
+impl trueseal_sync::relay::Severable for SlowStream<TcpStream> {
+    fn sever_handle(&self) -> std::sync::Arc<dyn Fn() + Send + Sync> {
+        self.inner.sever_handle()
+    }
+}
+
 impl<T: Read + Write + Send> Write for SlowStream<T> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         std::thread::sleep(std::time::Duration::from_micros(self.delay_us));
@@ -247,11 +253,17 @@ fn main() {
         },
         None, // reconnect_cap: use default (30s)
         // on_connection_changed
-        Some(Box::new(|connected| {
-            if connected {
-                println!("\n[relay: connected]");
-            } else {
-                println!("\n[relay: disconnected]");
+        Some(Box::new(|change| {
+            match change {
+                trueseal_sync::session::ConnectionChange::Connected => {
+                    println!("\n[relay: connected]");
+                }
+                trueseal_sync::session::ConnectionChange::Disconnected => {
+                    println!("\n[relay: disconnected]");
+                }
+                trueseal_sync::session::ConnectionChange::RelayVersionUnsupported { min, max } => {
+                    println!("\n[relay: unsupported transport version (supports {min}..={max})]");
+                }
             }
             print!("> ");
             io::stdout().flush().ok();
@@ -339,7 +351,7 @@ fn main() {
                     continue;
                 }
                 match session.push_sync(rest.as_bytes().to_vec()) {
-                    Ok(()) => println!("sent"),
+                    Ok(mid) => println!("sent (message id {})", mid),
                     Err(e) => println!("error: {}", e),
                 }
             }

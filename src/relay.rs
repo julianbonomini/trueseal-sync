@@ -115,6 +115,30 @@ pub(crate) fn parse(raw: &[u8]) -> Option<(MsgType, &[u8])> {
 /// A pre-encoded framed push message, ready to send over the Noise session.
 type PushBytes = Vec<u8>;
 
+/// A transport that can be severed from outside a blocked read (SYNC-15,
+/// ADR-0028 `close()`): after the sever handle runs, in-flight and future
+/// reads return EOF or an error, so a receive thread parked in WouldBlock
+/// retry exits instead of leaking for the process lifetime. Implemented by
+/// `TcpStream` (shutdown) and by the in-memory test pipes.
+pub trait Severable: Read + Write + Send + 'static {
+    /// A handle that severs the transport. Safe to call from any thread,
+    /// any number of times, and must not block.
+    fn sever_handle(&self) -> Arc<dyn Fn() + Send + Sync>;
+}
+
+impl Severable for std::net::TcpStream {
+    fn sever_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+        match self.try_clone() {
+            Ok(twin) => Arc::new(move || {
+                let _ = twin.shutdown(std::net::Shutdown::Both);
+            }),
+            // A stream we cannot clone cannot be severed from outside; the
+            // noise session's closed flag still gates new sends/receives.
+            Err(_) => Arc::new(|| {}),
+        }
+    }
+}
+
 /// Client-side connection to a trueseal-relay server.
 /// Transport-generic: uses any Read+Write+Send stream (TCP in production,
 /// in-memory pipes in tests).
@@ -122,7 +146,7 @@ type PushBytes = Vec<u8>;
 /// Push operations are sent via a channel to the run() thread, which owns
 /// the Session exclusively. This prevents the send/receive deadlock that
 /// would occur if both operations shared the same Noise session mutex.
-pub struct RelayClient<T: Read + Write + Send + 'static> {
+pub struct RelayClient<T: Severable> {
     /// Channel for sending pre-encoded push frames to the run thread.
     push_tx: mpsc::SyncSender<PushBytes>,
     /// Callbacks receive the decoded Message and the sender's signing public key ([u8;32]).
@@ -132,10 +156,33 @@ pub struct RelayClient<T: Read + Write + Send + 'static> {
     issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>>,
     /// True while the background run loop is alive; set to false when relay disconnects.
     is_connected: Arc<AtomicBool>,
+    /// Handle to the receive-side Noise Session, so `close()` (and Drop) can
+    /// fail NEW sends/receives fast. The closed flag is only checked at
+    /// send/receive ENTRY — interrupting a receive parked in WouldBlock
+    /// retry is the sever handle's job (below). `None` for the
+    /// disconnected stub.
+    session: Option<Arc<Session<T>>>,
+    /// Severs the transport under a receive parked in WouldBlock retry
+    /// (SYNC-15): the noise closed flag alone is only checked at
+    /// send/receive ENTRY, so without this a dropped client left its
+    /// receive thread parked on the socket forever (B7b/B12b review
+    /// notes). No-op for the disconnected stub.
+    sever: Arc<dyn Fn() + Send + Sync>,
     _transport: PhantomData<T>,
 }
 
-impl<T: Read + Write + Send + 'static> RelayClient<T> {
+impl<T: Severable> Drop for RelayClient<T> {
+    /// Dropping the client severs the receive side: the transport EOF
+    /// unblocks its receive thread (the noise closed flag is only checked
+    /// at receive entry), and dropping `push_tx` ends the send thread.
+    /// This is also what finally reaps the OLD client after an identity
+    /// rotation swaps in the disconnected stub.
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+impl<T: Severable> RelayClient<T> {
     /// Perform the Transport Version exchange, then a Noise XX handshake over
     /// `transport`, and verify the relay's identity.
     ///
@@ -197,6 +244,7 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         first_issue_callback: Option<Box<dyn Fn(DeliveryIssue) + Send + 'static>>,
     ) -> Result<Self, RelayError> {
         let my_noise_priv = my_keypair.private();
+        let sever = transport.sever_handle();
         let mut transport = transport;
         let prologue = version::exchange_transport_version(&mut transport)?;
         let session =
@@ -227,9 +275,13 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
         let is_connected_clone = is_connected.clone();
 
         // run() thread owns the Session exclusively — no shared lock needed.
+        // The client keeps an Arc handle so `close()` can interrupt the
+        // receive thread from the outside.
+        let session = Arc::new(session);
+        let session_for_loop = session.clone();
         std::thread::spawn(move || {
             run_loop(
-                session,
+                session_for_loop,
                 push_rx,
                 callbacks_clone,
                 issue_callbacks_clone,
@@ -243,6 +295,8 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
             callbacks,
             issue_callbacks,
             is_connected,
+            session: Some(session),
+            sever,
             _transport: PhantomData,
         })
     }
@@ -311,7 +365,27 @@ impl<T: Read + Write + Send + 'static> RelayClient<T> {
             callbacks: Arc::new(Mutex::new(Vec::new())),
             issue_callbacks: Arc::new(Mutex::new(Vec::new())),
             is_connected: Arc::new(AtomicBool::new(false)),
+            session: None,
+            sever: Arc::new(|| {}),
             _transport: PhantomData,
+        }
+    }
+
+    /// Interrupt the receive side: severing the transport makes a receive
+    /// parked in WouldBlock retry return EOF (the noise session's closed
+    /// flag is only checked at send/receive ENTRY, so the flag alone would
+    /// leave the thread parked). The run loop and its receive thread exit,
+    /// and `is_connected` flips to false via the DisconnectGuard. The send thread ends when the client (and its
+    /// `push_tx`) drops. Idempotent; a no-op on the disconnected stub.
+    ///
+    /// Does NOT wait for thread exit — the run loop winds down within one
+    /// WouldBlock retry cycle of the transport.
+    pub fn close(&self) {
+        // Sever first: the parked receive EOFs and its thread exits, then
+        // the run loop follows and the DisconnectGuard marks the link down.
+        (self.sever)();
+        if let Some(session) = &self.session {
+            let _ = session.close();
         }
     }
 }
@@ -375,8 +449,8 @@ impl Drop for DisconnectGuard {
 
 /// The actual event loop: runs in a dedicated thread that owns the Session.
 /// Interleaves push sends (from the channel) with receive processing.
-fn run_loop<T: Read + Write + Send + 'static>(
-    session: Session<T>,
+fn run_loop<T: Severable>(
+    session: Arc<Session<T>>,
     push_rx: mpsc::Receiver<PushBytes>,
     callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64, u64) + Send + 'static>>>>,
     issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>>,
@@ -404,7 +478,6 @@ fn run_loop<T: Read + Write + Send + 'static>(
     // receive() with a non-blocking receive attempt. Since trueseal-noise doesn't
     // support non-blocking receives, we use a dedicated send thread.
 
-    let session = Arc::new(session);
     let session_for_recv = session.clone();
     let session_for_send = session.clone();
 
@@ -714,6 +787,15 @@ mod tests {
             // the client.)
             self.peer_closed
                 .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    impl super::Severable for MemPipe {
+        /// Severing a MemPipe makes THIS end read EOF, like a socket
+        /// shutdown — a parked receive thread exits instead of leaking.
+        fn sever_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+            let closed = self.closed.clone();
+            Arc::new(move || closed.store(true, std::sync::atomic::Ordering::Release))
         }
     }
 

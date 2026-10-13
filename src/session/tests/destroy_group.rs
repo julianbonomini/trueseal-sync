@@ -354,7 +354,7 @@ fn destroy_completion_wipes_store_and_persists_fresh_identity() {
         move || {
             *dc.lock().unwrap() += 1;
         },
-        move |fresh: DeviceKeypair| {
+        move |fresh: DeviceKeypair, _reason: crate::session::ExitReason| {
             let store = rotate_store.lock().unwrap();
             let _ = store.wipe();
             let _ = store.save_keypair(&fresh);

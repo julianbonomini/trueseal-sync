@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -20,7 +19,7 @@ use super::{
 /// Polls for relay disconnect, backs off, reconnects, and replays the outbox.
 /// Runs in a background thread spawned by `connect_with_reconnect`.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
+pub(super) fn reconnect_loop<T: crate::relay::Severable>(
     client: Arc<Mutex<RelayClient<T>>>,
     op_log: Arc<Mutex<Box<dyn OperationLog>>>,
     relay_pub: NoisePublicKey,
@@ -40,22 +39,27 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
     sequence: Arc<Mutex<u64>>,
     pending_changes: Arc<Mutex<Vec<PendingChange>>>,
     leaving: Arc<Mutex<Option<LeavingRecord>>>,
-    on_identity_rotated: Arc<dyn Fn(crate::device::DeviceKeypair) + Send + Sync + 'static>,
+    on_identity_rotated: Arc<
+        dyn Fn(crate::device::DeviceKeypair, super::ExitReason) + Send + Sync + 'static,
+    >,
     rotation_pending: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,
     cap: Duration,
-    on_connection_changed: Arc<dyn Fn(bool) + Send + Sync + 'static>,
+    on_connection_changed: Arc<dyn Fn(super::ConnectionChange) + Send + Sync + 'static>,
 ) {
     let mut backoff = cap.min(Duration::from_secs(1));
     let mut was_connected = false; // track last-known state to detect transitions
                                    // ADR-0029: a Destroying device STAYS connected (its Revokes must reach
-                                   // the Relay) — the loop no longer exits on Destroy Group. In fact it
-                                   // has no exit condition at all: the thread runs until the process
-                                   // ends, keeping post-destroy connectivity so the device can pair again
-                                   // with its fresh identity (the same pump/reconnect threads also outlive
-                                   // Leave and Soft Removal wipes for the same reason). A formal shutdown
-                                   // signal (join on close()) is SYNC-15 (#107) scope.
+                                   // the Relay) — the loop does not exit on Destroy Group, Leave or
+                                   // Soft Removal: the device keeps connectivity so it can pair again
+                                   // with its fresh identity. The ONE exit condition is `close()`
+                                   // (SYNC-15, #107): the shutdown flag ends the loop, and the FFI
+                                   // reports `closed` for every later call.
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         std::thread::sleep(Duration::from_millis(50));
         let connected = client
             .lock()
@@ -65,7 +69,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             backoff = Duration::from_secs(1);
             if !was_connected {
                 was_connected = true;
-                (on_connection_changed)(true);
+                (on_connection_changed)(super::ConnectionChange::Connected);
             }
             continue;
         }
@@ -73,10 +77,20 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
         // Transition: was connected, now disconnected.
         if was_connected {
             was_connected = false;
-            (on_connection_changed)(false);
+            (on_connection_changed)(super::ConnectionChange::Disconnected);
         }
 
-        std::thread::sleep(backoff);
+        // Interruptible backoff: sleep in 50 ms slices so `close()` exits
+        // this thread promptly instead of up to `cap` (30 s) later.
+        let mut remaining = backoff;
+        while remaining > Duration::ZERO {
+            if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            let slice = remaining.min(Duration::from_millis(50));
+            std::thread::sleep(slice);
+            remaining -= slice;
+        }
         backoff = (backoff * 2).min(cap);
 
         let transport = match (factory)() {
@@ -113,6 +127,7 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             leaving.clone(),
             on_identity_rotated.clone(),
             rotation_pending.clone(),
+            shutdown.clone(),
             on_message.clone(),
         );
         // SYNC-5: receive-path Delivery Issues forward into the session sink
@@ -134,17 +149,32 @@ pub(super) fn reconnect_loop<T: Read + Write + Send + 'static>(
             Err(crate::relay::RelayError::RelayVersionUnsupported { min, max }) => {
                 // The relay refuses our Transport Version (ADR-0022). Keep
                 // retrying — the relay may be upgraded — and leave every
-                // outbox entry queued.
+                // outbox entry queued. Surface it as the
+                // `relayVersionUnsupported{min,max}` connection state
+                // (ADR-0028), not a bare log line.
                 log::warn!(
                     "relay supports Transport Version {min}..={max}, \
                      this build speaks {}; outbox stays queued",
                     crate::version::TRANSPORT_VERSION
                 );
+                (on_connection_changed)(super::ConnectionChange::RelayVersionUnsupported {
+                    min,
+                    max,
+                });
                 continue;
             }
             Err(_) => continue,
         };
 
+        // close() may have landed mid-dial (the version exchange retries
+        // WouldBlock up to its deadline — a wide window). If so, do NOT
+        // install the live client: dropping it severs the transport (the
+        // RelayClient Drop), its threads exit, and the relay's session
+        // dies instead of parking forever as a phantom (SYNC-15 gate F1).
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            drop(new_client);
+            return;
+        }
         *client.lock().unwrap_or_else(|e| e.into_inner()) = new_client;
         backoff = Duration::from_secs(1);
 

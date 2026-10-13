@@ -575,7 +575,7 @@ fn removed_member_no_longer_receives_fanout_blobs() {
     let result = session_a.push_sync(b"post-removal".to_vec());
     // Either NotInGroup (self-only treated as no group) or Ok(()) with empty fanout.
     assert!(
-        matches!(result, Ok(()) | Err(super::super::SessionError::NotInGroup)),
+        matches!(result, Ok(_) | Err(super::super::SessionError::NotInGroup)),
         "push_sync after removal must not error unexpectedly, got {:?}",
         result
     );

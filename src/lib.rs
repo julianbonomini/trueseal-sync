@@ -16,6 +16,7 @@ pub mod member;
 pub mod message;
 pub mod operation_log;
 pub mod relay;
+pub mod relay_address;
 pub mod revocation;
 pub mod session;
 pub mod store;

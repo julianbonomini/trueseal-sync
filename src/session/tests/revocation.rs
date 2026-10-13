@@ -77,8 +77,8 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
             },
             nk2.factory(), // NK push via reconnect relay
             Some(Duration::from_millis(50)),
-            Some(Box::new(move |connected| {
-                if connected {
+            Some(Box::new(move |change| {
+                if matches!(change, crate::session::ConnectionChange::Connected) {
                     let (lock, cvar) = &*a_reconnected2;
                     *lock.lock().unwrap() = true;
                     cvar.notify_all();
@@ -113,8 +113,8 @@ fn post_reconnect_destroy_fires_on_group_destroyed() {
             },
             nk2.factory(), // NK push via reconnect relay
             Some(Duration::from_millis(50)),
-            Some(Box::new(move |connected| {
-                if connected {
+            Some(Box::new(move |change| {
+                if matches!(change, crate::session::ConnectionChange::Connected) {
                     let (lock, cvar) = &*b_reconnected2;
                     *lock.lock().unwrap() = true;
                     cvar.notify_all();

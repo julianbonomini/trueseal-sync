@@ -450,7 +450,7 @@ fn destroy_completes_at_construction_and_never_double_wipes() {
         move || {
             *dc.lock().unwrap() += 1;
         },
-        move |fresh| *rt.lock().unwrap() = Some(fresh.public_key()),
+        move |fresh, _reason| *rt.lock().unwrap() = Some(fresh.public_key()),
         || -> Result<MemPipeSimple, String> { Err("offline".into()) },
         || -> Result<MemPipeSimple, String> { Err("offline".into()) },
         Some(Duration::from_millis(50)),
@@ -501,7 +501,7 @@ fn destroy_completes_at_construction_and_never_double_wipes() {
         move || {
             *dc2.lock().unwrap() += 1;
         },
-        |_| {},
+        |_, _| {},
         || -> Result<MemPipeSimple, String> { Err("offline".into()) },
         || -> Result<MemPipeSimple, String> { Err("offline".into()) },
         Some(Duration::from_millis(50)),
@@ -1234,7 +1234,7 @@ fn destroy_partially_drained_restart_resumes_and_completes_once() {
         move || {
             *dc.lock().unwrap() += 1;
         },
-        move |fresh| *rt.lock().unwrap() = Some(fresh.public_key()),
+        move |fresh, _reason| *rt.lock().unwrap() = Some(fresh.public_key()),
         move || {
             ps.lock()
                 .unwrap()

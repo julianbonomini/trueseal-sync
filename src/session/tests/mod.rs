@@ -1,5 +1,6 @@
 mod accept_member;
 mod accept_pair;
+mod close;
 mod connection;
 mod convergence;
 mod delivery_contract;

@@ -7,7 +7,6 @@ mod tests;
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -92,6 +91,11 @@ pub enum SessionError {
     /// anything is issued; the Pairing Window stays open.
     #[error("group is full: maximum {max} members")]
     GroupFull { max: u32 },
+    /// The session was closed (`close()`, ADR-0028): the connection and
+    /// the handlers are stopped, Session State is kept, and every later
+    /// call fails with this. (`closed` in ADR-0028's error list.)
+    #[error("session is closed")]
+    Closed,
 }
 
 /// The Maximum Group Size: 32 members (ADR-0027; `maxGroupSize` in
@@ -437,6 +441,40 @@ pub(super) struct PendingMember {
     pub signing_pub: SigningPublicKey,
 }
 
+/// A relay-link transition (ADR-0028's `connection`, event form). The
+/// steady "never connected yet" state (`connecting`) is the FFI getter's
+/// initial value, not an event: the library connects in the background
+/// from construction, and the first observable transition is `Connected`
+/// or `RelayVersionUnsupported`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionChange {
+    /// The Receive Session is up.
+    Connected,
+    /// The Receive Session dropped; the library reconnects automatically.
+    Disconnected,
+    /// The Relay refused our Transport Version and reported the range it
+    /// supports (ADR-0022). Every outbox entry stays queued and the
+    /// library keeps retrying in case the Relay is upgraded. Surfaced as
+    /// the `relayVersionUnsupported{min,max}` connection state, not an
+    /// error (ADR-0028).
+    RelayVersionUnsupported { min: u32, max: u32 },
+}
+
+/// Why the identity rotated and the namespace wiped (ADR-0027/0029). The
+/// FFI maps it to the `statusChanged(notJoined, reason)` event reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    /// A current member issued a manifest excluding this device
+    /// (Soft Removal, ADR-0027).
+    Removed,
+    /// The device's own Leave completed — the Relay accepted every push
+    /// of the excluding manifest (ADR-0027).
+    Left,
+    /// Destroy Group completed — the Relay accepted every queued Revoke
+    /// (ADR-0029).
+    Destroyed,
+}
+
 /// Session-side Delivery Issue channel (ADR-0034 §3).
 ///
 /// The load-time reports of ADR-0025 fire during construction, before any
@@ -634,7 +672,7 @@ fn drop_oversize_outbox_entries(
 /// Owns the relay connection, sequence counter, signing keypair, pairing state,
 /// and current GroupManifest.
 /// Transport-generic so tests can inject in-memory pipes.
-pub struct TruesealSession<T: Read + Write + Send + 'static> {
+pub struct TruesealSession<T: crate::relay::Severable> {
     client: Arc<Mutex<RelayClient<T>>>,
     keys: Arc<Mutex<KeyState>>,
     sequence: Arc<Mutex<u64>>,
@@ -691,12 +729,16 @@ pub struct TruesealSession<T: Read + Write + Send + 'static> {
     /// Fired after the identity is rotated (deliberate removal, completed
     /// Leave): the caller persists the fresh keypair. The FFI wipes the
     /// namespace store here.
-    on_identity_rotated: Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static>,
+    on_identity_rotated: Arc<dyn Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static>,
     /// Set when the identity rotated: the sender pump swaps the receive
     /// client for the disconnected stub so the reconnect loop rebinds the
     /// Receive Session to the fresh keys (an old-key session could never
     /// receive the manifests a re-pair brings).
     rotation_pending: Arc<AtomicBool>,
+    /// Set by `close()` (ADR-0028): the reconnect loop and the sender pump
+    /// exit, the receive client is severed, and every state-changing call
+    /// fails with `Closed`. Session State is untouched.
+    shutdown: Arc<AtomicBool>,
 }
 
 /// Wipe the group state and rotate the identity (ADR-0027: deliberate
@@ -720,8 +762,9 @@ pub(super) fn wipe_and_rotate(
     leaving: &Arc<Mutex<Option<LeavingRecord>>>,
     destroying: &Arc<Mutex<Option<DestroyingRecord>>>,
     pending_join: &Arc<Mutex<Option<PendingJoin>>>,
-    on_identity_rotated: &Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static>,
+    on_identity_rotated: &Arc<dyn Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static>,
     rotation_pending: &Arc<AtomicBool>,
+    reason: ExitReason,
 ) {
     let fresh = DeviceKeypair::generate();
     {
@@ -730,8 +773,9 @@ pub(super) fn wipe_and_rotate(
     }
     // The FFI wipes the namespace store and persists the rotated identity
     // inside this callback. Fresh identity first, so the callback can save
-    // it after the wipe.
-    (on_identity_rotated)(fresh);
+    // it after the wipe. The reason becomes the `statusChanged(notJoined,
+    // reason)` event (ADR-0028).
+    (on_identity_rotated)(fresh, reason);
     {
         let mut log = op_log.lock().unwrap_or_else(|e| e.into_inner());
         log.wipe_group_state();
@@ -799,8 +843,9 @@ pub(super) fn build_subscribe_handler(
     outbox_sequence: Arc<Mutex<u64>>,
     pending_changes: Arc<Mutex<Vec<PendingChange>>>,
     leaving: Arc<Mutex<Option<LeavingRecord>>>,
-    on_identity_rotated: Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static>,
+    on_identity_rotated: Arc<dyn Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static>,
     rotation_pending: Arc<AtomicBool>,
+    shutdown: Arc<AtomicBool>,
     on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
 ) -> impl Fn(Message, [u8; 32], u64, u64) + Send + 'static {
     move |msg, author_signing_pub, sequence, sender_timestamp_ms| {
@@ -818,10 +863,11 @@ pub(super) fn build_subscribe_handler(
         } = &msg
         {
             // ADR-0029: a Destroying device is ending the group — inbound
-            // Pairs are dropped like manifests. No window can be OPEN while
-            // Destroying (pairing_token refuses and destroy_group() closes
-            // any open window); this guards the residual race where a Pair
-            // passed the secret check just as destroy_group() committed.
+            // Pairs are dropped like manifests. Pairing's CONSUMERS are
+            // gated while Destroying (pairing_token() refuses,
+            // destroy_group() closes any open window, accept_pair errors);
+            // this drop guards the residual race where a Pair passed the
+            // secret check just as destroy_group() committed.
             if destroying
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1075,6 +1121,7 @@ pub(super) fn build_subscribe_handler(
                         &pending_join,
                         &on_identity_rotated,
                         &rotation_pending,
+                        ExitReason::Removed,
                     );
                     if !was_leaving {
                         // A Leaving device that is removed has nothing more
@@ -1573,6 +1620,17 @@ pub(super) fn build_subscribe_handler(
             }));
             match result {
                 Ok(()) => {
+                    // close() during the handler — or during the FFI's
+                    // pre-registration wait, which returns here too —
+                    // abandons the delivery: do NOT record the Message ID
+                    // (SYNC-15 gate F2). The ack fails on the severed
+                    // session, the relay re-delivers on the next open(),
+                    // and a committed record would turn that re-delivery
+                    // into a silent no-op — at-least-once broken on exactly
+                    // the flow registration-gating creates.
+                    if shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
                     // Step 5: record the Message ID, THEN return so the
                     // DeliverAck follows. A crash before the record commits
                     // re-delivers and the handler runs again — the only way
@@ -1619,7 +1677,50 @@ fn load_pending_join(op_log: &Arc<Mutex<Box<dyn OperationLog>>>) -> Option<Pendi
     }
 }
 
-impl<T: Read + Write + Send + 'static> TruesealSession<T> {
+impl<T: crate::relay::Severable> TruesealSession<T> {
+    /// Close the session (ADR-0028): stop the connection and the handlers
+    /// but keep Session State. The reconnect loop and the sender pump exit
+    /// (woken immediately, not on the next poll), the receive client is
+    /// severed — the transport EOF interrupts a receive parked in
+    /// WouldBlock retry — and every state-changing call fails
+    /// with [`SessionError::Closed`] from here on. In-flight handlers run
+    /// to completion; their Blobs are then handled by the usual dispatch
+    /// (the receive loop exits on the next frame at the latest). A Blob
+    /// whose ack could not be sent is re-delivered on the next `open()` —
+    /// the at-least-once contract is unaffected.
+    ///
+    /// Idempotent. The object is not reusable after `close()`; starting
+    /// again means constructing a new session on the same namespace.
+    pub fn close(&self) {
+        if self.shutdown.swap(true, Ordering::AcqRel) {
+            return; // already closed
+        }
+        // Wake the pump so it notices the flag now rather than on its next
+        // poll, and sever the receive client. Replacing it with the stub
+        // drops the old client, whose Drop closes the Noise session — the
+        // receive thread unblocks and the run loop exits (DisconnectGuard
+        // marks the link down).
+        self.kick.kick();
+        let old = {
+            let mut guard = self.client.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *guard, RelayClient::disconnected())
+        };
+        old.close();
+    }
+
+    /// True after [`Self::close()`].
+    pub fn is_closed(&self) -> bool {
+        self.shutdown.load(Ordering::Acquire)
+    }
+
+    /// The shared `Closed` guard for state-changing methods.
+    fn check_open(&self) -> Result<(), SessionError> {
+        if self.is_closed() {
+            return Err(SessionError::Closed);
+        }
+        Ok(())
+    }
+
     /// Current noise public key for this session.
     pub fn noise_pub(&self) -> NoisePublicKey {
         self.keys
@@ -1680,6 +1781,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// cannot be decoded or predates the Pairing Secret (ADR-0022 clean
     /// break). `cancel_join` abandons the wait.
     pub fn join_group(&self, token: &str) -> Result<(), SessionError> {
+        self.check_open()?;
         if self
             .destroying
             .lock()
@@ -1735,6 +1837,9 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// means a crash in between restarts as still-pending — visible,
     /// cancellable, and safe (the anchor only narrows what is accepted).
     pub fn cancel_join(&self) {
+        if self.is_closed() {
+            return;
+        }
         self.op_log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1843,7 +1948,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             on_removed_from_group,
             on_manifest_changed,
             on_group_destroyed,
-            |_| {},
+            |_, _| {},
             push_factory,
         )
     }
@@ -1858,7 +1963,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
-        on_identity_rotated: impl Fn(DeviceKeypair) + Send + Sync + 'static,
+        on_identity_rotated: impl Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
     ) -> Result<Self, SessionError> {
         let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
@@ -1922,9 +2027,10 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let leaving: Arc<Mutex<Option<LeavingRecord>>> =
             Arc::new(Mutex::new(load_leaving(&op_log)));
         *destroying.lock().unwrap_or_else(|e| e.into_inner()) = load_destroying(&op_log);
-        let on_identity_rotated: Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static> =
+        let on_identity_rotated: Arc<dyn Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static> =
             Arc::new(on_identity_rotated);
         let rotation_pending = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         // SYNC-6 (#98): the handler is built first and registered inside
         // connect, before the receive loop starts reading. A Blob queued in
@@ -1949,6 +2055,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             leaving.clone(),
             on_identity_rotated.clone(),
             rotation_pending.clone(),
+            shutdown.clone(),
             on_message,
         );
         // SYNC-5: the Delivery Issue stream is one channel from the very
@@ -1990,6 +2097,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                         &pending_join,
                         &on_identity_rotated,
                         &rotation_pending,
+                        ExitReason::Destroyed,
                     );
                     // Fired after the wipe: a crash mid-wipe leaves a wiped
                     // store and the app observes `notJoined` on next open.
@@ -2014,6 +2122,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                         &pending_join,
                         &on_identity_rotated,
                         &rotation_pending,
+                        ExitReason::Left,
                     );
                 }
             }
@@ -2049,6 +2158,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                     &pending_join,
                     &on_identity_rotated,
                     &rotation_pending,
+                    ExitReason::Left,
                 );
             }
         };
@@ -2079,6 +2189,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                     &pending_join,
                     &on_identity_rotated,
                     &rotation_pending,
+                    ExitReason::Destroyed,
                 );
                 (on_group_destroyed)();
             }
@@ -2097,6 +2208,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             rotation_pending.clone(),
             Box::new(on_leave_complete),
             Box::new(on_destroy_complete),
+            shutdown.clone(),
         );
 
         // SYNC-8 (#100): drop oversize entries persisted by pre-fix builds —
@@ -2129,6 +2241,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             leaving,
             on_identity_rotated,
             rotation_pending,
+            shutdown,
         })
     }
 
@@ -2147,7 +2260,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
-        on_connection_changed: Option<Box<dyn Fn(bool) + Send + Sync + 'static>>,
+        on_connection_changed: Option<Box<dyn Fn(ConnectionChange) + Send + Sync + 'static>>,
     ) -> Result<Self, SessionError> {
         Self::connect_with_reconnect_rotating(
             transport,
@@ -2158,7 +2271,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             on_removed_from_group,
             on_manifest_changed,
             on_group_destroyed,
-            |_| {},
+            |_, _| {},
             transport_factory,
             push_factory,
             reconnect_cap,
@@ -2176,11 +2289,11 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
-        on_identity_rotated: impl Fn(DeviceKeypair) + Send + Sync + 'static,
+        on_identity_rotated: impl Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static,
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
-        on_connection_changed: Option<Box<dyn Fn(bool) + Send + Sync + 'static>>,
+        on_connection_changed: Option<Box<dyn Fn(ConnectionChange) + Send + Sync + 'static>>,
     ) -> Result<Self, SessionError> {
         let transport_factory = Arc::new(transport_factory);
         let session = Self::connect_full_rotating(
@@ -2214,9 +2327,10 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let leaving_arc = session.leaving.clone();
         let on_ir_arc = session.on_identity_rotated.clone();
         let rotation_pending_arc = session.rotation_pending.clone();
+        let shutdown_arc = session.shutdown.clone();
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
-        let on_cc: Arc<dyn Fn(bool) + Send + Sync + 'static> = on_connection_changed
-            .map(|f| -> Arc<dyn Fn(bool) + Send + Sync + 'static> { Arc::new(f) })
+        let on_cc: Arc<dyn Fn(ConnectionChange) + Send + Sync + 'static> = on_connection_changed
+            .map(|f| -> Arc<dyn Fn(ConnectionChange) + Send + Sync + 'static> { Arc::new(f) })
             .unwrap_or_else(|| Arc::new(|_| {}));
         std::thread::spawn(move || {
             reconnect::reconnect_loop(
@@ -2241,6 +2355,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 leaving_arc,
                 on_ir_arc,
                 rotation_pending_arc,
+                shutdown_arc,
                 transport_factory,
                 cap,
                 on_cc,
@@ -2283,7 +2398,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
-        on_connection_changed: Option<Box<dyn Fn(bool) + Send + Sync + 'static>>,
+        on_connection_changed: Option<Box<dyn Fn(ConnectionChange) + Send + Sync + 'static>>,
     ) -> Result<Self, SessionError> {
         Self::connect_background_rotating(
             relay_pub,
@@ -2294,7 +2409,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             on_removed_from_group,
             on_manifest_changed,
             on_group_destroyed,
-            |_| {},
+            |_, _| {},
             transport_factory,
             push_factory,
             reconnect_cap,
@@ -2312,11 +2427,11 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
-        on_identity_rotated: impl Fn(DeviceKeypair) + Send + Sync + 'static,
+        on_identity_rotated: impl Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static,
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
-        on_connection_changed: Option<Box<dyn Fn(bool) + Send + Sync + 'static>>,
+        on_connection_changed: Option<Box<dyn Fn(ConnectionChange) + Send + Sync + 'static>>,
     ) -> Result<Self, SessionError> {
         // Build all arcs directly — mirrors connect_full but without an initial transport.
         let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
@@ -2390,9 +2505,10 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         let leaving: Arc<Mutex<Option<LeavingRecord>>> =
             Arc::new(Mutex::new(load_leaving(&op_log_arc)));
         *destroying.lock().unwrap_or_else(|e| e.into_inner()) = load_destroying(&op_log_arc);
-        let on_identity_rotated: Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static> =
+        let on_identity_rotated: Arc<dyn Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static> =
             Arc::new(on_identity_rotated);
         let rotation_pending = Arc::new(AtomicBool::new(false));
+        let shutdown = Arc::new(AtomicBool::new(false));
 
         // ADR-0029: a crash after the Destroying commit or mid-wipe
         // resumes here — a Destroying record whose Revoke refs are already
@@ -2413,6 +2529,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                         &pending_join,
                         &on_identity_rotated,
                         &rotation_pending,
+                        ExitReason::Destroyed,
                     );
                     // Fired after the wipe: a crash mid-wipe leaves a wiped
                     // store and the app observes `notJoined` on next open.
@@ -2437,6 +2554,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                         &pending_join,
                         &on_identity_rotated,
                         &rotation_pending,
+                        ExitReason::Left,
                     );
                 }
             }
@@ -2471,6 +2589,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                     &pending_join,
                     &on_identity_rotated,
                     &rotation_pending,
+                    ExitReason::Left,
                 );
             }
         };
@@ -2501,6 +2620,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                     &pending_join,
                     &on_identity_rotated,
                     &rotation_pending,
+                    ExitReason::Destroyed,
                 );
                 (on_group_destroyed)();
             }
@@ -2519,6 +2639,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             rotation_pending.clone(),
             Box::new(on_leave_complete),
             Box::new(on_destroy_complete),
+            shutdown.clone(),
         );
 
         let session = Self {
@@ -2543,11 +2664,12 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             leaving: leaving.clone(),
             on_identity_rotated: on_identity_rotated.clone(),
             rotation_pending: rotation_pending.clone(),
+            shutdown: shutdown.clone(),
         };
 
         let cap = reconnect_cap.unwrap_or(DEFAULT_RECONNECT_CAP);
-        let on_cc: Arc<dyn Fn(bool) + Send + Sync + 'static> = on_connection_changed
-            .map(|f| -> Arc<dyn Fn(bool) + Send + Sync + 'static> { Arc::new(f) })
+        let on_cc: Arc<dyn Fn(ConnectionChange) + Send + Sync + 'static> = on_connection_changed
+            .map(|f| -> Arc<dyn Fn(ConnectionChange) + Send + Sync + 'static> { Arc::new(f) })
             .unwrap_or_else(|| Arc::new(|_| {}));
         std::thread::spawn(move || {
             reconnect::reconnect_loop(
@@ -2572,6 +2694,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
                 leaving,
                 on_identity_rotated,
                 rotation_pending,
+                shutdown,
                 transport_factory,
                 cap,
                 on_cc,
@@ -2591,9 +2714,12 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// connected (backoff 1 s to 5 min, immediately on reconnect), holds
     /// head-of-line order per recipient, fails permanently-refused and
     /// expired entries with `sendFailed` on the delivery-issue stream, and
-    /// deletes delivered rows. `Ok(())` means "durably queued" — the caller
-    /// must not retry (ADR-0017); observing failures is optional.
-    pub fn push_sync(&self, blob: Vec<u8>) -> Result<(), SessionError> {
+    /// deletes delivered rows. `Ok` carries the message's Message ID
+    /// (ADR-0031) and means "durably queued" — the caller must not retry
+    /// (ADR-0017); observing failures is optional. The same Message ID
+    /// appears in any later `sendFailed`/`handlerGaveUp` report for it.
+    pub fn push_sync(&self, blob: Vec<u8>) -> Result<String, SessionError> {
+        self.check_open()?;
         if self
             .destroying
             .lock()
@@ -2646,7 +2772,13 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             }
         }
         self.kick.kick();
-        Ok(())
+        let signing_pub = self
+            .keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .signing_pub
+            .0;
+        Ok(message_id(&signing_pub, seq))
     }
 
     /// The largest `Sync` body `send()` currently accepts, in bytes
@@ -2725,6 +2857,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Leave is abandoned. Pending `Sync` sends and Pending Membership
     /// Changes drop without reporting, as removal does.
     pub fn destroy_group(&self) -> Result<(), SessionError> {
+        self.check_open()?;
         if self
             .destroying
             .lock()
@@ -2808,6 +2941,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// window opened mid-Destroy could only admit a joiner into a group
     /// every other device has already dropped.
     pub fn pairing_token(&self) -> Result<String, SessionError> {
+        self.check_open()?;
         if self
             .destroying
             .lock()
@@ -2845,6 +2979,9 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     }
 
     pub fn cancel_pairing(&self) {
+        if self.is_closed() {
+            return;
+        }
         // Same lock order as `pairing_token` and the inbound handler
         // (pairing → pending_members): the window close and the clear of
         // its pending requests are one observation.
@@ -2875,6 +3012,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
         noise_pub: NoisePublicKey,
         signing_pub: SigningPublicKey,
     ) -> Result<bool, SessionError> {
+        self.check_open()?;
         // A Destroying device admits no one (ADR-0029): the group is
         // ending and no other device would honour the admission.
         if self
@@ -3101,6 +3239,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Clears the pairing window on success (single-use window).
     /// Errors: see [`Self::accept_pair`] (`GroupFull`, `Store`, ...).
     pub fn accept_member(&self, token: &str) -> Result<bool, SessionError> {
+        self.check_open()?;
         let pending = self
             .pending_members
             .lock()
@@ -3124,6 +3263,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Returns `SessionError::NotInGroup` if no manifest is set.
     /// Returns `SessionError::MemberNotFound` if `target` is not in the current manifest.
     pub fn remove_member(&self, target: SigningPublicKey) -> Result<(), SessionError> {
+        self.check_open()?;
         // Lock discipline: keys copied out and released before the manifest
         // lock (the handler locks manifest → keys).
         let (self_noise, self_signing, signing_key) = {
@@ -3235,6 +3375,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Errors: `NotInGroup` when not a member, `GroupDestroyed`,
     /// `ManifestVersionExhausted`, `Store` (nothing changed in memory).
     pub fn leave_group(&self) -> Result<(), SessionError> {
+        self.check_open()?;
         if self
             .destroying
             .lock()
@@ -3344,6 +3485,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// Returns `SessionError::NotInGroup` if no manifest is set.
     /// Returns `SessionError::MemberNotFound` if no member with that id exists.
     pub fn remove_member_by_id(&self, id: &str) -> Result<(), SessionError> {
+        self.check_open()?;
         let target = {
             let guard = self.manifest.lock().unwrap_or_else(|e| e.into_inner());
             let m = guard.as_ref().ok_or(SessionError::NotInGroup)?;
