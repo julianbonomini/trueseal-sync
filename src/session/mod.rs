@@ -417,6 +417,18 @@ fn load_destroying(op_log: &Arc<Mutex<Box<dyn OperationLog>>>) -> Option<Destroy
 /// `Keypair` derives `ZeroizeOnDrop` in trueseal-noise and ed25519-dalek's
 /// `SigningKey` zeroizes on drop. Data at rest stays OS-sandbox-only
 /// (documented preview limitation).
+///
+/// Known residual copies (honest scope, SYNC-19/SYNC-20): zeroizing on drop
+/// does not erase every transient copy of key or plaintext material. In
+/// particular: `relay.rs` holds the device's noise private key as a plain
+/// `[u8; 32]` field for the lifetime of a connection (needed to open sealed
+/// envelopes); `open_sealed` returns plaintext by value, so handled message
+/// plaintext lives on the heap until reused; and the reconnect loop carries
+/// a cloned copy of this struct. Eliminating these would need
+/// secret-managed buffers end to end — that is 1.0 territory alongside
+/// encryption at rest (ADR-0033), not a preview guarantee. The preview
+/// claim is only: keys replaced by rotation/wipe/destroy do not linger in
+/// the long-lived session state.
 #[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub(super) struct KeyState {
     pub noise_priv: [u8; 32],

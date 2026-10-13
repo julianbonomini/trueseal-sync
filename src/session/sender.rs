@@ -185,6 +185,10 @@ fn sender_loop<T: crate::relay::Severable>(
 ) {
     let mut backoffs: HashMap<[u8; 32], RecipientBackoff> = HashMap::new();
     let mut was_connected = false;
+    // Rate-conscious store-failure logging: warn on the FIRST failure of a
+    // streak, stay silent while it persists, and re-arm when a query
+    // succeeds again. No client metadata — just the store error.
+    let mut store_failure_logged = false;
     loop {
         // close() (SYNC-15, ADR-0028): the pump exits on the shutdown flag.
         // close() kicks, so this is observed immediately, not on the next
@@ -241,16 +245,24 @@ fn sender_loop<T: crate::relay::Severable>(
             continue;
         }
 
-        // A failing store query is not a panic (SYNC-19): skip this pass
-        // and retry on the next poll — a persistently broken store surfaces
-        // typed `storage` errors through the send/open paths.
+        // A failing store query is not a panic (SYNC-19): warn once per
+        // failure streak, skip this pass and retry on the next poll — a
+        // persistently broken store also surfaces typed `storage` errors
+        // through the send/open paths.
         let entries = match op_log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .undelivered_entries()
         {
-            Ok(entries) => entries,
-            Err(_) => {
+            Ok(entries) => {
+                store_failure_logged = false;
+                entries
+            }
+            Err(e) => {
+                if !store_failure_logged {
+                    log::warn!("[trueseal-sync] outbox pump: store query failed ({e}); retrying");
+                    store_failure_logged = true;
+                }
                 kick.wait(config.poll);
                 continue;
             }

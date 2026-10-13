@@ -221,6 +221,14 @@ Design recommendations from the macOS integration:
 - **Incoming request UI**: show a prominent banner with the device name and
   ACCEPT / IGNORE. A countdown timer is a useful visual affordance but should
   not auto-dismiss — let the user decide.
+- **Names are labels, not authentication** (ADR-0023): the displayed device
+  name is derived from the requester's own key and proves nothing. What the
+  Pairing Secret proves is that the requester holds the token the user just
+  shared — so the user should confirm the *physical device in front of them*
+  is the one knocking, not that the name looks right. There is no SAS in the
+  preview: a token someone photographed while the window was open can be used
+  by a different device (a documented limitation). Keep the window open only
+  while you expect a knock.
 
 ### Cancelling
 

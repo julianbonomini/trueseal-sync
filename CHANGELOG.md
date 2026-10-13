@@ -42,6 +42,16 @@ breaking release carries upgrade steps (ADR-0033).
   14 typed errors, `close()`, Relay Address parsing (ADR-0028).
 - Sync JSON test vectors and generated Shared Facts ship with every release
   (gates G5, G11, G12).
+- Licence metadata corrected to Apache-2.0 everywhere (the code has always
+  been Apache-2.0; stale MIT metadata claimed otherwise) (SYNC-19).
+- Behaviour change: local store failures are typed `storage` errors instead
+  of panics — the `PersistentLog` is panic-free, and the outbox pump backs
+  off and retries on a store error instead of crashing (SYNC-19). Apps that
+  relied on the process dying on a corrupt store now get errors they must
+  surface.
+- Private key material in long-lived session state zeroizes on drop
+  (rotation, removal wipe, Destroy Group); transient copies remain and are
+  documented honestly (SYNC-19).
 
 ### Swift SDK (trueseal-sync-swift)
 

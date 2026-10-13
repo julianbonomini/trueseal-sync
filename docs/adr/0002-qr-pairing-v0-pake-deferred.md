@@ -29,7 +29,8 @@ SAS (the "both devices show the same 6-digit code, user confirms visually" mecha
 
 ## Consequences
 
-- `start_pairing()` returns raw QR bytes (the initiator's public key + signing key, 64 bytes). Caller is responsible for QR encoding.
-- The session enforces a pairing window (opened by `start_pairing()`, closed by timeout, successful accept, or `cancel_pairing()`).
-- `accept_pair()` is only valid inside an open pairing window.
+- `startPairing()` returns a base64url Pairing Token: `base64url(version[1]=2 || noise_pub[32] || signing_pub[32] || pairing_secret[32] || name)`. The single-use Pairing Secret is what stops the Relay (or anyone else who sees the token) from raising join requests the initiator never received (ADR-0023). The caller is responsible for QR encoding and out-of-band transfer.
+- The Pairing Window is **caller-controlled** (ADR-0021): opened by `startPairing()`, closed by `cancelPairing()` or a successful accept — there is no protocol-enforced timeout; the app decides when to stop accepting. The window can only open from group status `idle` (ADR-0023).
+- `accept(requestId)` is only valid inside an open Pairing Window, and a device in Pending Join, a group, Leaving or Destroying cannot open a window or accept (ADR-0023, ADR-0029).
+- The joining device persists a Pending Join before its Pair leaves the outbox and gates its first Group Manifest on the token's signing key (ADR-0023).
 - If keyboard/phrase pairing is needed in future, PAKE must be implemented — it cannot be bolted on as a cosmetic change.
