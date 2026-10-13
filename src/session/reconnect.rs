@@ -39,7 +39,7 @@ pub(super) fn reconnect_loop<T: crate::relay::Severable>(
     sequence: Arc<Mutex<u64>>,
     pending_changes: Arc<Mutex<Vec<PendingChange>>>,
     leaving: Arc<Mutex<Option<LeavingRecord>>>,
-    on_identity_rotated: Arc<dyn Fn(crate::device::DeviceKeypair) + Send + Sync + 'static>,
+    on_identity_rotated: Arc<dyn Fn(crate::device::DeviceKeypair, super::ExitReason) + Send + Sync + 'static>,
     rotation_pending: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     factory: Arc<dyn Fn() -> Result<T, String> + Send + Sync>,

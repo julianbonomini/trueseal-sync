@@ -964,7 +964,7 @@ fn leave_resumes_after_crash_and_completes() {
         || {},
         |_| {},
         || {},
-        move |fresh| *rt.lock().unwrap() = Some(fresh.public_key()),
+        move |fresh, _reason| *rt.lock().unwrap() = Some(fresh.public_key()),
         move || {
             transport_once
                 .lock()

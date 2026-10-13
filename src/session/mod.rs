@@ -460,6 +460,21 @@ pub enum ConnectionChange {
     RelayVersionUnsupported { min: u32, max: u32 },
 }
 
+/// Why the identity rotated and the namespace wiped (ADR-0027/0029). The
+/// FFI maps it to the `statusChanged(notJoined, reason)` event reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitReason {
+    /// A current member issued a manifest excluding this device
+    /// (Soft Removal, ADR-0027).
+    Removed,
+    /// The device's own Leave completed — the Relay accepted every push
+    /// of the excluding manifest (ADR-0027).
+    Left,
+    /// Destroy Group completed — the Relay accepted every queued Revoke
+    /// (ADR-0029).
+    Destroyed,
+}
+
 /// Session-side Delivery Issue channel (ADR-0034 §3).
 ///
 /// The load-time reports of ADR-0025 fire during construction, before any
@@ -714,7 +729,7 @@ pub struct TruesealSession<T: crate::relay::Severable> {
     /// Fired after the identity is rotated (deliberate removal, completed
     /// Leave): the caller persists the fresh keypair. The FFI wipes the
     /// namespace store here.
-    on_identity_rotated: Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static>,
+    on_identity_rotated: Arc<dyn Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static>,
     /// Set when the identity rotated: the sender pump swaps the receive
     /// client for the disconnected stub so the reconnect loop rebinds the
     /// Receive Session to the fresh keys (an old-key session could never
@@ -747,8 +762,9 @@ pub(super) fn wipe_and_rotate(
     leaving: &Arc<Mutex<Option<LeavingRecord>>>,
     destroying: &Arc<Mutex<Option<DestroyingRecord>>>,
     pending_join: &Arc<Mutex<Option<PendingJoin>>>,
-    on_identity_rotated: &Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static>,
+    on_identity_rotated: &Arc<dyn Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static>,
     rotation_pending: &Arc<AtomicBool>,
+    reason: ExitReason,
 ) {
     let fresh = DeviceKeypair::generate();
     {
@@ -757,8 +773,9 @@ pub(super) fn wipe_and_rotate(
     }
     // The FFI wipes the namespace store and persists the rotated identity
     // inside this callback. Fresh identity first, so the callback can save
-    // it after the wipe.
-    (on_identity_rotated)(fresh);
+    // it after the wipe. The reason becomes the `statusChanged(notJoined,
+    // reason)` event (ADR-0028).
+    (on_identity_rotated)(fresh, reason);
     {
         let mut log = op_log.lock().unwrap_or_else(|e| e.into_inner());
         log.wipe_group_state();
@@ -826,7 +843,7 @@ pub(super) fn build_subscribe_handler(
     outbox_sequence: Arc<Mutex<u64>>,
     pending_changes: Arc<Mutex<Vec<PendingChange>>>,
     leaving: Arc<Mutex<Option<LeavingRecord>>>,
-    on_identity_rotated: Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static>,
+    on_identity_rotated: Arc<dyn Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static>,
     rotation_pending: Arc<AtomicBool>,
     on_message: impl Fn(Message, [u8; 32], u64) + Send + 'static,
 ) -> impl Fn(Message, [u8; 32], u64, u64) + Send + 'static {
@@ -1102,6 +1119,7 @@ pub(super) fn build_subscribe_handler(
                         &pending_join,
                         &on_identity_rotated,
                         &rotation_pending,
+                        ExitReason::Removed,
                     );
                     if !was_leaving {
                         // A Leaving device that is removed has nothing more
@@ -1917,7 +1935,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
             on_removed_from_group,
             on_manifest_changed,
             on_group_destroyed,
-            |_| {},
+            |_, _| {},
             push_factory,
         )
     }
@@ -1932,7 +1950,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
-        on_identity_rotated: impl Fn(DeviceKeypair) + Send + Sync + 'static,
+        on_identity_rotated: impl Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
     ) -> Result<Self, SessionError> {
         let keys = Arc::new(Mutex::new(KeyState::from_keypair(&keypair)));
@@ -1996,7 +2014,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
         let leaving: Arc<Mutex<Option<LeavingRecord>>> =
             Arc::new(Mutex::new(load_leaving(&op_log)));
         *destroying.lock().unwrap_or_else(|e| e.into_inner()) = load_destroying(&op_log);
-        let on_identity_rotated: Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static> =
+        let on_identity_rotated: Arc<dyn Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static> =
             Arc::new(on_identity_rotated);
         let rotation_pending = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2065,6 +2083,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
                         &pending_join,
                         &on_identity_rotated,
                         &rotation_pending,
+                        ExitReason::Destroyed,
                     );
                     // Fired after the wipe: a crash mid-wipe leaves a wiped
                     // store and the app observes `notJoined` on next open.
@@ -2089,6 +2108,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
                         &pending_join,
                         &on_identity_rotated,
                         &rotation_pending,
+                        ExitReason::Left,
                     );
                 }
             }
@@ -2124,6 +2144,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
                     &pending_join,
                     &on_identity_rotated,
                     &rotation_pending,
+                    ExitReason::Left,
                 );
             }
         };
@@ -2154,6 +2175,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
                     &pending_join,
                     &on_identity_rotated,
                     &rotation_pending,
+                    ExitReason::Destroyed,
                 );
                 (on_group_destroyed)();
             }
@@ -2235,7 +2257,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
             on_removed_from_group,
             on_manifest_changed,
             on_group_destroyed,
-            |_| {},
+            |_, _| {},
             transport_factory,
             push_factory,
             reconnect_cap,
@@ -2253,7 +2275,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
-        on_identity_rotated: impl Fn(DeviceKeypair) + Send + Sync + 'static,
+        on_identity_rotated: impl Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static,
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
@@ -2373,7 +2395,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
             on_removed_from_group,
             on_manifest_changed,
             on_group_destroyed,
-            |_| {},
+            |_, _| {},
             transport_factory,
             push_factory,
             reconnect_cap,
@@ -2391,7 +2413,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
         on_removed_from_group: impl Fn() + Send + Sync + 'static,
         on_manifest_changed: impl Fn(&GroupManifest) + Send + Sync + 'static,
         on_group_destroyed: impl Fn() + Send + Sync + 'static,
-        on_identity_rotated: impl Fn(DeviceKeypair) + Send + Sync + 'static,
+        on_identity_rotated: impl Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static,
         transport_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         push_factory: impl Fn() -> Result<T, String> + Send + Sync + 'static,
         reconnect_cap: Option<Duration>,
@@ -2469,7 +2491,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
         let leaving: Arc<Mutex<Option<LeavingRecord>>> =
             Arc::new(Mutex::new(load_leaving(&op_log_arc)));
         *destroying.lock().unwrap_or_else(|e| e.into_inner()) = load_destroying(&op_log_arc);
-        let on_identity_rotated: Arc<dyn Fn(DeviceKeypair) + Send + Sync + 'static> =
+        let on_identity_rotated: Arc<dyn Fn(DeviceKeypair, ExitReason) + Send + Sync + 'static> =
             Arc::new(on_identity_rotated);
         let rotation_pending = Arc::new(AtomicBool::new(false));
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -2493,6 +2515,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
                         &pending_join,
                         &on_identity_rotated,
                         &rotation_pending,
+                        ExitReason::Destroyed,
                     );
                     // Fired after the wipe: a crash mid-wipe leaves a wiped
                     // store and the app observes `notJoined` on next open.
@@ -2517,6 +2540,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
                         &pending_join,
                         &on_identity_rotated,
                         &rotation_pending,
+                        ExitReason::Left,
                     );
                 }
             }
@@ -2551,6 +2575,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
                     &pending_join,
                     &on_identity_rotated,
                     &rotation_pending,
+                    ExitReason::Left,
                 );
             }
         };
@@ -2581,6 +2606,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
                     &pending_join,
                     &on_identity_rotated,
                     &rotation_pending,
+                    ExitReason::Destroyed,
                 );
                 (on_group_destroyed)();
             }
@@ -2674,9 +2700,11 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
     /// connected (backoff 1 s to 5 min, immediately on reconnect), holds
     /// head-of-line order per recipient, fails permanently-refused and
     /// expired entries with `sendFailed` on the delivery-issue stream, and
-    /// deletes delivered rows. `Ok(())` means "durably queued" — the caller
-    /// must not retry (ADR-0017); observing failures is optional.
-    pub fn push_sync(&self, blob: Vec<u8>) -> Result<(), SessionError> {
+    /// deletes delivered rows. `Ok` carries the message's Message ID
+    /// (ADR-0031) and means "durably queued" — the caller must not retry
+    /// (ADR-0017); observing failures is optional. The same Message ID
+    /// appears in any later `sendFailed`/`handlerGaveUp` report for it.
+    pub fn push_sync(&self, blob: Vec<u8>) -> Result<String, SessionError> {
         self.check_open()?;
         if self
             .destroying
@@ -2730,7 +2758,13 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
             }
         }
         self.kick.kick();
-        Ok(())
+        let signing_pub = self
+            .keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .signing_pub
+            .0;
+        Ok(message_id(&signing_pub, seq))
     }
 
     /// The largest `Sync` body `send()` currently accepts, in bytes

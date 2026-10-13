@@ -366,7 +366,7 @@ impl TruesealFfiSession {
             // namespace's store is wiped (manifest, identity, outbox, dedup,
             // pending records — one transaction) and the fresh keypair is
             // persisted, so a restart opens as the rotated device.
-            move |fresh: DeviceKeypair| {
+            move |fresh: DeviceKeypair, _reason: crate::session::ExitReason| {
                 let store = rotate_store.lock().unwrap_or_else(|e| e.into_inner());
                 let _ = store.wipe();
                 let _ = store.save_keypair(&fresh);
@@ -539,7 +539,7 @@ impl TruesealFfiSession {
 
     /// Encrypt `blob` and fan out to all current group members.
     /// Returns `SessionError::NotInGroup` if the session has no manifest yet.
-    pub fn send(&self, blob: Vec<u8>) -> Result<(), SessionError> {
+    pub fn send(&self, blob: Vec<u8>) -> Result<String, SessionError> {
         self.inner.push_sync(blob).map_err(SessionError::from)
     }
 
