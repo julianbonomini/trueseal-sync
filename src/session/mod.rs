@@ -2501,6 +2501,7 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
     /// relay-kill detection must be exercisable without the production
     /// 75 s liveness window). Production callers use
     /// `connect_background_rotating`, which passes the defaults.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn connect_background_with_timeouts(
         relay_pub: NoisePublicKey,

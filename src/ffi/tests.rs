@@ -1412,9 +1412,9 @@ fn silent_relay_is_detected_through_the_ffi_stack() {
         .expect("on_event");
 
     let saw = |want: fn(&ConnectionState) -> bool| {
-        events.lock().unwrap().iter().any(|e| {
-            matches!(e, TrueSealEvent::ConnectionChanged { connection } if want(connection))
-        })
+        events.lock().unwrap().iter().any(
+            |e| matches!(e, TrueSealEvent::ConnectionChanged { connection } if want(connection)),
+        )
     };
     wait_for(
         || saw(|c| matches!(c, ConnectionState::Connected)),
