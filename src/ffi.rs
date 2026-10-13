@@ -266,25 +266,23 @@ impl TruesealFfiSession {
                 msg: format!("namespace must match [a-zA-Z0-9_-]+ (got {:?})", namespace),
             });
         }
+        // Validate every fallible argument BEFORE the store open: if
+        // create() fails after an automatic Store Reset ran, the reset's
+        // callback below would never fire and the wipe would be invisible
+        // to the app (B11 review). Cheap pure validation first keeps
+        // `storeReset` observable on every path.
+        let relay_pub_key =
+            noise_pub_from_bytes(&relay_pub).map_err(|_| SessionError::InvalidRelayPublicKey)?;
         // SYNC-13 (ADR-0032): the first open runs the Store Version state
         // machine — chained migrations, an automatic Store Reset for an
         // unmigratable store, a typed refusal for a newer one. Later opens
         // see a current store and are no-ops.
-        let (store, open_outcome) = Store::open_with_outcome(Path::new(&base_dir), &namespace)
-            .map_err(|e| match e {
-                crate::store::StoreError::StoreTooNew { found, supported } => {
-                    SessionError::StoreTooNew { found, supported }
-                }
-                other => SessionError::StoreFailed {
-                    msg: format!("store: {other}"),
-                },
-            })?;
+        let (store, open_outcome) =
+            Store::open_with_outcome(Path::new(&base_dir), &namespace).map_err(map_store_error)?;
         // After a Store Reset the identity row is empty: the library
         // generates a fresh identity here, and the session below starts
         // NotJoined — `storeReset` is reported once construction succeeds.
         let keypair = load_or_generate_keypair(&store)?;
-        let relay_pub_key =
-            noise_pub_from_bytes(&relay_pub).map_err(|_| SessionError::InvalidRelayPublicKey)?;
 
         // SYNC-7 (#99): the manifest slot is created and seeded from the store
         // BEFORE the session (and its reconnect loop) starts, so the receive
@@ -301,36 +299,20 @@ impl TruesealFfiSession {
         let manifest_cb = manifest.clone();
 
         // Open a second store handle for PersistentLog (same DB file, separate connection).
-        let log_store = Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
-            SessionError::InvalidNamespace {
-                msg: format!("store: {e}"),
-            }
-        })?;
+        let log_store = Store::open(Path::new(&base_dir), &namespace).map_err(map_store_error)?;
 
         let manifest_store_save = Arc::new(Mutex::new(
-            Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
-                SessionError::InvalidNamespace {
-                    msg: format!("store: {e}"),
-                }
-            })?,
+            Store::open(Path::new(&base_dir), &namespace).map_err(map_store_error)?,
         ));
 
         // Open a fourth store handle for wiping on group destroy, and a
         // fifth for the wipe + rotate on deliberate removal / completed
         // Leave (ADR-0027).
         let wipe_store = Arc::new(Mutex::new(
-            Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
-                SessionError::InvalidNamespace {
-                    msg: format!("store: {e}"),
-                }
-            })?,
+            Store::open(Path::new(&base_dir), &namespace).map_err(map_store_error)?,
         ));
         let rotate_store = Arc::new(Mutex::new(
-            Store::open(Path::new(&base_dir), &namespace).map_err(|e| {
-                SessionError::InvalidNamespace {
-                    msg: format!("store: {e}"),
-                }
-            })?,
+            Store::open(Path::new(&base_dir), &namespace).map_err(map_store_error)?,
         ));
 
         let receive_addr = format!("{}:7700", relay_host);
@@ -560,21 +542,28 @@ impl TruesealFfiSession {
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
 /// Load the identity keypair from `store`, or generate and persist a fresh one.
+/// Map a store failure to the typed taxonomy (ADR-0028): a newer store is
+/// `storeTooNew`; anything else is the `storage` case.
+fn map_store_error(e: crate::store::StoreError) -> SessionError {
+    match e {
+        crate::store::StoreError::StoreTooNew { found, supported } => {
+            SessionError::StoreTooNew { found, supported }
+        }
+        other => SessionError::StoreFailed {
+            msg: format!("store: {other}"),
+        },
+    }
+}
+
 fn load_or_generate_keypair(store: &Store) -> Result<DeviceKeypair, SessionError> {
     match store.load_keypair() {
         Ok(Some(kp)) => Ok(kp),
         Ok(None) => {
             let kp = DeviceKeypair::generate();
-            store
-                .save_keypair(&kp)
-                .map_err(|e| SessionError::InvalidNamespace {
-                    msg: format!("store: {e}"),
-                })?;
+            store.save_keypair(&kp).map_err(map_store_error)?;
             Ok(kp)
         }
-        Err(e) => Err(SessionError::InvalidNamespace {
-            msg: format!("store: {e}"),
-        }),
+        Err(e) => Err(map_store_error(e)),
     }
 }
 

@@ -510,6 +510,13 @@ impl Store {
         let decision = if !path.exists() {
             Decision::Fresh
         } else {
+            // Read-only, and deliberately so (ADR-0032): a store we refuse
+            // keeps its exact bytes. Known edge (accepted): if the previous
+            // process was a NEWER install that died leaving an
+            // uncheckpointed WAL holding the meta row, this read-only probe
+            // cannot see that row and the open surfaces as StoreFailed
+            // (a `storage` error) instead of StoreTooNew — the bytes are
+            // still unchanged, and rolling forward again loses nothing.
             let probe = rusqlite::Connection::open_with_flags(
                 &path,
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -2317,8 +2324,7 @@ mod versioning_tests {
         let kp = DeviceKeypair::generate();
         let s = Store::open(dir.path(), "ns").expect("open");
         s.save_keypair(&kp).expect("save");
-        let genesis =
-            GroupManifest::new(oid(9), 0, vec![member(&kp, "me")], &kp.signing);
+        let genesis = GroupManifest::new(oid(9), 0, vec![member(&kp, "me")], &kp.signing);
         // The same manifest to two recipients — fan-out's row shape.
         let encoded = Message::GroupManifest {
             manifest: genesis.clone(),
@@ -2342,8 +2348,7 @@ mod versioning_tests {
         let mut new_hashes = Vec::new();
         for seq in [1i64, 2] {
             let (blob, _, _) = outbox_row(dir.path(), "ns", seq);
-            let Message::GroupManifest { manifest } = Message::decode(&blob).unwrap()
-            else {
+            let Message::GroupManifest { manifest } = Message::decode(&blob).unwrap() else {
                 panic!("seq {seq} is a manifest");
             };
             manifest
@@ -2362,6 +2367,37 @@ mod versioning_tests {
             "deterministic re-sign: identical bytes on both rows"
         );
         assert_ne!(new_hashes[0], genesis.hash());
+    }
+
+    /// destroyGroup()/removal wipe group data but keep the store VERSIONED:
+    /// a reopen after a wipe is a plain current store — no phantom
+    /// `storeReset` from losing the version keys with the group state.
+    #[test]
+    fn wipe_preserves_version_keys_so_reopen_is_not_a_reset() {
+        let dir = tmp_dir();
+        let kp = make_v1_store(dir.path(), "ns");
+        {
+            let s = Store::open(dir.path(), "ns").expect("open");
+            s.wipe().expect("wipe");
+            // Group state gone, versions kept.
+            assert!(s.load_keypair().expect("load").is_none());
+            assert_eq!(
+                meta_get(&s.conn, META_STORE_VERSION).unwrap(),
+                Some(crate::version::STORE_VERSION as i64),
+                "wipe preserves the Store Version"
+            );
+            assert_eq!(
+                meta_get(&s.conn, META_E2E_VERSION).unwrap(),
+                Some(crate::version::END_TO_END_VERSION as i64),
+            );
+            let _ = kp;
+        }
+        let (_s, outcome) = Store::open_with_outcome(dir.path(), "ns").expect("reopen");
+        assert_eq!(
+            outcome,
+            OpenOutcome::default(),
+            "post-wipe reopen: current store, no phantom storeReset"
+        );
     }
 
     #[test]
