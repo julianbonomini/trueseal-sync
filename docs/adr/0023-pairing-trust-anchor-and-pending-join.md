@@ -9,6 +9,7 @@ We need this because of [trueseal-roadmap#4](https://github.com/julianbonomini/t
 ## State machine
 
 **Admitter (initiator).** `Idle → WindowOpen(secret) → Idle`.
+- A device holding a Pending Join is not `Idle`: `pairingToken()` and `acceptMember()` fail typed (`notMember{pendingJoin}`) until the join completes or is cancelled (B13 review, SYNC-15 fix-forward). An admission issued mid-join would be a genesis manifest competing with the join's anchor — a state this machine does not contemplate.
 - `pairingToken()` generates a fresh secret and opens the window. The window and its pending requests live in memory only. A restart or `cancelPairing()` closes the window and spends the secret, and a new window always gets a new secret.
 - A `Pair` with a valid secret proof becomes a pending request. Repeat `Pair`s from the same joiner keys deduplicate into one request. Several distinct requests may coexist, and the user picks one.
 - `acceptMember()` is single-use. It persists the new manifest and queues it for delivery before returning true, and then the window closes. Later `Pair`s under the spent secret are dropped.

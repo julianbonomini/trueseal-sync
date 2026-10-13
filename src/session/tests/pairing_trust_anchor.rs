@@ -1644,3 +1644,95 @@ fn pending_join_device_cannot_open_window_or_accept() {
         "a cancelled join leaves the device free to pair"
     );
 }
+
+/// B13b, full path: a window opened while NotJoined can hold a live Join
+/// Request when the device then joins a DIFFERENT group (join_group does
+/// not close an open window). Accepting that request while PendingJoin
+/// must refuse typed `NotInGroup` through the real request-resolution
+/// path — the gate sits before the window is consumed, so the request
+/// survives and the device can admit it once its own join resolves
+/// (completes or is cancelled).
+#[test]
+fn pending_join_device_cannot_accept_a_live_request() {
+    let relay_kp = make_relay_kp();
+    let relay_pub = relay_pub(&relay_kp);
+    let (pipe_a_client, pipe_a_relay) = mem_pipe_pair();
+    let (pipe_b_client, pipe_b_relay) = mem_pipe_pair();
+    let (nk_rx, nk) = nk_push_channel();
+    spawn_bidirectional_relay(&relay_kp, pipe_a_relay, pipe_b_relay, nk_rx);
+
+    let device_a = DeviceKeypair::generate();
+    let device_b = DeviceKeypair::generate();
+
+    let received: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(vec![]));
+    let rc = received.clone();
+    let session_a = TruesealSession::<MemPipe>::connect_full(
+        pipe_a_client,
+        relay_pub,
+        device_a,
+        |_, _, _| {},
+        Box::new(MemLog::new()),
+        || {},
+        |_| {},
+        || {},
+        nk.factory(),
+    )
+    .expect("session A");
+    session_a.set_on_member_request(move |token, _name| {
+        rc.lock().unwrap().push(token);
+    });
+
+    // A opens a window while NotJoined; B requests to join A's group.
+    let window_token = session_a.pairing_token().expect("window opens");
+    let session_b = TruesealSession::<MemPipe>::connect_full(
+        pipe_b_client,
+        relay_pub,
+        device_b,
+        |_, _, _| {},
+        Box::new(MemLog::new()),
+        || {},
+        |_| {},
+        || {},
+        nk.factory(),
+    )
+    .expect("session B");
+    session_b
+        .join_group(&window_token)
+        .expect("B joins A's window");
+    wait_for(
+        || !received.lock().unwrap().is_empty(),
+        Duration::from_secs(5),
+    );
+    let request_token = received.lock().unwrap()[0].clone();
+
+    // A then joins a DIFFERENT group: PendingJoin with a live request.
+    let initiator_c = DeviceKeypair::generate();
+    let token_c = crate::message::pairing_token(
+        &initiator_c.public_key().0,
+        &initiator_c.signing_public_key().0,
+        &[3u8; 32],
+    );
+    session_a.join_group(&token_c).expect("A joins C's group");
+    assert_eq!(session_a.group_status(), GroupStatus::PendingJoin);
+
+    // Accepting the live request is refused typed; nothing is issued.
+    let result = session_a.accept_member(&request_token);
+    assert!(
+        matches!(result, Err(SessionError::NotInGroup)),
+        "accept_member on a live request must fail typed NotInGroup while PendingJoin, got {result:?}"
+    );
+    assert!(
+        session_a.manifest.lock().unwrap().is_none(),
+        "no genesis manifest was issued"
+    );
+    assert_eq!(session_a.group_status(), GroupStatus::PendingJoin);
+
+    // Once the join is cancelled, the same live request CAN be admitted —
+    // the gate never consumed the window.
+    session_a.cancel_join();
+    let admitted = session_a
+        .accept_member(&request_token)
+        .expect("accept after cancel_join is a clean state change");
+    assert!(admitted, "the surviving request is admitted once Idle");
+    assert_eq!(session_a.group_status(), GroupStatus::Member);
+}
