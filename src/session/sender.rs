@@ -41,6 +41,18 @@ use super::{
 
 /// Tunables for the sender pump. Defaults follow ADR-0026: backoff from
 /// 1 s to a 5 min cap, and a 30-day expiry on `Sync` entries.
+///
+/// Accepted dev-preview behaviour (B7 review notes, SYNC-19):
+/// - The pump polls every 50 ms between kicks. A condition-variable-only
+///   design would need per-recipient deadline tracking; the fixed poll is
+///   simple and cheap (one wake per 50 ms per session) and stays for the
+///   preview.
+/// - The expiry sweep runs only while CONNECTED (the sweep lives in the
+///   connected branch of the loop). A `Sync` entry that ages past 30 days
+///   while the device is offline is failed on the next connected pass, not
+///   exactly at the deadline — harmless, because an expired entry could
+///   not have been delivered anyway (the Relay TTL cap is 30 days,
+///   ADR-0034 §2).
 pub(super) struct SenderConfig {
     pub retry_base: Duration,
     pub retry_cap: Duration,
@@ -229,10 +241,20 @@ fn sender_loop<T: crate::relay::Severable>(
             continue;
         }
 
-        let entries = op_log
+        // A failing store query is not a panic (SYNC-19): skip this pass
+        // and retry on the next poll — a persistently broken store surfaces
+        // typed `storage` errors through the send/open paths.
+        let entries = match op_log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .undelivered_entries();
+            .undelivered_entries()
+        {
+            Ok(entries) => entries,
+            Err(_) => {
+                kick.wait(config.poll);
+                continue;
+            }
+        };
 
         if entries.is_empty() {
             kick.wait(config.poll);

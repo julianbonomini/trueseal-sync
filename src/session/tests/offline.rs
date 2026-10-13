@@ -112,7 +112,12 @@ fn offline_session_with_manifest_queues_to_outbox() {
         "offline with manifest → Ok(()) (queued to outbox), got {result:?}"
     );
     // Verify outbox has the entry.
-    let undelivered = session.op_log.lock().unwrap().undelivered_entries();
+    let undelivered = session
+        .op_log
+        .lock()
+        .unwrap()
+        .undelivered_entries()
+        .unwrap();
     assert_eq!(undelivered.len(), 1, "outbox should have 1 queued message");
 }
 
@@ -197,7 +202,12 @@ fn unsupported_transport_version_leaves_outbox_queued() {
     // Let the reconnect loop bang on the refusing relay a few times.
     std::thread::sleep(Duration::from_millis(500));
 
-    let undelivered = session.op_log.lock().unwrap().undelivered_entries();
+    let undelivered = session
+        .op_log
+        .lock()
+        .unwrap()
+        .undelivered_entries()
+        .unwrap();
     assert_eq!(
         undelivered.len(),
         1,

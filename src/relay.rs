@@ -955,6 +955,14 @@ impl RelayClient<TcpStream> {
     /// FFI and CLI run every session in: a blocking receive would hold the
     /// session lock for the whole `read()` syscall and starve concurrent
     /// sends.
+    ///
+    /// WARNING (SYNC-6): a client connected this way has NO message handler
+    /// registered — an inbound Deliver frame processed before a handler
+    /// exists is acked and dropped, losing the message. Production paths
+    /// must register the handler before the receive loop starts (the
+    /// `connect` variants that take the handler up front, as `connect_full`
+    /// and `connect_background` do). This convenience exists for tests and
+    /// push-only clients.
     pub fn connect_tcp(
         addr: &str,
         relay_pub: NoisePublicKey,
@@ -2378,17 +2386,30 @@ mod tests {
         let _client =
             connect_with_timeouts(client_pipe, relay_pub, &device, test_timeouts(40, 5_000));
 
-        std::thread::sleep(std::time::Duration::from_millis(400));
-        let count = frames
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(t, _)| *t == MsgType::Heartbeat)
-            .count();
-        // ~10 intervals in 400 ms. A ping-pong storm produces hundreds.
+        let beat_count =
+            |frames: &std::sync::Arc<std::sync::Mutex<Vec<(MsgType, std::time::Instant)>>>| {
+                frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(t, _)| *t == MsgType::Heartbeat)
+                    .count()
+            };
+        // Lower bound WITHOUT a fixed sleep (SYNC-19 flake sweep): wait for
+        // the first beats however long startup takes on a loaded runner.
         assert!(
-            (2..=40).contains(&count),
-            "expected roughly one heartbeat per interval, got {count} — ping-pong?"
+            wait_until(|| beat_count(&frames) >= 2, 5_000),
+            "the client should heartbeat at the configured interval"
+        );
+        // Upper bound: over one more sampling window the count grows by
+        // roughly one beat per interval (~10 in 400 ms). A ping-pong storm
+        // would produce hundreds.
+        let before = beat_count(&frames);
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let delta = beat_count(&frames) - before;
+        assert!(
+            delta <= 40,
+            "expected roughly one heartbeat per interval, got {delta} in 400 ms — ping-pong?"
         );
     }
 

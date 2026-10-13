@@ -1,8 +1,10 @@
-# author_pub is unencrypted in the Envelope — relay observes the sender↔recipient graph
+# ADR-0035: author_pub is unencrypted in the Envelope — relay observes the sender↔recipient graph
+
+(Renumbered from the duplicate ADR-0018 in SYNC-19; the anonymous-push-sessions ADR keeps 0018.)
 
 ## Status
 
-Accepted — gap documented, fix deferred to v1.
+Accepted — gap documented; resolved by ADR-0031 (the Sealed Envelope moved the sender's signing key, sequence and timestamp inside the ciphertext; the relay now reads only the End-to-End Version, the recipient key and the sealed payload).
 
 ## Context
 

@@ -2,7 +2,7 @@
 
 Any device that knows a recipient's public key can push a blob addressed to it. The relay does not verify that the sender is a member of any group or has a prior relationship with the recipient. Garbage blobs from unknown senders are harmless — they cannot decrypt without the recipient's private key and are silently discarded at the application layer.
 
-This keeps the relay's knowledge of content minimal: it never decrypts payload content and never learns group membership. However, the relay **does** observe sender identity: every `Envelope` carries an unencrypted `author_pub` field (the sender's Ed25519 signing key) alongside the encrypted payload. The relay therefore observes (sender_signing_key → recipient_noise_key) pairs for every forwarded envelope. See ADR-0018 for the full analysis and the v1 fix plan.
+This keeps the relay's knowledge of content minimal: it never decrypts payload content and never learns group membership. However, the relay **does** observe sender identity: every `Envelope` carries an unencrypted `author_pub` field (the sender's Ed25519 signing key) alongside the encrypted payload. The relay therefore observes (sender_signing_key → recipient_noise_key) pairs for every forwarded envelope. See ADR-0035 for the full analysis; ADR-0031 implemented the fix (sender metadata is sealed).
 
 Rate limiting at the relay level is the mitigation for denial-of-service, not trust logic. The tradeoff (any sender can push to any recipient) was accepted because the cryptographic guarantee is end-to-end and the relay enforcing sender identity would require it to know trust relationships — violating the zero-knowledge content property.
 

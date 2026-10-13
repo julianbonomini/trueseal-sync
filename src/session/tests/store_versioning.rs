@@ -73,7 +73,7 @@ fn sync_queued_before_e2e_bump_is_delivered_once_with_original_id_and_stamp() {
         });
         // Read the stamped queue time back for the timestamp assertion.
         let s2 = Store::open(dir_a.path(), "a").expect("reopen");
-        PersistentLog::new(s2).undelivered_entries()[0].created_at
+        PersistentLog::new(s2).undelivered_entries().unwrap()[0].created_at
     };
 
     // ── The simulated End-to-End bump: migrate the store to e2e v2 ──────────
@@ -255,6 +255,7 @@ fn sync_queued_before_e2e_bump_is_delivered_once_with_original_id_and_stamp() {
         || {
             PersistentLog::new(Store::open(dir_a.path(), "a").expect("check"))
                 .undelivered_entries()
+                .unwrap()
                 .is_empty()
         },
         Duration::from_secs(10),
@@ -286,7 +287,10 @@ fn store_reset_clears_everything_and_reopen_is_clean() {
     assert_eq!(outcome.migrated_from, None);
     assert_eq!(outcome.resealed_from_e2e, None);
     assert!(s.load_keypair().expect("load").is_none());
-    assert!(PersistentLog::new(s).undelivered_entries().is_empty());
+    assert!(PersistentLog::new(s)
+        .undelivered_entries()
+        .unwrap()
+        .is_empty());
     // Reopen is a clean, current store.
     let (_s2, outcome2) = Store::open_with_outcome(dir.path(), "ns").expect("reopen");
     assert_eq!(outcome2, OpenOutcome::default());

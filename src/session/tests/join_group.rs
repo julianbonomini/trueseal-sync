@@ -181,7 +181,8 @@ fn join_group_queues_the_pair_when_the_relay_refuses_our_version() {
         .op_log
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .undelivered_entries();
+        .undelivered_entries()
+        .unwrap();
     assert_eq!(entries.len(), 1, "the Pair stays queued, undelivered");
     assert_eq!(
         entries[0].kind,

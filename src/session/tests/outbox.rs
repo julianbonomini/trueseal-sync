@@ -68,12 +68,18 @@ fn push_sync_appends_and_marks_delivered() {
                 .lock()
                 .unwrap()
                 .undelivered_entries()
+                .unwrap()
                 .is_empty()
         },
         Duration::from_secs(5),
     );
 
-    let undelivered = session.op_log.lock().unwrap().undelivered_entries();
+    let undelivered = session
+        .op_log
+        .lock()
+        .unwrap()
+        .undelivered_entries()
+        .unwrap();
     assert!(undelivered.is_empty(), "entry should be delivered");
 }
 
@@ -239,7 +245,12 @@ fn push_sync_while_disconnected_queues_and_returns_ok() {
     );
 
     // Exactly one outbox entry must exist (one recipient, not duplicated by retry).
-    let undelivered = session.op_log.lock().unwrap().undelivered_entries();
+    let undelivered = session
+        .op_log
+        .lock()
+        .unwrap()
+        .undelivered_entries()
+        .unwrap();
     assert_eq!(undelivered.len(), 1, "entry should be queued in outbox");
 }
 
@@ -334,7 +345,12 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
         session1.push_sync(b"blob-1".to_vec()).expect("push 1");
         session1.push_sync(b"blob-2".to_vec()).expect("push 2");
 
-        let undelivered = session1.op_log.lock().unwrap().undelivered_entries();
+        let undelivered = session1
+            .op_log
+            .lock()
+            .unwrap()
+            .undelivered_entries()
+            .unwrap();
         assert_eq!(undelivered.len(), 2, "2 entries in outbox before crash");
 
         // session1 drops here — simulates process crash.
@@ -345,7 +361,7 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
     let log2 = PersistentLog::new(store2);
     {
         use crate::operation_log::OperationLog;
-        let entries = log2.undelivered_entries();
+        let entries = log2.undelivered_entries().unwrap();
         assert_eq!(entries.len(), 2, "entries persist across session drop");
     }
 
@@ -385,6 +401,7 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
                 .lock()
                 .unwrap()
                 .undelivered_entries()
+                .unwrap()
                 .is_empty()
         },
         Duration::from_secs(5),
@@ -394,7 +411,12 @@ fn outbox_survives_crash_and_replays_on_reconnect() {
     assert_eq!(*lock.lock().unwrap(), 2, "relay received exactly 2 pushes");
 
     // Outbox must be empty after replay.
-    let undelivered = session2.op_log.lock().unwrap().undelivered_entries();
+    let undelivered = session2
+        .op_log
+        .lock()
+        .unwrap()
+        .undelivered_entries()
+        .unwrap();
     assert!(undelivered.is_empty(), "outbox empty after replay");
 }
 
@@ -452,7 +474,12 @@ fn sequence_counter_not_reused_after_restart() {
         session1.push_sync(b"b".to_vec()).expect("push b");
         session1.push_sync(b"c".to_vec()).expect("push c");
 
-        let entries = session1.op_log.lock().unwrap().undelivered_entries();
+        let entries = session1
+            .op_log
+            .lock()
+            .unwrap()
+            .undelivered_entries()
+            .unwrap();
         assert_eq!(entries.len(), 3, "3 offline entries");
         last_seq = entries
             .iter()
@@ -497,7 +524,12 @@ fn sequence_counter_not_reused_after_restart() {
         // Push one blob offline — must use sequence last_seq + 1 = 3.
         session2.push_sync(b"d".to_vec()).expect("push d");
 
-        let entries = session2.op_log.lock().unwrap().undelivered_entries();
+        let entries = session2
+            .op_log
+            .lock()
+            .unwrap()
+            .undelivered_entries()
+            .unwrap();
         // 4 entries total: 3 from session1 + 1 from session2.
         assert_eq!(entries.len(), 4, "4 entries total");
         let new_seq = entries

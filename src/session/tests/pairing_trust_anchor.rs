@@ -1016,7 +1016,8 @@ fn pending_join_survives_restart_with_pair_queued() {
             .op_log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .undelivered_entries();
+            .undelivered_entries()
+            .unwrap();
         assert!(
             undelivered.iter().any(|e| matches!(
                 crate::message::Message::decode(&e.blob),
@@ -1291,7 +1292,7 @@ fn admitter_restart_keeps_the_queued_admission_manifest() {
     {
         let store = Store::open(dir.path(), "ns").expect("reopen");
         let log = PersistentLog::new(store);
-        let undelivered = log.undelivered_entries();
+        let undelivered = log.undelivered_entries().unwrap();
         assert!(
             undelivered.iter().any(|e| matches!(
                 crate::message::Message::decode(&e.blob),
@@ -1438,14 +1439,16 @@ impl OperationLog for FailingJoinLog {
     fn remove(&mut self, object_id: &[u8; 32], sequence: u64) {
         self.inner.remove(object_id, sequence);
     }
-    fn undelivered_entries(&self) -> Vec<crate::operation_log::LogEntry> {
+    fn undelivered_entries(
+        &self,
+    ) -> Result<Vec<crate::operation_log::LogEntry>, crate::store::StoreError> {
         self.inner.undelivered_entries()
     }
     fn entries_from(
         &self,
         object_id: &[u8; 32],
         sequence: u64,
-    ) -> Vec<crate::operation_log::LogEntry> {
+    ) -> Result<Vec<crate::operation_log::LogEntry>, crate::store::StoreError> {
         self.inner.entries_from(object_id, sequence)
     }
     fn max_sequence(&self) -> Option<u64> {
@@ -1611,7 +1614,7 @@ fn pending_join_device_cannot_open_window_or_accept() {
     );
     {
         let log = session.op_log.lock().unwrap();
-        let entries = log.undelivered_entries();
+        let entries = log.undelivered_entries().unwrap();
         assert_eq!(
             entries.len(),
             1,

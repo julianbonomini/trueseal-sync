@@ -77,7 +77,8 @@ fn oversize_send_is_refused_and_never_enters_outbox() {
         .op_log
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .undelivered_entries();
+        .undelivered_entries()
+        .unwrap();
     assert!(
         undelivered.is_empty(),
         "an oversize body must never enter the Outbox, found {} entries",
@@ -122,7 +123,8 @@ fn oversize_outbox_entry_is_dropped_on_load() {
         .op_log
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .undelivered_entries();
+        .undelivered_entries()
+        .unwrap();
     assert_eq!(
         undelivered.len(),
         1,
@@ -148,7 +150,8 @@ fn send_at_exact_limit_is_accepted() {
         .op_log
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .undelivered_entries();
+        .undelivered_entries()
+        .unwrap();
     assert_eq!(
         undelivered.len(),
         1,
@@ -188,7 +191,8 @@ fn refused_send_consumes_no_sequence() {
         .op_log
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .undelivered_entries();
+        .undelivered_entries()
+        .unwrap();
     assert_eq!(undelivered.len(), 1);
     assert_eq!(
         undelivered[0].sequence, 0,
@@ -305,7 +309,8 @@ fn drop_reports_each_oversize_entry_once() {
     let remaining = op_log
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .undelivered_entries();
+        .undelivered_entries()
+        .unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].sequence, 5);
 }
@@ -414,7 +419,8 @@ fn oversize_entry_dropped_from_persistent_log_on_load() {
         .op_log
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .undelivered_entries();
+        .undelivered_entries()
+        .unwrap();
     assert_eq!(
         undelivered.len(),
         1,

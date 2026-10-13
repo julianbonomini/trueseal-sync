@@ -409,17 +409,23 @@ fn load_destroying(op_log: &Arc<Mutex<Box<dyn OperationLog>>>) -> Option<Destroy
 
 /// All mutable key material — replaced atomically on key rotation.
 ///
-/// TODO(P4): `noise_priv` and `signing_priv` are plain byte arrays and are NOT
-/// zeroized on drop. An attacker with process-memory read access could extract
-/// the private keys from heap. Fix: derive `zeroize::ZeroizeOnDrop` on this
-/// struct (add `zeroize` crate feature `zeroize_derive`, wrap fields in
-/// `Zeroizing<[u8;32]>`). Low urgency on current platforms (iOS/macOS sandbox
-/// provides OS-level memory protection), but expected by any security audit.
+/// Private material zeroizes on drop (SYNC-19): `noise_priv` and
+/// `signing_priv` are overwritten when a `KeyState` is dropped — every key
+/// rotation, removal wipe and Destroy Group replaces this struct, so the old
+/// private keys do not linger on the heap. The public-key fields are skipped
+/// (not secret). `DeviceKeypair` itself is covered by its fields: the noise
+/// `Keypair` derives `ZeroizeOnDrop` in trueseal-noise and ed25519-dalek's
+/// `SigningKey` zeroizes on drop. Data at rest stays OS-sandbox-only
+/// (documented preview limitation).
+#[derive(zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub(super) struct KeyState {
     pub noise_priv: [u8; 32],
+    #[zeroize(skip)]
     pub noise_pub_key: [u8; 32],
     pub signing_priv: [u8; 32],
+    #[zeroize(skip)]
     pub noise_pub: NoisePublicKey,
+    #[zeroize(skip)]
     pub signing_pub: SigningPublicKey,
 }
 
@@ -632,12 +638,17 @@ fn drop_oversize_outbox_entries(
 ) {
     let oversized: Vec<(u64, [u8; 32])> = {
         let mut log = op_log.lock().unwrap_or_else(|e| e.into_inner());
-        let oversized: Vec<(u64, [u8; 32])> = log
-            .undelivered_entries()
-            .into_iter()
-            .filter(|entry| entry.blob.len() > PROTOCOL_SIZE_LIMIT)
-            .map(|entry| (entry.sequence, entry.object_id))
-            .collect();
+        // A failing store query here is not a panic (SYNC-19): skip the
+        // sweep — the next session open retries, and a persistently broken
+        // store surfaces typed `storage` errors through open/send paths.
+        let oversized: Vec<(u64, [u8; 32])> = match log.undelivered_entries() {
+            Ok(entries) => entries
+                .into_iter()
+                .filter(|entry| entry.blob.len() > PROTOCOL_SIZE_LIMIT)
+                .map(|entry| (entry.sequence, entry.object_id))
+                .collect(),
+            Err(_) => return,
+        };
         for (sequence, object_id) in &oversized {
             log.remove(object_id, *sequence);
         }
@@ -809,11 +820,16 @@ pub(super) fn refs_drained(
     refs: &[([u8; 32], u64)],
 ) -> bool {
     let log = op_log.lock().unwrap_or_else(|e| e.into_inner());
-    let undelivered: std::collections::HashSet<([u8; 32], u64)> = log
-        .undelivered_entries()
-        .into_iter()
-        .map(|e| (e.object_id, e.sequence))
-        .collect();
+    // A failing store query reads as "not drained" (SYNC-19): the
+    // Leave/Destroy completion never fires on unknown state — the record
+    // stays and the next pump pass retries.
+    let undelivered: std::collections::HashSet<([u8; 32], u64)> = match log.undelivered_entries() {
+        Ok(entries) => entries
+            .into_iter()
+            .map(|e| (e.object_id, e.sequence))
+            .collect(),
+        Err(_) => return false,
+    };
     refs.iter().all(|r| !undelivered.contains(r))
 }
 
@@ -1932,6 +1948,13 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
     /// rotation still happens in memory on a deliberate removal or completed
     /// Leave; the callback is only for persisting the fresh keypair, which
     /// MemLog-backed and test sessions don't need.
+    ///
+    /// WARNING (SYNC-7): this path does NOT restore the persisted manifest
+    /// before connecting — the session starts with an empty manifest slot
+    /// and the member filter is bypassed for anything that arrives in the
+    /// window before a manifest lands. Production must use
+    /// [`Self::connect_background`] (or `connect_full_rotating`), which
+    /// caller-seeds the slot from the store before the connection starts.
     #[allow(clippy::too_many_arguments)]
     pub fn connect_full(
         transport: T,
@@ -2252,6 +2275,11 @@ impl<T: crate::relay::Severable> TruesealSession<T> {
 
     /// `connect_with_reconnect` without identity-rotation persistence (see
     /// [`Self::connect_full`]).
+    ///
+    /// WARNING (SYNC-7): like `connect_full`, this path starts with an empty
+    /// manifest slot — production must use [`Self::connect_background`]
+    /// (or the `_rotating` variants), which caller-seeds the persisted
+    /// manifest before the reconnect loop spawns.
     #[allow(clippy::too_many_arguments)]
     pub fn connect_with_reconnect(
         transport: T,

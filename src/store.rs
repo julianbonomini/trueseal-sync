@@ -892,68 +892,66 @@ impl OperationLog for PersistentLog {
         self.store.checkpoint_wal();
     }
 
-    fn undelivered_entries(&self) -> Vec<LogEntry> {
-        let mut stmt = self
-            .store
-            .conn
-            .prepare(
-                "SELECT object_id, sequence, blob, kind, created_at FROM outbox
-                 WHERE delivered = 0 ORDER BY sequence ASC",
-            )
-            .expect("prepare undelivered");
-        let rows = stmt
-            .query_map([], |row| {
-                let oid: Vec<u8> = row.get(0)?;
-                let seq: i64 = row.get(1)?;
-                let blob: Vec<u8> = row.get(2)?;
-                let kind: i64 = row.get(3)?;
-                let created_at: i64 = row.get(4)?;
-                Ok((oid, seq as u64, blob, kind, created_at as u64))
+    fn undelivered_entries(&self) -> Result<Vec<LogEntry>, StoreError> {
+        let mut stmt = self.store.conn.prepare(
+            "SELECT object_id, sequence, blob, kind, created_at FROM outbox
+             WHERE delivered = 0 ORDER BY sequence ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let oid: Vec<u8> = row.get(0)?;
+            let seq: i64 = row.get(1)?;
+            let blob: Vec<u8> = row.get(2)?;
+            let kind: i64 = row.get(3)?;
+            let created_at: i64 = row.get(4)?;
+            Ok((oid, seq as u64, blob, kind, created_at as u64))
+        })?;
+        // A row that fails to decode is a store error, not a skip — silently
+        // dropping it would stall the outbox forever with no signal.
+        rows.map(|r| {
+            let (oid, sequence, blob, kind, created_at) = r?;
+            let object_id: [u8; 32] = oid.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?;
+            Ok(LogEntry {
+                object_id,
+                sequence,
+                kind: kind_from_db(kind),
+                created_at,
+                blob,
             })
-            .expect("query undelivered");
-        rows.filter_map(|r| r.ok())
-            .filter_map(|(oid, sequence, blob, kind, created_at)| {
-                let object_id: [u8; 32] = oid.try_into().ok()?;
-                Some(LogEntry {
-                    object_id,
-                    sequence,
-                    kind: kind_from_db(kind),
-                    created_at,
-                    blob,
-                })
-            })
-            .collect()
+        })
+        .collect::<Result<Vec<_>, rusqlite::Error>>()
+        .map_err(StoreError::from)
     }
 
-    fn entries_from(&self, object_id: &[u8; 32], sequence: u64) -> Vec<LogEntry> {
-        let mut stmt = self
-            .store
-            .conn
-            .prepare(
-                "SELECT sequence, blob, kind, created_at FROM outbox
-                 WHERE object_id = ?1 AND sequence >= ?2
-                 ORDER BY sequence ASC",
-            )
-            .expect("prepare entries_from");
+    fn entries_from(
+        &self,
+        object_id: &[u8; 32],
+        sequence: u64,
+    ) -> Result<Vec<LogEntry>, StoreError> {
+        let mut stmt = self.store.conn.prepare(
+            "SELECT sequence, blob, kind, created_at FROM outbox
+             WHERE object_id = ?1 AND sequence >= ?2
+             ORDER BY sequence ASC",
+        )?;
         let oid_slice: &[u8] = object_id.as_slice();
-        let rows = stmt
-            .query_map(rusqlite::params![oid_slice, sequence as i64], |row| {
-                let seq: i64 = row.get(0)?;
-                let blob: Vec<u8> = row.get(1)?;
-                let kind: i64 = row.get(2)?;
-                let created_at: i64 = row.get(3)?;
-                Ok((seq as u64, blob, kind, created_at as u64))
-            })
-            .expect("query entries_from");
-        rows.filter_map(|r| r.ok())
-            .map(|(seq, blob, kind, created_at)| LogEntry {
+        let rows = stmt.query_map(rusqlite::params![oid_slice, sequence as i64], |row| {
+            let seq: i64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let kind: i64 = row.get(2)?;
+            let created_at: i64 = row.get(3)?;
+            Ok((seq as u64, blob, kind, created_at as u64))
+        })?;
+        rows.map(|r| {
+            let (seq, blob, kind, created_at) = r?;
+            Ok(LogEntry {
                 object_id: *object_id,
                 sequence: seq,
                 kind: kind_from_db(kind),
                 created_at,
                 blob,
             })
-            .collect()
+        })
+        .collect::<Result<Vec<_>, rusqlite::Error>>()
+        .map_err(StoreError::from)
     }
 
     fn max_sequence(&self) -> Option<u64> {
@@ -1303,7 +1301,7 @@ mod tests {
         // Reopen and check outbox is empty
         let s3 = Store::open(dir.path(), "ns").expect("open3");
         let log2 = PersistentLog::new(s3);
-        assert!(log2.undelivered_entries().is_empty());
+        assert!(log2.undelivered_entries().unwrap().is_empty());
     }
 
     /// wipe() also clears the ADR-0027 tables (changes, held history,
@@ -1379,11 +1377,36 @@ mod tests {
         log.append(&[1u8; 32], 0, b"first".to_vec());
         log.append(&[1u8; 32], 1, b"second".to_vec());
         log.append(&[1u8; 32], 2, b"third".to_vec());
-        let entries = log.undelivered_entries();
+        let entries = log.undelivered_entries().unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].blob, b"first");
         assert_eq!(entries[1].blob, b"second");
         assert_eq!(entries[2].blob, b"third");
+    }
+
+    /// SYNC-19: a failing store query surfaces as `Err(StoreError)` — the
+    /// old code panicked via `.expect()`, which would crash the host app.
+    #[test]
+    fn undelivered_entries_surfaces_store_errors_without_panicking() {
+        let dir = tmp_dir();
+        let s = Store::open(dir.path(), "ns").expect("open");
+        let log = PersistentLog::new(s);
+        // Break the query underneath the store: drop the outbox table via a
+        // second connection to the same file.
+        let raw =
+            rusqlite::Connection::open(dir.path().join("trueseal_ns.db")).expect("raw connection");
+        raw.execute_batch("DROP TABLE outbox;").expect("drop table");
+        drop(raw);
+        let result = log.undelivered_entries();
+        assert!(
+            matches!(result, Err(StoreError::Sqlite(_))),
+            "undelivered_entries must return a typed storage error, not panic"
+        );
+        let result = log.entries_from(&[1u8; 32], 0);
+        assert!(
+            matches!(result, Err(StoreError::Sqlite(_))),
+            "entries_from must return a typed storage error, not panic"
+        );
     }
 
     /// A delivered-flag entry is excluded from undelivered_entries but kept in entries_from.
@@ -1395,11 +1418,11 @@ mod tests {
         log.append(&[1u8; 32], 0, b"keep".to_vec());
         log.append(&[1u8; 32], 1, b"deliver".to_vec());
         set_delivered(&log, &[1u8; 32], 1);
-        let undelivered = log.undelivered_entries();
+        let undelivered = log.undelivered_entries().unwrap();
         assert_eq!(undelivered.len(), 1);
         assert_eq!(undelivered[0].blob, b"keep");
         // entries_from still returns both
-        let all = log.entries_from(&[1u8; 32], 0);
+        let all = log.entries_from(&[1u8; 32], 0).unwrap();
         assert_eq!(all.len(), 2);
     }
 
@@ -1409,7 +1432,7 @@ mod tests {
         let dir = tmp_dir();
         let s = Store::open(dir.path(), "ns").expect("open");
         let log = PersistentLog::new(s);
-        assert!(log.undelivered_entries().is_empty());
+        assert!(log.undelivered_entries().unwrap().is_empty());
     }
 
     // ── PersistentLog tests ────────────────────────────────────────────────────
@@ -1441,7 +1464,7 @@ mod tests {
         let s = Store::open(dir.path(), "ns").expect("open");
         let mut log = PersistentLog::new(s);
         log.append(&oid(1), 0, b"hello".to_vec());
-        let entries = log.entries_from(&oid(1), 0);
+        let entries = log.entries_from(&oid(1), 0).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sequence, 0);
         assert_eq!(entries[0].blob, b"hello");
@@ -1456,7 +1479,7 @@ mod tests {
         let mut log = PersistentLog::new(s);
         log.append(&oid(1), 5, b"original".to_vec());
         log.append(&oid(1), 5, b"overwrite attempt".to_vec());
-        let entries = log.entries_from(&oid(1), 5);
+        let entries = log.entries_from(&oid(1), 5).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].blob, b"original");
     }
@@ -1469,7 +1492,7 @@ mod tests {
         let mut log = PersistentLog::new(s);
         log.append(&oid(1), 0, b"a".to_vec());
         log.append(&oid(2), 1, b"b".to_vec());
-        let undelivered = log.undelivered_entries();
+        let undelivered = log.undelivered_entries().unwrap();
         assert_eq!(undelivered.len(), 2);
     }
 
@@ -1484,6 +1507,7 @@ mod tests {
         log.append(&oid(1), 2, b"b".to_vec());
         let seqs: Vec<u64> = log
             .undelivered_entries()
+            .unwrap()
             .iter()
             .map(|e| e.sequence)
             .collect();
@@ -1498,7 +1522,7 @@ mod tests {
         let mut log = PersistentLog::new(s);
         log.append(&oid(1), 0, b"msg".to_vec());
         set_delivered(&log, &oid(1), 0);
-        assert!(log.undelivered_entries().is_empty());
+        assert!(log.undelivered_entries().unwrap().is_empty());
     }
 
     /// The delivered flag does not remove an entry from entries_from.
@@ -1509,7 +1533,7 @@ mod tests {
         let mut log = PersistentLog::new(s);
         log.append(&oid(1), 0, b"msg".to_vec());
         set_delivered(&log, &oid(1), 0);
-        let entries = log.entries_from(&oid(1), 0);
+        let entries = log.entries_from(&oid(1), 0).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].blob, b"msg");
     }
@@ -1523,7 +1547,7 @@ mod tests {
         log.append(&oid(1), 0, b"first".to_vec());
         log.append(&oid(1), 1, b"second".to_vec());
         log.append(&oid(1), 2, b"third".to_vec());
-        let entries = log.entries_from(&oid(1), 1);
+        let entries = log.entries_from(&oid(1), 1).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].sequence, 1);
         assert_eq!(entries[1].sequence, 2);
@@ -1541,7 +1565,7 @@ mod tests {
         }
         let s2 = Store::open(dir.path(), "ns").expect("reopen");
         let log2 = PersistentLog::new(s2);
-        let undelivered = log2.undelivered_entries();
+        let undelivered = log2.undelivered_entries().unwrap();
         assert_eq!(undelivered.len(), 1);
         assert_eq!(undelivered[0].blob, b"persisted");
     }
@@ -1627,7 +1651,7 @@ mod tests {
         let s2 = Store::open(dir.path(), "ns").expect("reopen");
         let log2 = PersistentLog::new(s2);
         assert_eq!(log2.max_sequence(), Some(0), "high-water mark persists");
-        assert!(log2.undelivered_entries().is_empty());
+        assert!(log2.undelivered_entries().unwrap().is_empty());
     }
 
     /// Kind and created_at round-trip through SQLite; a Sync entry staged
@@ -1645,7 +1669,7 @@ mod tests {
             created_at: 1_000_000,
             blob: b"old".to_vec(),
         });
-        let entries = log.undelivered_entries();
+        let entries = log.undelivered_entries().unwrap();
         assert_eq!(entries[0].kind, OutboxKind::Control);
         assert!(entries[0].created_at > 1_000_000);
         assert_eq!(entries[1].kind, OutboxKind::Sync);
@@ -1739,7 +1763,7 @@ mod tests {
         assert!(!outcome.created);
         let log = PersistentLog::new(s);
         assert!(
-            log.undelivered_entries().is_empty(),
+            log.undelivered_entries().unwrap().is_empty(),
             "the reset wiped the legacy rows"
         );
         // The store is fully usable: schema complete, versioned, working.
@@ -1773,7 +1797,7 @@ mod tests {
             log2.pending_join().as_deref(),
             Some(b"pending-record".as_slice())
         );
-        let undelivered = log2.undelivered_entries();
+        let undelivered = log2.undelivered_entries().unwrap();
         assert_eq!(undelivered.len(), 1);
         assert_eq!(undelivered[0].kind, OutboxKind::Control);
         assert_eq!(undelivered[0].sequence, 3);
@@ -1796,7 +1820,7 @@ mod tests {
             log.pending_join().as_deref(),
             Some(b"new-anchor".as_slice())
         );
-        let undelivered = log.undelivered_entries();
+        let undelivered = log.undelivered_entries().unwrap();
         assert_eq!(
             undelivered.len(),
             2,
@@ -1821,7 +1845,7 @@ mod tests {
         let log2 = PersistentLog::new(s2);
         assert!(log2.pending_join().is_none());
         // The queued Pair is NOT removed by cancelJoin — the outbox owns it.
-        assert_eq!(log2.undelivered_entries().len(), 1);
+        assert_eq!(log2.undelivered_entries().unwrap().len(), 1);
     }
 
     /// wipe() clears the Pending Join — after Destroy Group the device
@@ -1889,7 +1913,7 @@ mod tests {
         assert!(log2.is_held_including_self(&[7u8; 32]));
         assert!(!log2.is_held_including_self(&[8u8; 32]));
         assert_eq!(log2.leaving().as_deref(), Some(b"leave-refs".as_slice()));
-        let undelivered = log2.undelivered_entries();
+        let undelivered = log2.undelivered_entries().unwrap();
         assert_eq!(undelivered.len(), 1);
         assert_eq!(undelivered[0].kind, OutboxKind::Control);
         // The manifest row landed too (same DB the FFI reads).
@@ -2086,7 +2110,7 @@ mod tests {
             outbox: vec![(oid(2), 3, b"revoke".to_vec())],
         })
         .expect("commit");
-        let remaining = log.undelivered_entries();
+        let remaining = log.undelivered_entries().unwrap();
         assert_eq!(remaining.len(), 1, "only the queued Revoke survives");
         assert_eq!(remaining[0].kind, OutboxKind::Control);
         assert_eq!(remaining[0].object_id, oid(2));
@@ -2149,7 +2173,7 @@ mod tests {
         })
         .expect("commit");
         log.wipe_group_state();
-        assert!(log.undelivered_entries().is_empty());
+        assert!(log.undelivered_entries().unwrap().is_empty());
         assert!(!log.is_handled("tsm1_a"));
         assert_eq!(log.max_sequence(), None);
         assert!(log.pending_join().is_none());
@@ -2225,10 +2249,14 @@ mod tests {
             let s = Store::open(dir.path(), "ns").expect("open");
             let mut log = PersistentLog::new(s);
             log.append(&oid(7), 1, marker.clone());
-            assert_eq!(log.undelivered_entries()[0].blob, marker, "body stored");
+            assert_eq!(
+                log.undelivered_entries().unwrap()[0].blob,
+                marker,
+                "body stored"
+            );
             // Relay acceptance, exactly what the pump does on Ok.
             log.remove(&oid(7), 1);
-            assert!(log.undelivered_entries().is_empty());
+            assert!(log.undelivered_entries().unwrap().is_empty());
             // What the pump does at the end of a pass that removed rows.
             log.checkpoint_wal();
             // Scan WHILE THE STORE IS STILL OPEN: the truncated-but-present
@@ -2255,7 +2283,7 @@ mod tests {
         }
         let s = Store::open(dir.path(), "ns").expect("reopen");
         let log = PersistentLog::new(s);
-        let entries = log.undelivered_entries();
+        let entries = log.undelivered_entries().unwrap();
         assert_eq!(
             entries.len(),
             1,

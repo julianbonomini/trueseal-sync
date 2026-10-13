@@ -493,7 +493,13 @@ fn destroy_group_drops_sync_sends_and_replays_revoke_after_reconnect() {
     session.push_sync(b"blob-1".to_vec()).expect("push 1");
     session.push_sync(b"blob-2".to_vec()).expect("push 2");
     assert_eq!(
-        session.op_log.lock().unwrap().undelivered_entries().len(),
+        session
+            .op_log
+            .lock()
+            .unwrap()
+            .undelivered_entries()
+            .unwrap()
+            .len(),
         2,
         "2 outbox entries"
     );
@@ -509,7 +515,7 @@ fn destroy_group_drops_sync_sends_and_replays_revoke_after_reconnect() {
     );
     {
         let log = session.op_log.lock().unwrap();
-        let entries = log.undelivered_entries();
+        let entries = log.undelivered_entries().unwrap();
         assert_eq!(entries.len(), 1, "only the queued Revoke survives");
         assert_eq!(
             entries[0].kind,

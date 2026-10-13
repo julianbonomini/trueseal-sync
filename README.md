@@ -94,4 +94,4 @@ Ecosystem overview and full protocol documentation → **[trueseal-docs](../docs
 
 ## License
 
-MIT
+Apache-2.0
