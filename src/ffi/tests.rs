@@ -853,116 +853,63 @@ fn newer_store_is_refused_with_store_too_new() {
     assert_eq!(before, after, "refused store: bytes unchanged");
 }
 
-// ── The machine-readable surface (G12) ────────────────────────────────────────
-
-/// One canonical code per error variant — an exhaustive match, so the
-/// compiler fails this test's helper when a 15th case appears.
-fn error_code(e: &TrueSealError) -> &'static str {
-    match e {
-        TrueSealError::InvalidRelayAddress { .. } => "invalidRelayAddress",
-        TrueSealError::InvalidNamespace { .. } => "invalidNamespace",
-        TrueSealError::Storage { .. } => "storage",
-        TrueSealError::Closed => "closed",
-        TrueSealError::NotMember { .. } => "notMember",
-        TrueSealError::AlreadyInGroup => "alreadyInGroup",
-        TrueSealError::InvalidPairingToken => "invalidPairingToken",
-        TrueSealError::PairingClosed => "pairingClosed",
-        TrueSealError::GroupFull { .. } => "groupFull",
-        TrueSealError::MemberNotFound => "memberNotFound",
-        TrueSealError::PayloadTooLarge { .. } => "payloadTooLarge",
-        TrueSealError::MessageHandlerAlreadySet => "messageHandlerAlreadySet",
-        TrueSealError::StoreTooNew { .. } => "storeTooNew",
-        TrueSealError::ManifestVersionExhausted => "manifestVersionExhausted",
-    }
-}
-
-/// One instance of every error variant — 14, no more (ADR-0028 as amended
-/// by ADR-0032 and SYNC-15).
-fn every_error() -> Vec<TrueSealError> {
-    vec![
-        TrueSealError::InvalidRelayAddress { msg: String::new() },
-        TrueSealError::InvalidNamespace { msg: String::new() },
-        TrueSealError::Storage { msg: String::new() },
-        TrueSealError::Closed,
-        TrueSealError::NotMember {
-            status: GroupStatus::NotJoined,
-        },
-        TrueSealError::AlreadyInGroup,
-        TrueSealError::InvalidPairingToken,
-        TrueSealError::PairingClosed,
-        TrueSealError::GroupFull { max: 32 },
-        TrueSealError::MemberNotFound,
-        TrueSealError::PayloadTooLarge { max: 61440 },
-        TrueSealError::MessageHandlerAlreadySet,
-        TrueSealError::StoreTooNew {
-            found: 2,
-            supported: 1,
-        },
-        TrueSealError::ManifestVersionExhausted,
-    ]
-}
+// ── The machine-readable surface (G12, SYNC-21) ───────────────────────────────
+//
+// The code-side lists come from `crate::surface` — the single source that
+// also feeds the generator (`cargo run --bin gen-shared-facts`), so this
+// test, the shared-facts test and the emitted files can never disagree
+// about what the code says. `surface`'s naming functions are exhaustive
+// matches: adding a variant fails compilation until it is named there.
 
 #[test]
 fn the_ffi_surface_matches_api_surface_json() {
+    use crate::surface;
     let golden: serde_jsonless::Surface = serde_jsonless::load();
 
     // Errors: 14 canonical cases (ADR-0028 as amended by ADR-0032 and the
-    // SYNC-15 amendment). `error_code` is an exhaustive match — adding a
-    // variant fails compilation until the JSON and this test move together.
-    let codes: Vec<&str> = every_error().iter().map(error_code).collect();
+    // SYNC-15 amendment).
+    let codes: Vec<&str> = surface::errors();
     assert_eq!(codes.len(), 14);
     assert_eq!(codes, golden.errors, "api-surface.json: errors drifted");
 
     // Events.
-    let events: Vec<&str> = every_event().iter().map(event_kind).collect();
+    let events: Vec<&str> = surface::events();
     assert_eq!(events, golden.events, "api-surface.json: events drifted");
 
     // Group statuses, status reasons, connection states.
-    let statuses: Vec<&str> = every_status().iter().map(status_name).collect();
+    let statuses: Vec<&str> = surface::statuses();
     assert_eq!(
         statuses, golden.statuses,
         "api-surface.json: statuses drifted"
     );
-    let reasons: Vec<&str> = every_status_reason()
-        .iter()
-        .map(status_reason_name)
-        .collect();
+    let reasons: Vec<&str> = surface::status_reasons();
     assert_eq!(
         reasons, golden.status_reasons,
         "api-surface.json: statusReasons drifted"
     );
-    let connections: Vec<&str> = every_connection_state()
-        .iter()
-        .map(connection_state_name)
-        .collect();
+    let connections: Vec<&str> = surface::connection_states();
     assert_eq!(
         connections, golden.connection_states,
         "api-surface.json: connectionStates drifted"
     );
 
     // Delivery issues and their reason enums.
-    let issues: Vec<&str> = every_issue().iter().map(issue_kind).collect();
+    let issues: Vec<&str> = surface::delivery_issues();
     assert_eq!(
         issues, golden.delivery_issues,
         "api-surface.json: deliveryIssues drifted"
     );
-    let unreadable: Vec<&str> = every_unreadable_reason()
-        .iter()
-        .map(unreadable_reason_name)
-        .collect();
+    let unreadable: Vec<&str> = surface::unreadable_reasons();
     assert_eq!(
         unreadable, golden.unreadable_reasons,
         "api-surface.json: unreadableReasons drifted"
     );
-    let send_failed: Vec<&str> = every_send_failed_reason()
-        .iter()
-        .map(send_failed_reason_name)
-        .collect();
+    let send_failed: Vec<&str> = surface::send_failed_reasons();
     assert_eq!(
         send_failed, golden.send_failed_reasons,
         "api-surface.json: sendFailedReasons drifted"
     );
-    let drops: Vec<&str> = vec![admission_drop_reason_name(&AdmissionDropReason::GroupFull)];
+    let drops: Vec<&str> = surface::admission_drop_reasons();
     assert_eq!(
         drops, golden.admission_drop_reasons,
         "api-surface.json: admissionDropReasons drifted"
@@ -971,169 +918,115 @@ fn the_ffi_surface_matches_api_surface_json() {
     // Limits come from the core constants — the single source of truth.
     assert_eq!(golden.max_payload_bytes, 61_440);
     assert_eq!(golden.max_payload_bytes, trueseal_max_payload_bytes());
+    assert_eq!(golden.max_payload_bytes, surface::max_payload_bytes());
     assert_eq!(golden.max_group_size, 32);
     assert_eq!(golden.max_group_size, trueseal_max_group_size());
+    assert_eq!(golden.max_group_size, surface::max_group_size());
 }
 
-fn every_event() -> Vec<TrueSealEvent> {
-    vec![
-        TrueSealEvent::StatusChanged {
-            status: GroupStatus::Member,
-            reason: StatusReason::Joined,
-        },
-        TrueSealEvent::MembersChanged { members: vec![] },
-        TrueSealEvent::JoinRequest {
-            request: JoinRequest {
-                id: String::new(),
-                name: String::new(),
-            },
-        },
-        TrueSealEvent::ConnectionChanged {
-            connection: ConnectionState::Connected,
-        },
-        TrueSealEvent::AdmissionDropped {
-            name: String::new(),
-            reason: AdmissionDropReason::GroupFull,
-        },
-    ]
-}
+/// Shared Facts (SYNC-21, docs ADR-0003): the checked-in
+/// docs/shared-facts.json must carry every public error, event, limit,
+/// protocol/Store Version and the Relay Address format — from the code,
+/// not by hand. This test fails if a fact is missing or stale; CI's
+/// `gen-shared-facts --check` gate fails if the file was not regenerated.
+#[test]
+fn shared_facts_json_matches_the_code() {
+    use crate::surface;
+    let raw = include_str!("../../docs/shared-facts.json");
 
-fn event_kind(e: &TrueSealEvent) -> &'static str {
-    match e {
-        TrueSealEvent::StatusChanged { .. } => "statusChanged",
-        TrueSealEvent::MembersChanged { .. } => "membersChanged",
-        TrueSealEvent::JoinRequest { .. } => "joinRequest",
-        TrueSealEvent::ConnectionChanged { .. } => "connectionChanged",
-        TrueSealEvent::AdmissionDropped { .. } => "admissionDropped",
-    }
-}
+    assert_eq!(
+        serde_jsonless::extract_string(raw, "sdkVersion"),
+        env!("CARGO_PKG_VERSION")
+    );
 
-fn every_status() -> Vec<GroupStatus> {
-    vec![
-        GroupStatus::NotJoined,
-        GroupStatus::PendingJoin,
-        GroupStatus::Member,
-        GroupStatus::Leaving,
-        GroupStatus::Destroying,
-    ]
-}
+    // Versions (ADR-0022, ADR-0032).
+    assert_eq!(
+        serde_jsonless::extract_number(raw, "transportVersion"),
+        surface::transport_version()
+    );
+    assert_eq!(
+        serde_jsonless::extract_number(raw, "endToEndVersion"),
+        surface::end_to_end_version()
+    );
+    assert_eq!(
+        serde_jsonless::extract_number(raw, "storeVersion"),
+        surface::store_version()
+    );
+    assert_eq!(
+        serde_jsonless::extract_number(raw, "storeMigrationFloor"),
+        surface::store_migration_floor()
+    );
 
-fn status_name(s: &GroupStatus) -> &'static str {
-    match s {
-        GroupStatus::NotJoined => "notJoined",
-        GroupStatus::PendingJoin => "pendingJoin",
-        GroupStatus::Member => "member",
-        GroupStatus::Leaving => "leaving",
-        GroupStatus::Destroying => "destroying",
-    }
-}
+    // Limits (ADR-0025, ADR-0027, ADR-0022).
+    assert_eq!(
+        serde_jsonless::extract_number(raw, "maxPayloadBytes"),
+        surface::max_payload_bytes()
+    );
+    assert_eq!(
+        serde_jsonless::extract_number(raw, "maxGroupSize"),
+        surface::max_group_size()
+    );
+    assert_eq!(
+        serde_jsonless::extract_number(raw, "maxHeldBlobs"),
+        surface::max_held_blobs()
+    );
 
-fn every_status_reason() -> Vec<StatusReason> {
-    vec![
-        StatusReason::Created,
-        StatusReason::Joined,
-        StatusReason::Left,
-        StatusReason::Removed,
-        StatusReason::Destroyed,
-        StatusReason::StoreReset,
-    ]
-}
+    // Relay Address (ADR-0028).
+    assert_eq!(
+        serde_jsonless::extract_string(raw, "format"),
+        surface::relay_address_format()
+    );
+    assert_eq!(
+        serde_jsonless::extract_string(raw, "scheme"),
+        surface::relay_address_scheme()
+    );
+    assert_eq!(
+        serde_jsonless::extract_number(raw, "defaultReceivePort"),
+        surface::relay_address_default_receive_port() as u32
+    );
+    assert_eq!(
+        serde_jsonless::extract_number(raw, "defaultPushPort"),
+        surface::relay_address_default_push_port() as u32
+    );
 
-fn status_reason_name(r: &StatusReason) -> &'static str {
-    match r {
-        StatusReason::Created => "created",
-        StatusReason::Joined => "joined",
-        StatusReason::Left => "left",
-        StatusReason::Removed => "removed",
-        StatusReason::Destroyed => "destroyed",
-        StatusReason::StoreReset => "storeReset",
-    }
-}
-
-fn every_connection_state() -> Vec<ConnectionState> {
-    vec![
-        ConnectionState::Connecting,
-        ConnectionState::Connected,
-        ConnectionState::Disconnected,
-        ConnectionState::RelayVersionUnsupported { min: 1, max: 1 },
-    ]
-}
-
-fn connection_state_name(c: &ConnectionState) -> &'static str {
-    match c {
-        ConnectionState::Connecting => "connecting",
-        ConnectionState::Connected => "connected",
-        ConnectionState::Disconnected => "disconnected",
-        ConnectionState::RelayVersionUnsupported { .. } => "relayVersionUnsupported",
-    }
-}
-
-fn every_issue() -> Vec<DeliveryIssue> {
-    vec![
-        DeliveryIssue::Unreadable {
-            reason: UnreadableReason::Malformed,
-        },
-        DeliveryIssue::Unauthorized,
-        DeliveryIssue::HeldForUpgrade { version: 2 },
-        DeliveryIssue::HandlerGaveUp {
-            message_id: String::new(),
-            error: String::new(),
-        },
-        DeliveryIssue::SendFailed {
-            message_id: String::new(),
-            reason: SendFailedReason::Expired,
-        },
-    ]
-}
-
-fn issue_kind(i: &DeliveryIssue) -> &'static str {
-    match i {
-        DeliveryIssue::Unreadable { .. } => "unreadable",
-        DeliveryIssue::Unauthorized => "unauthorized",
-        DeliveryIssue::HeldForUpgrade { .. } => "heldForUpgrade",
-        DeliveryIssue::HandlerGaveUp { .. } => "handlerGaveUp",
-        DeliveryIssue::SendFailed { .. } => "sendFailed",
-    }
-}
-
-fn every_unreadable_reason() -> Vec<UnreadableReason> {
-    vec![
-        UnreadableReason::Malformed,
-        UnreadableReason::SenderOutdated,
-        UnreadableReason::Expired,
-        UnreadableReason::DroppedWhileHeld,
-    ]
-}
-
-fn unreadable_reason_name(r: &UnreadableReason) -> &'static str {
-    match r {
-        UnreadableReason::Malformed => "malformed",
-        UnreadableReason::SenderOutdated => "senderOutdated",
-        UnreadableReason::Expired => "expired",
-        UnreadableReason::DroppedWhileHeld => "droppedWhileHeld",
-    }
-}
-
-fn every_send_failed_reason() -> Vec<SendFailedReason> {
-    vec![
-        SendFailedReason::TooLarge,
-        SendFailedReason::Malformed,
-        SendFailedReason::Expired,
-    ]
-}
-
-fn send_failed_reason_name(r: &SendFailedReason) -> &'static str {
-    match r {
-        SendFailedReason::TooLarge => "tooLarge",
-        SendFailedReason::Malformed => "malformed",
-        SendFailedReason::Expired => "expired",
-    }
-}
-
-fn admission_drop_reason_name(r: &AdmissionDropReason) -> &'static str {
-    match r {
-        AdmissionDropReason::GroupFull => "groupFull",
-    }
+    // The full enum surface — including the 14th error case
+    // (manifestVersionExhausted, SYNC-15's ADR-0028 amendment).
+    assert_eq!(
+        serde_jsonless::extract_array(raw, "errors"),
+        surface::errors()
+    );
+    assert_eq!(
+        serde_jsonless::extract_array(raw, "events"),
+        surface::events()
+    );
+    assert_eq!(
+        serde_jsonless::extract_array(raw, "statuses"),
+        surface::statuses()
+    );
+    assert_eq!(
+        serde_jsonless::extract_array(raw, "statusReasons"),
+        surface::status_reasons()
+    );
+    assert_eq!(
+        serde_jsonless::extract_array(raw, "connectionStates"),
+        surface::connection_states()
+    );
+    assert_eq!(
+        serde_jsonless::extract_array(raw, "deliveryIssues"),
+        surface::delivery_issues()
+    );
+    assert_eq!(
+        serde_jsonless::extract_array(raw, "unreadableReasons"),
+        surface::unreadable_reasons()
+    );
+    assert_eq!(
+        serde_jsonless::extract_array(raw, "sendFailedReasons"),
+        surface::send_failed_reasons()
+    );
+    assert_eq!(
+        serde_jsonless::extract_array(raw, "admissionDropReasons"),
+        surface::admission_drop_reasons()
+    );
 }
 
 // Minimal JSON reader for docs/api-surface.json — no serde dependency in
@@ -1170,7 +1063,7 @@ mod serde_jsonless {
         }
     }
 
-    fn extract_array(raw: &str, key: &str) -> Vec<&'static str> {
+    pub fn extract_array(raw: &str, key: &str) -> Vec<&'static str> {
         let needle = format!("\"{key}\"");
         let start = raw.find(&needle).expect("key present");
         let rest = &raw[start..];
@@ -1187,7 +1080,7 @@ mod serde_jsonless {
             .collect()
     }
 
-    fn extract_number(raw: &str, key: &str) -> u32 {
+    pub fn extract_number(raw: &str, key: &str) -> u32 {
         let needle = format!("\"{key}\"");
         let start = raw.find(&needle).expect("key present");
         let rest = &raw[start + needle.len()..];
@@ -1198,6 +1091,37 @@ mod serde_jsonless {
             .take_while(|c| c.is_ascii_digit())
             .collect();
         num.parse().expect("number parses")
+    }
+
+    /// Extract a flat string value: `"key": "value"`. Unescapes the escape
+    /// sequences the generator can emit.
+    pub fn extract_string(raw: &str, key: &str) -> String {
+        let needle = format!("\"{key}\"");
+        let start = raw.find(&needle).expect("key present");
+        let rest = &raw[start + needle.len()..];
+        let colon = rest.find(':').expect("colon");
+        let rest = rest[colon + 1..].trim_start();
+        let rest = rest.strip_prefix('"').expect("string opens");
+        let mut out = String::new();
+        let mut chars = rest.chars();
+        loop {
+            match chars.next().expect("string closes") {
+                '"' => break,
+                '\\' => match chars.next().expect("escape char") {
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    'n' => out.push('\n'),
+                    'u' => {
+                        let hex: String = chars.by_ref().take(4).collect();
+                        let code = u32::from_str_radix(&hex, 16).expect("unicode escape");
+                        out.push(char::from_u32(code).expect("valid char"));
+                    }
+                    other => panic!("unsupported escape: \\{other}"),
+                },
+                c => out.push(c),
+            }
+        }
+        out
     }
 }
 

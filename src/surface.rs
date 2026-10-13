@@ -166,7 +166,10 @@ pub fn status_reason_name(r: &StatusReason) -> &'static str {
 }
 
 pub fn status_reasons() -> Vec<&'static str> {
-    every_status_reason().iter().map(status_reason_name).collect()
+    every_status_reason()
+        .iter()
+        .map(status_reason_name)
+        .collect()
 }
 
 // ── Connection states (ADR-0028) ──────────────────────────────────────────────
