@@ -47,3 +47,6 @@ jobs:
 
       - name: connection-factory guard (SYNC-17)
         run: bash scripts/check-connection-factory.sh
+
+      - name: shared-facts drift gate (SYNC-21)
+        run: cargo run --bin gen-shared-facts -- --check

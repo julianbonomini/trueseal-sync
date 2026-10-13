@@ -21,6 +21,8 @@ pub mod relay_address;
 pub mod revocation;
 pub mod session;
 pub mod store;
+#[doc(hidden)]
+pub mod surface;
 pub mod version;
 
 pub use keys::{NoisePublicKey, SigningPublicKey};
