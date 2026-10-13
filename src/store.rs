@@ -33,8 +33,11 @@ fn kind_from_db(v: i64) -> OutboxKind {
 /// iOS/macOS: `NSURLIsExcludedFromBackupKey` is persisted as exactly this
 /// xattr; writing it directly keeps the core free of an Objective-C
 /// dependency and covers every SDK that routes its store through `open`.
-/// Android is handled SDK-side (Kotlin: `noBackupFilesDir` + backup rules
-/// shipped in the AAR), Node by documentation — the issue has the split.
+/// Android and Node are NOT yet covered: the Kotlin SDK's no-backup
+/// storage + backup rules and the TS README guidance are tracked for the
+/// SDK phase (SYNC-14 / SDK-1 tasks) — as of this change the Kotlin SDK
+/// stores under `filesDir`, which Android Auto Backup includes. Do not
+/// claim their exclusion until those land.
 /// Best-effort by contract: callers never fail an open over this.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn exclude_from_backup(path: &Path) {
@@ -700,6 +703,9 @@ impl Store {
         // sequence high-water mark included, goes.
         self.conn
             .execute_batch(&format!("BEGIN; {WIPE_DATA_SQL} COMMIT;"))?;
+        // SYNC-14 (#106): outbox bodies were just deleted; truncate the
+        // WAL so they stop existing on disk promptly. Best-effort.
+        self.checkpoint_wal();
         Ok(())
     }
 
@@ -1163,7 +1169,13 @@ impl OperationLog for PersistentLog {
             }
             tx.commit()
         })();
-        result.map_err(|e| format!("commit_membership failed: {e}"))
+        let result = result.map_err(|e| format!("commit_membership failed: {e}"));
+        if result.is_ok() && drop_sync_outbox {
+            // SYNC-14 (#106): the destroy-flow Sync-delete removed bodies;
+            // truncate the WAL so they stop existing on disk promptly.
+            self.store.checkpoint_wal();
+        }
+        result
     }
 
     fn pending_membership_changes(&self) -> Option<Vec<u8>> {
@@ -1235,7 +1247,11 @@ impl OperationLog for PersistentLog {
              COMMIT;",
         ) {
             warn!("[trueseal-sync] wipe_group_state failed: {e}");
+            return;
         }
+        // SYNC-14 (#106): outbox bodies were just deleted; truncate the WAL
+        // so they stop existing on disk promptly. Best-effort.
+        self.store.checkpoint_wal();
     }
 }
 
@@ -2185,6 +2201,22 @@ mod tests {
     /// the sealed body's bytes exist in NO store file.
     #[test]
     fn accepted_outbox_entry_leaves_no_body_bytes_on_disk() {
+        fn assert_no_store_file_contains(dir: &Path, marker: &[u8], phase: &str) {
+            let mut scanned = 0;
+            for entry in std::fs::read_dir(dir).expect("read dir") {
+                let path = entry.expect("entry").path();
+                let bytes = std::fs::read(&path).expect("read file");
+                scanned += 1;
+                assert!(
+                    !bytes.windows(marker.len()).any(|w| w == marker),
+                    "accepted body bytes must not linger in {} ({})",
+                    path.display(),
+                    phase
+                );
+            }
+            assert!(scanned > 0, "the store directory was scanned ({phase})");
+        }
+
         let dir = tmp_dir();
         // Long and distinctive: cannot occur in schema, bookkeeping or the
         // other rows, and spans any partial-write window.
@@ -2199,20 +2231,14 @@ mod tests {
             assert!(log.undelivered_entries().is_empty());
             // What the pump does at the end of a pass that removed rows.
             log.checkpoint_wal();
-        } // store dropped: connections closed, files flushed
-
-        let mut scanned = 0;
-        for entry in std::fs::read_dir(dir.path()).expect("read dir") {
-            let path = entry.expect("entry").path();
-            let bytes = std::fs::read(&path).expect("read file");
-            scanned += 1;
-            assert!(
-                !bytes.windows(marker.len()).any(|w| w == marker.as_slice()),
-                "accepted body bytes must not linger in {}",
-                path.display()
-            );
+            // Scan WHILE THE STORE IS STILL OPEN: the truncated-but-present
+            // -wal file is exercised — a regression that stops truncating
+            // leaves the marker in it and fails here, rather than being
+            // vacuously passed after a clean close removes the file.
+            assert_no_store_file_contains(dir.path(), &marker, "store open");
         }
-        assert!(scanned > 0, "the store directory was scanned");
+        // And after a clean close, for good measure.
+        assert_no_store_file_contains(dir.path(), &marker, "store closed");
     }
 
     /// Completion criterion (#106): entries the Relay has NOT accepted
@@ -2240,7 +2266,8 @@ mod tests {
 
     /// Completion criterion (#106): on Apple platforms the store file is
     /// marked excluded from iCloud/iTunes backups at open. (Android and
-    /// Node are covered SDK-side — the issue has the split.)
+    /// Node exclusion is SDK-side, tracked for the SDK phase — not yet
+    /// shipped, so this criterion's remaining half lives in the SDK tasks.)
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     #[test]
     fn store_is_excluded_from_backup() {
