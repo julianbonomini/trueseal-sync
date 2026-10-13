@@ -115,6 +115,98 @@ pub(crate) fn parse(raw: &[u8]) -> Option<(MsgType, &[u8])> {
 /// A pre-encoded framed push message, ready to send over the Noise session.
 type PushBytes = Vec<u8>;
 
+/// Relay ADR-0012 deadlines, enforced at the client seams (SYNC-16):
+/// trueseal-noise retries `WouldBlock` forever (RetryConn during the
+/// handshake, `read_exact_interruptible` inside `receive`), so the bound
+/// lives here. The Noise handshake gets 10 s (ADR-0012's handshake
+/// deadline); a whole Push Session gets 30 s (ADR-0012's Push Session
+/// deadline) — a hung Ack wait resolves typed and temporary instead of
+/// wedging the outbox pump thread silently (B7 review note).
+const HANDSHAKE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+const PUSH_SESSION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A transport wrapper that fails reads and writes with `TimedOut` once
+/// its deadline passes. trueseal-noise's retry loops pass every error
+/// except `WouldBlock`/`Interrupted` straight through, so a `TimedOut`
+/// terminates a stalled handshake or Ack wait instead of spinning
+/// forever. Disarm once the bounded phase is over (after the XX
+/// handshake) and the session runs passthrough.
+struct DeadlineConn<T> {
+    inner: T,
+    deadline: Arc<Mutex<Option<std::time::Instant>>>,
+}
+
+/// Handle that disarms a `DeadlineConn`'s deadline (None = passthrough).
+struct DeadlineHandle(Arc<Mutex<Option<std::time::Instant>>>);
+
+impl DeadlineHandle {
+    fn disarm(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+impl<T> DeadlineConn<T> {
+    fn armed(inner: T, budget: std::time::Duration) -> (Self, DeadlineHandle) {
+        let deadline = Arc::new(Mutex::new(Some(std::time::Instant::now() + budget)));
+        (
+            Self {
+                inner,
+                deadline: deadline.clone(),
+            },
+            DeadlineHandle(deadline),
+        )
+    }
+
+    fn expired(&self) -> bool {
+        self.deadline
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|d| std::time::Instant::now() >= d)
+    }
+
+    fn timed_out() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "relay deadline exceeded")
+    }
+}
+
+impl<T: Read> Read for DeadlineConn<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.expired() {
+            return Err(Self::timed_out());
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl<T: Write> Write for DeadlineConn<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.expired() {
+            return Err(Self::timed_out());
+        }
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<T: Severable> Severable for DeadlineConn<T> {
+    /// Severing delegates to the inner transport: a sever must interrupt
+    /// a receive no matter what deadline state the wrapper is in.
+    fn sever_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+        self.inner.sever_handle()
+    }
+}
+
+/// Wall-clock milliseconds for the liveness stamp. A clock step can only
+/// cause a false-positive sever, which costs one reconnect — acceptable.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// A transport that can be severed from outside a blocked read (SYNC-15,
 /// ADR-0028 `close()`): after the sever handle runs, in-flight and future
 /// reads return EOF or an error, so a receive thread parked in WouldBlock
@@ -139,21 +231,25 @@ impl Severable for std::net::TcpStream {
     }
 }
 
-/// Heartbeat and liveness knobs for the Receive Session (relay ADR-0012).
-/// The client sends a Heartbeat every `interval`; if NO inbound frame of any
-/// kind arrives within `liveness`, the session is dead and is severed so the
-/// reconnect loop engages. Production defaults: 25 s / 75 s.
+/// Receive Session timeout knobs (relay ADR-0012). The client sends a
+/// Heartbeat every `heartbeat`; if NO inbound frame of any kind arrives
+/// within `liveness`, the session is dead and is severed so the reconnect
+/// loop engages. `handshake` bounds the post-0x01 Noise handshake
+/// (trueseal-noise RetryConn retries WouldBlock with no deadline of its
+/// own). Production defaults: 25 s / 75 s / 10 s.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct HeartbeatConfig {
-    pub interval: std::time::Duration,
+pub(crate) struct SessionTimeouts {
+    pub heartbeat: std::time::Duration,
     pub liveness: std::time::Duration,
+    pub handshake: std::time::Duration,
 }
 
-impl Default for HeartbeatConfig {
+impl Default for SessionTimeouts {
     fn default() -> Self {
         Self {
-            interval: std::time::Duration::from_secs(25),
+            heartbeat: std::time::Duration::from_secs(25),
             liveness: std::time::Duration::from_secs(75),
+            handshake: HANDSHAKE_DEADLINE,
         }
     }
 }
@@ -180,7 +276,7 @@ pub struct RelayClient<T: Severable> {
     /// send/receive ENTRY — interrupting a receive parked in WouldBlock
     /// retry is the sever handle's job (below). `None` for the
     /// disconnected stub.
-    session: Option<Arc<Session<T>>>,
+    session: Option<Arc<Session<DeadlineConn<T>>>>,
     /// Severs the transport under a receive parked in WouldBlock retry
     /// (SYNC-15): the noise closed flag alone is only checked at
     /// send/receive ENTRY, so without this a dropped client left its
@@ -233,7 +329,7 @@ impl<T: Severable> RelayClient<T> {
             my_keypair,
             None,
             None,
-            HeartbeatConfig::default(),
+            SessionTimeouts::default(),
         )
     }
 
@@ -259,7 +355,7 @@ impl<T: Severable> RelayClient<T> {
             my_keypair,
             Some(Box::new(on_message)),
             on_issue,
-            HeartbeatConfig::default(),
+            SessionTimeouts::default(),
         )
     }
 
@@ -267,13 +363,13 @@ impl<T: Severable> RelayClient<T> {
     /// seam the SYNC-16 tests use; production callers get the ADR-0012
     /// defaults (25 s / 75 s).
     #[cfg(test)]
-    pub(crate) fn connect_subscribed_with_heartbeat(
+    pub(crate) fn connect_subscribed_with_timeouts(
         transport: T,
         relay_pub: NoisePublicKey,
         my_keypair: NoiseKeypair,
         on_message: impl Fn(Message, [u8; 32], u64, u64) + Send + 'static,
         on_issue: Option<Box<dyn Fn(DeliveryIssue) + Send + 'static>>,
-        heartbeat: HeartbeatConfig,
+        timeouts: SessionTimeouts,
     ) -> Result<Self, RelayError> {
         Self::connect_inner(
             transport,
@@ -281,7 +377,7 @@ impl<T: Severable> RelayClient<T> {
             my_keypair,
             Some(Box::new(on_message)),
             on_issue,
-            heartbeat,
+            timeouts,
         )
     }
 
@@ -291,14 +387,20 @@ impl<T: Severable> RelayClient<T> {
         my_keypair: NoiseKeypair,
         first_callback: Option<Box<dyn Fn(Message, [u8; 32], u64, u64) + Send + 'static>>,
         first_issue_callback: Option<Box<dyn Fn(DeliveryIssue) + Send + 'static>>,
-        heartbeat: HeartbeatConfig,
+        timeouts: SessionTimeouts,
     ) -> Result<Self, RelayError> {
         let my_noise_priv = my_keypair.private();
         let sever = transport.sever_handle();
         let mut transport = transport;
         let prologue = version::exchange_transport_version(&mut transport)?;
+        // Bound the Noise handshake (relay ADR-0012: 10 s): a relay that
+        // answers 0x01 and then goes silent must surface a typed failure,
+        // not spin RetryConn forever. Disarmed on success — the session
+        // then runs passthrough.
+        let (transport, handshake_deadline) = DeadlineConn::armed(transport, timeouts.handshake);
         let session =
             dial(transport, my_keypair, &prologue).map_err(RelayError::HandshakeFailed)?;
+        handshake_deadline.disarm();
 
         if session.remote_public_key() != relay_pub.0 {
             return Err(RelayError::HandshakeFailed(
@@ -329,6 +431,7 @@ impl<T: Severable> RelayClient<T> {
         // receive thread from the outside.
         let session = Arc::new(session);
         let session_for_loop = session.clone();
+        let sever_for_loop = sever.clone();
         std::thread::spawn(move || {
             run_loop(
                 session_for_loop,
@@ -337,6 +440,8 @@ impl<T: Severable> RelayClient<T> {
                 issue_callbacks_clone,
                 my_noise_priv,
                 is_connected_clone,
+                timeouts,
+                sever_for_loop,
             );
         });
 
@@ -500,12 +605,14 @@ impl Drop for DisconnectGuard {
 /// The actual event loop: runs in a dedicated thread that owns the Session.
 /// Interleaves push sends (from the channel) with receive processing.
 fn run_loop<T: Severable>(
-    session: Arc<Session<T>>,
+    session: Arc<Session<DeadlineConn<T>>>,
     push_rx: mpsc::Receiver<PushBytes>,
     callbacks: Arc<Mutex<Vec<Box<dyn Fn(Message, [u8; 32], u64, u64) + Send + 'static>>>>,
     issue_callbacks: Arc<Mutex<Vec<Box<dyn Fn(DeliveryIssue) + Send + 'static>>>>,
     my_noise_priv: [u8; 32],
     is_connected: Arc<AtomicBool>,
+    timeouts: SessionTimeouts,
+    sever: Arc<dyn Fn() + Send + Sync>,
 ) {
     // On ANY exit — clean or unwinding — signal that the relay connection
     // has been lost.
@@ -530,12 +637,24 @@ fn run_loop<T: Severable>(
 
     let session_for_recv = session.clone();
     let session_for_send = session.clone();
+    let session_for_heartbeat = session.clone();
+
+    // Liveness stamp (SYNC-16, relay ADR-0012): the RECEIVE thread stamps
+    // EVERY inbound frame — not the dispatch thread (a slow handler must
+    // not look like a dead connection) and not only heartbeat echoes (the
+    // relay may legitimately drop echoes under Deliver saturation,
+    // trueseal-relay #47 — any inbound frame proves the link is alive).
+    let last_inbound = Arc::new(std::sync::atomic::AtomicU64::new(now_millis()));
+    let last_inbound_recv = last_inbound.clone();
 
     // Receive thread: blocks on session.receive() and forwards results.
     let (recv_tx, recv_rx) = mpsc::channel::<Result<Vec<u8>, String>>();
     std::thread::spawn(move || loop {
         let result = session_for_recv.receive();
         let done = result.is_err();
+        if result.is_ok() {
+            last_inbound_recv.store(now_millis(), Ordering::Release);
+        }
         if recv_tx.send(result).is_err() {
             break;
         }
@@ -550,6 +669,37 @@ fn run_loop<T: Severable>(
             if session_for_send.send(&framed).is_err() {
                 break;
             }
+        }
+    });
+
+    // Heartbeat thread (SYNC-16, relay ADR-0012 — superseding ADR-0019's
+    // relay-initiated keepalive): the client sends a Heartbeat every
+    // `interval` while connected. The relay echoes it, but ANY inbound
+    // frame counts as liveness; if no inbound frame arrives within
+    // `liveness`, the link is dead — sever it so the receive thread EOFs,
+    // this loop exits, DisconnectGuard flips is_connected and the
+    // reconnect loop redials. The thread exits the moment this run loop
+    // does (the stop channel's sender drops), so close() leaves no
+    // zombie behind.
+    let (heartbeat_stop_tx, heartbeat_stop_rx) = mpsc::channel::<()>();
+    let _heartbeat_stop_tx = heartbeat_stop_tx;
+    let last_inbound_heartbeat = last_inbound.clone();
+    std::thread::spawn(move || loop {
+        match heartbeat_stop_rx.recv_timeout(timeouts.heartbeat) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            // Sender dropped (run loop exiting) — leave immediately.
+            _ => break,
+        }
+        let age = now_millis().saturating_sub(last_inbound_heartbeat.load(Ordering::Acquire));
+        if age > timeouts.liveness.as_millis() as u64 {
+            (sever)();
+            break;
+        }
+        if session_for_heartbeat
+            .send(&frame(MsgType::Heartbeat, &[]))
+            .is_err()
+        {
+            break;
         }
     });
 
@@ -718,8 +868,12 @@ fn run_loop<T: Severable>(
                         }
                     }
                 } else if let Some((MsgType::Heartbeat, _)) = parse(&raw) {
-                    // Echo Heartbeat back to keep the Receive Session alive (ADR-0019).
-                    let _ = session.send(&frame(MsgType::Heartbeat, &[]));
+                    // The relay's echo of our Heartbeat (SYNC-16, relay
+                    // ADR-0012): a liveness signal only — the receive
+                    // thread already stamped it. The client NEVER echoes:
+                    // the relay does not initiate Heartbeats (relay #13
+                    // wontfix), and echoing its echoes would ping-pong
+                    // without bound.
                 } else if parse(&raw).is_none() {
                     // An unknown frame type or unparseable bytes (ADR-0034: malformed).
                     fire_issue(
@@ -783,6 +937,17 @@ pub fn push_send<T: Read + Write + Send>(
     relay_pub: [u8; 32],
     blob: Vec<u8>,
 ) -> Result<(), RelayError> {
+    push_send_with_deadline(transport, relay_pub, blob, PUSH_SESSION_DEADLINE)
+}
+
+/// `push_send` with an explicit Push Session deadline — the seam the
+/// SYNC-16 tests use; production gets ADR-0012's 30 s.
+fn push_send_with_deadline<T: Read + Write + Send>(
+    transport: T,
+    relay_pub: [u8; 32],
+    blob: Vec<u8>,
+    deadline: std::time::Duration,
+) -> Result<(), RelayError> {
     use trueseal_noise::keypair::generate_keypair;
     let fresh_kp = generate_keypair();
     let mut transport = transport;
@@ -790,13 +955,20 @@ pub fn push_send<T: Read + Write + Send>(
     // Noise prologue. A refusal surfaces as RelayVersionUnsupported and the
     // outbox entry stays queued.
     let prologue = version::exchange_transport_version(&mut transport)?;
+    // Bound the whole Push Session (relay ADR-0012: 30 s): handshake, push
+    // and the Ack wait. A relay that accepts the push but never Acks must
+    // resolve typed — the pump classifies PushFailed as temporary, backs
+    // off and retries — instead of wedging the pump thread forever (B7
+    // review note). The deadline stays armed until the session closes.
+    let (transport, _push_deadline) = DeadlineConn::armed(transport, deadline);
     let session = trueseal_noise::session_nk::dial(transport, fresh_kp, relay_pub, &prologue)
         .map_err(RelayError::HandshakeFailed)?;
     session.send(&blob).map_err(RelayError::PushFailed)?;
-    // Block until the relay confirms persistence (ADR-0019).
+    // Block until the relay confirms persistence (ADR-0019), bounded by
+    // the Push Session deadline above.
     let raw = session
         .receive()
-        .map_err(|_| RelayError::PushFailed("expected Ack, connection closed".into()))?;
+        .map_err(|e| RelayError::PushFailed(format!("expected Ack: {e}")))?;
     match parse(&raw) {
         Some((MsgType::Ack, _)) => {}
         Some((MsgType::Error, _)) => return Err(RelayError::PushRejected),
@@ -2012,26 +2184,27 @@ mod tests {
         frames
     }
 
-    fn heartbeat_config(interval_ms: u64, liveness_ms: u64) -> HeartbeatConfig {
-        HeartbeatConfig {
-            interval: std::time::Duration::from_millis(interval_ms),
+    fn test_timeouts(heartbeat_ms: u64, liveness_ms: u64) -> SessionTimeouts {
+        SessionTimeouts {
+            heartbeat: std::time::Duration::from_millis(heartbeat_ms),
             liveness: std::time::Duration::from_millis(liveness_ms),
+            handshake: std::time::Duration::from_millis(400),
         }
     }
 
-    fn connect_with_heartbeat(
+    fn connect_with_timeouts(
         client_pipe: MemPipe,
         relay_pub: NoisePublicKey,
         device: &DeviceKeypair,
-        config: HeartbeatConfig,
+        timeouts: SessionTimeouts,
     ) -> RelayClient<MemPipe> {
-        RelayClient::connect_subscribed_with_heartbeat(
+        RelayClient::connect_subscribed_with_timeouts(
             client_pipe,
             relay_pub,
             Keypair::new(device.noise.private(), device.noise.public_key),
             |_, _, _, _| {},
             None,
-            config,
+            timeouts,
         )
         .expect("connect should succeed")
     }
@@ -2047,12 +2220,8 @@ mod tests {
         let frames = spawn_frame_recording_relay(relay_pipe, relay_kp2, true);
 
         let device = DeviceKeypair::generate();
-        let _client = connect_with_heartbeat(
-            client_pipe,
-            relay_pub,
-            &device,
-            heartbeat_config(40, 5_000),
-        );
+        let _client =
+            connect_with_timeouts(client_pipe, relay_pub, &device, test_timeouts(40, 5_000));
 
         // At least 3 heartbeats within one second on an idle session.
         let ok = wait_until(
@@ -2067,7 +2236,10 @@ mod tests {
             },
             1_000,
         );
-        assert!(ok, "an idle session should heartbeat at the configured interval");
+        assert!(
+            ok,
+            "an idle session should heartbeat at the configured interval"
+        );
 
         // Cadence: consecutive heartbeats arrive roughly an interval apart.
         let beats: Vec<std::time::Instant> = frames
@@ -2098,12 +2270,8 @@ mod tests {
         let frames = spawn_frame_recording_relay(relay_pipe, relay_kp2, true);
 
         let device = DeviceKeypair::generate();
-        let _client = connect_with_heartbeat(
-            client_pipe,
-            relay_pub,
-            &device,
-            heartbeat_config(40, 5_000),
-        );
+        let _client =
+            connect_with_timeouts(client_pipe, relay_pub, &device, test_timeouts(40, 5_000));
 
         std::thread::sleep(std::time::Duration::from_millis(400));
         let count = frames
@@ -2133,12 +2301,7 @@ mod tests {
         let frames = spawn_frame_recording_relay(relay_pipe, relay_kp2, false);
 
         let device = DeviceKeypair::generate();
-        let client = connect_with_heartbeat(
-            client_pipe,
-            relay_pub,
-            &device,
-            heartbeat_config(40, 300),
-        );
+        let client = connect_with_timeouts(client_pipe, relay_pub, &device, test_timeouts(40, 300));
 
         assert!(
             wait_until(|| !client.is_connected(), 3_000),
@@ -2186,12 +2349,7 @@ mod tests {
         });
 
         let device = DeviceKeypair::generate();
-        let client = connect_with_heartbeat(
-            client_pipe,
-            relay_pub,
-            &device,
-            heartbeat_config(40, 300),
-        );
+        let client = connect_with_timeouts(client_pipe, relay_pub, &device, test_timeouts(40, 300));
 
         // 700 ms of regular inbound frames with a 300 ms liveness window:
         // the session must still be alive at the end of the burst.
@@ -2222,15 +2380,18 @@ mod tests {
         let device = DeviceKeypair::generate();
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = RelayClient::connect(
+            let result = RelayClient::connect_subscribed_with_timeouts(
                 client_pipe,
                 NoisePublicKey(relay_kp.public_key),
                 Keypair::new(device.noise.private(), device.noise.public_key),
+                |_, _, _, _| {},
+                None,
+                test_timeouts(25_000, 75_000), // handshake: 400 ms
             );
             let _ = result_tx.send(result.is_err());
         });
 
-        let answered = result_rx.recv_timeout(std::time::Duration::from_secs(15));
+        let answered = result_rx.recv_timeout(std::time::Duration::from_secs(5));
         // Unstick the fake relay either way.
         drop(relay_handle);
         assert!(
@@ -2260,14 +2421,18 @@ mod tests {
 
         let (result_tx, result_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = push_send(client_pipe, relay_kp.public_key, b"blob".to_vec());
+            let result = push_send_with_deadline(
+                client_pipe,
+                relay_kp.public_key,
+                b"blob".to_vec(),
+                std::time::Duration::from_millis(500),
+            );
             let _ = result_tx.send(result);
         });
 
-        let answered = result_rx.recv_timeout(std::time::Duration::from_secs(45));
+        let answered = result_rx.recv_timeout(std::time::Duration::from_secs(10));
         drop(relay_handle);
-        let result = answered
-            .expect("a hung Ack wait must resolve, not wedge the pump forever");
+        let result = answered.expect("a hung Ack wait must resolve, not wedge the pump forever");
         match result {
             Err(RelayError::PushRejected) => {
                 panic!("a missing Ack is temporary (retry), never a permanent refusal")
@@ -2288,12 +2453,8 @@ mod tests {
         let frames = spawn_frame_recording_relay(relay_pipe, relay_kp2, true);
 
         let device = DeviceKeypair::generate();
-        let client = connect_with_heartbeat(
-            client_pipe,
-            relay_pub,
-            &device,
-            heartbeat_config(40, 5_000),
-        );
+        let client =
+            connect_with_timeouts(client_pipe, relay_pub, &device, test_timeouts(40, 5_000));
         assert!(wait_until(
             || frames
                 .lock()
@@ -2322,9 +2483,6 @@ mod tests {
             .iter()
             .filter(|(t, _)| *t == MsgType::Heartbeat)
             .count();
-        assert_eq!(
-            count_at_close, count_later,
-            "no heartbeats after close()"
-        );
+        assert_eq!(count_at_close, count_later, "no heartbeats after close()");
     }
 }
