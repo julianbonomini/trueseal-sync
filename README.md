@@ -24,7 +24,7 @@ The SDKs wrap the compiled native library via UniFFI — no Rust toolchain requi
 ## What you get
 
 - **Device identity** — X25519 + Ed25519 keypair, auto-generated on first launch, persisted to SQLite. You never handle key bytes.
-- **Pairing** — one device generates a token (QR or text); the other calls `joinGroup(token)`. Library manages the Noise handshake underneath.
+- **Pairing** — one device opens a window and generates a Pairing Token (QR or text); the other calls `join(token)`. The token carries a single-use Pairing Secret, so the relay cannot raise join requests (ADR-0023). The library manages the Noise handshake underneath.
 - **Group membership** — signed, versioned `GroupManifest`. Any current member can add or remove devices.
 - **Encrypted fan-out** — one envelope per recipient. ECDH + ChaCha20-Poly1305. The relay sees `recipient_pub` + ciphertext; sender identity is inside the ciphertext.
 - **At-least-once transport, with stated bounds** — the sender outbox survives crashes and relay disconnects and retries while connected; messages live up to 30 days (the relay TTL cap). Delivery is per-sender ordered and acked only after your handler finishes; the library deduplicates, so your handler never sees the same message twice. The bounds are real: a payload over 61,440 bytes is refused, a handler that keeps failing is eventually given up on, and every failure surfaces as a typed Delivery Issue — there is no silent loss, and there is no unconditional "guaranteed delivery".
