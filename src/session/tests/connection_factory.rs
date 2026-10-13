@@ -100,10 +100,7 @@ fn every_receive_and_push_connection_flows_through_the_injected_factories() {
     )
     .expect("session");
 
-    wait_for(
-        || connected.load(Ordering::SeqCst),
-        Duration::from_secs(5),
-    );
+    wait_for(|| connected.load(Ordering::SeqCst), Duration::from_secs(5));
     assert!(
         receive_calls.load(Ordering::SeqCst) >= 1,
         "the receive connection must come from the injected receive factory"

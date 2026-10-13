@@ -1068,11 +1068,8 @@ impl TrueSeal {
         // SYNC-17 (#109): sockets are opened only by the connection factory,
         // so a future IP-hiding transport (roadmap#26) is one local change.
         let (receive_factory, push_factory) =
-            crate::connection::ConnectionFactory::new(
-                address.receive_addr(),
-                address.push_addr(),
-            )
-            .into_factories();
+            crate::connection::ConnectionFactory::new(address.receive_addr(), address.push_addr())
+                .into_factories();
 
         let on_connection_changed = {
             let events = events.clone();
