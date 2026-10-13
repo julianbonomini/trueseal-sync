@@ -254,11 +254,17 @@ fn push_send_accepts_zero_byte_ack() {
     );
 }
 
-// ── Heartbeat + Ack silent drop on XX Receive Session (ADR-0019 / #73) ───────
+// ── Heartbeat + Ack handling on the XX Receive Session (ADR-0019 / #73, ──
+// ── heartbeat direction amended by SYNC-16 / #108) ─────────────────────
 
-/// run_loop echoes Heartbeat back when the relay sends one on the XX session.
+/// An inbound Heartbeat is a liveness signal only (SYNC-16, relay
+/// ADR-0012): the client does NOT echo it. The relay never initiates
+/// Heartbeats (trueseal-relay #13 wontfix), so an echoing client would
+/// ping-pong its own echoes with the real relay without bound. This test
+/// supersedes the original #73 echo test, which pinned the pre-SYNC-16
+/// relay-initiated keepalive direction.
 #[test]
-fn run_loop_echoes_heartbeat_on_receive_session() {
+fn run_loop_does_not_echo_inbound_heartbeat() {
     use crate::relay::RelayClient;
     use std::time::Duration;
 
@@ -267,18 +273,25 @@ fn run_loop_echoes_heartbeat_on_receive_session() {
     let (pipe_client, pipe_relay) = mem_pipe_pair_simple();
 
     let relay_kp2 = Keypair::new(relay_kp.private(), relay_kp.public_key);
-    let echo_received: std::sync::Arc<std::sync::Mutex<bool>> =
-        std::sync::Arc::new(std::sync::Mutex::new(false));
-    let echo_clone = echo_received.clone();
+    let client_frames: std::sync::Arc<std::sync::Mutex<Vec<crate::relay::MsgType>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let frames_clone = client_frames.clone();
 
-    // Relay: accepts XX, sends Heartbeat, waits for echo back.
+    // Relay: accepts XX, sends a Heartbeat (as an echo of the client's
+    // would-be heartbeat), records every frame the client sends.
     std::thread::spawn(move || {
         let sess = crate::version::testutil::xx_accept_after_prefix(pipe_relay, relay_kp2)
             .expect("XX accept");
         let _ = sess.send(&frame(MsgType::Heartbeat, &[]));
-        if let Ok(raw) = sess.receive() {
-            if let Some((MsgType::Heartbeat, _)) = parse(&raw) {
-                *echo_clone.lock().unwrap() = true;
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            match sess.receive() {
+                Ok(raw) => {
+                    if let Some((typ, _)) = parse(&raw) {
+                        frames_clone.lock().unwrap().push(typ);
+                    }
+                }
+                Err(_) => break,
             }
         }
     });
@@ -291,10 +304,12 @@ fn run_loop_echoes_heartbeat_on_receive_session() {
     )
     .expect("connect");
 
-    wait_for(|| *echo_received.lock().unwrap(), Duration::from_secs(5));
+    // Give the relay its full recording window, then assert: not one
+    // frame left the client in response to the inbound Heartbeat.
+    std::thread::sleep(Duration::from_millis(700));
     assert!(
-        *echo_received.lock().unwrap(),
-        "run_loop must echo Heartbeat back"
+        client_frames.lock().unwrap().is_empty(),
+        "the client must not echo an inbound Heartbeat (ping-pong)"
     );
 }
 
