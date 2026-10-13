@@ -47,7 +47,9 @@ fn pairing_ceremony_creates_manifest_with_new_member() {
     )
     .expect("session B");
 
-    let admitted = session_a.accept_pair(device_b_noise_pub, device_b_signing_pub).expect("accept");
+    let admitted = session_a
+        .accept_pair(device_b_noise_pub, device_b_signing_pub)
+        .expect("accept");
     assert!(admitted, "accept_pair must return true when window is open");
 
     let manifest = session_a.manifest.lock().unwrap();

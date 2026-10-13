@@ -1277,7 +1277,9 @@ fn admitter_restart_keeps_the_queued_admission_manifest() {
         .expect("session");
         let _token = session.pairing_token();
         assert!(
-            session.accept_pair(joiner.public_key(), joiner.signing_public_key()).expect("accept"),
+            session
+                .accept_pair(joiner.public_key(), joiner.signing_public_key())
+                .expect("accept"),
             "admission commits"
         );
         // The manifest is local and queued; nothing could be pushed.

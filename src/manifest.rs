@@ -303,21 +303,18 @@ impl GroupManifest {
                     got: proto.signature.len(),
                 })?;
 
-        let parent: Option<[u8; 32]> = if proto.parent.is_empty() {
-            None
-        } else {
-            Some(
-                proto
-                    .parent
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| ManifestError::InvalidLength {
+        let parent: Option<[u8; 32]> =
+            if proto.parent.is_empty() {
+                None
+            } else {
+                Some(proto.parent.as_slice().try_into().map_err(|_| {
+                    ManifestError::InvalidLength {
                         field: "parent",
                         expected: 32,
                         got: proto.parent.len(),
-                    })?,
-            )
-        };
+                    }
+                })?)
+            };
 
         let members = proto
             .members

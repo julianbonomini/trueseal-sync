@@ -151,7 +151,9 @@ fn accept_pair_without_window_returns_false() {
     let dummy_noise = crate::keys::NoisePublicKey([0xAA; 32]);
     let dummy_signing = crate::keys::SigningPublicKey([0xBB; 32]);
 
-    let result = session.accept_pair(dummy_noise, dummy_signing).expect("accept");
+    let result = session
+        .accept_pair(dummy_noise, dummy_signing)
+        .expect("accept");
     assert!(!result, "no window → must return false");
     assert!(
         session.manifest.lock().unwrap().is_none(),

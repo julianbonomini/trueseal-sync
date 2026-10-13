@@ -277,7 +277,8 @@ impl PendingChange {
             let intent = match kind {
                 0 => {
                     let noise_pub = NoisePublicKey(take(&mut rest, 32)?.try_into().ok()?);
-                    let name_len = u16::from_le_bytes(take(&mut rest, 2)?.try_into().ok()?) as usize;
+                    let name_len =
+                        u16::from_le_bytes(take(&mut rest, 2)?.try_into().ok()?) as usize;
                     let name = String::from_utf8(take(&mut rest, name_len)?.to_vec()).ok()?;
                     PendingIntent::Admit(ManifestMember {
                         noise_pub,
@@ -345,9 +346,7 @@ impl LeavingRecord {
 
 /// Load and decode the persisted Pending Membership Changes (ADR-0027).
 /// A corrupt record fails closed — treated as empty (no re-applications).
-fn load_pending_changes(
-    op_log: &Arc<Mutex<Box<dyn OperationLog>>>,
-) -> Vec<PendingChange> {
+fn load_pending_changes(op_log: &Arc<Mutex<Box<dyn OperationLog>>>) -> Vec<PendingChange> {
     let log = op_log.lock().unwrap_or_else(|e| e.into_inner());
     match log.pending_membership_changes() {
         None => Vec::new(),
@@ -1112,10 +1111,8 @@ pub(super) fn build_subscribe_handler(
                                 // ADR-0027: a re-applied admission that
                                 // would exceed 32 is dropped with a typed
                                 // event; the joiner stays in Pending Join.
-                                dropped_admissions.push((
-                                    member_id(&m.signing_pub),
-                                    member_name(&m.signing_pub),
-                                ));
+                                dropped_admissions
+                                    .push((member_id(&m.signing_pub), member_name(&m.signing_pub)));
                             } else {
                                 members.push(m.clone());
                                 applied.push(c.intent.clone());
@@ -1151,19 +1148,11 @@ pub(super) fn build_subscribe_handler(
                             // Push the re-applied manifest to everyone in
                             // either view except self (covers re-removed
                             // targets and the re-admitted joiner).
-                            let self_noise = keys
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .noise_pub;
+                            let self_noise =
+                                keys.lock().unwrap_or_else(|e| e.into_inner()).noise_pub;
                             let mut recipients: Vec<NoisePublicKey> = Vec::new();
-                            for m in incoming
-                                .members
-                                .iter()
-                                .chain(reapplied.members.iter())
-                            {
-                                if m.noise_pub != self_noise
-                                    && !recipients.contains(&m.noise_pub)
-                                {
+                            for m in incoming.members.iter().chain(reapplied.members.iter()) {
+                                if m.noise_pub != self_noise && !recipients.contains(&m.noise_pub) {
                                     recipients.push(m.noise_pub);
                                 }
                             }
@@ -1174,9 +1163,8 @@ pub(super) fn build_subscribe_handler(
                             let mut refs: Vec<([u8; 32], u64)> = Vec::new();
                             for peer in &recipients {
                                 let seq = {
-                                    let mut s = outbox_sequence
-                                        .lock()
-                                        .unwrap_or_else(|e| e.into_inner());
+                                    let mut s =
+                                        outbox_sequence.lock().unwrap_or_else(|e| e.into_inner());
                                     let v = *s;
                                     *s += 1;
                                     v
@@ -1191,8 +1179,7 @@ pub(super) fn build_subscribe_handler(
                             if was_leaving {
                                 // The Leave was re-applied: the Leaving
                                 // record now waits on the NEW pushes.
-                                leaving_update =
-                                    Some(LeavingRecord { refs }.encode());
+                                leaving_update = Some(LeavingRecord { refs }.encode());
                             }
                             final_manifest = reapplied;
                         }
@@ -2892,8 +2879,7 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             })
             .map_err(SessionError::Store)?;
 
-        *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(leave_manifest.clone());
+        *self.manifest.lock().unwrap_or_else(|e| e.into_inner()) = Some(leave_manifest.clone());
         *self
             .pending_changes
             .lock()

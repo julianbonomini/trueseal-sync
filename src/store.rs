@@ -617,7 +617,9 @@ impl OperationLog for PersistentLog {
     fn leaving(&self) -> Option<Vec<u8>> {
         self.store
             .conn
-            .query_row("SELECT data FROM leaving WHERE id = 1", [], |row| row.get(0))
+            .query_row("SELECT data FROM leaving WHERE id = 1", [], |row| {
+                row.get(0)
+            })
             .ok()
     }
 
