@@ -1082,22 +1082,22 @@ fn accepted_manifest_survives_restart_as_member() {
         &signing_keypair(&initiator.signing.to_bytes()),
         1,
     );
+    // Admission is: install the manifest, THEN clear the Pending Join
+    // (persist-first ordering, ADR-0023 Crash points) — wait for both
+    // halves of the committed transition, not just the first.
     wait_for(
-        || session.manifest.lock().unwrap().is_some(),
+        || {
+            session.manifest.lock().unwrap().is_some()
+                && session
+                    .op_log
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending_join()
+                    .is_none()
+        },
         Duration::from_secs(3),
     );
     assert_eq!(session.group_status(), GroupStatus::Member);
-    // The Pending Join record is cleared on admission (MemLog is
-    // in-memory; the durable form is asserted in the store tests).
-    assert!(
-        session
-            .op_log
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .pending_join()
-            .is_none(),
-        "admission clears the Pending Join"
-    );
 
     // Restart with the persisted manifest seeded by the caller (the FFI
     // pattern, SYNC-7). Status comes up Member with no anchor needed.
