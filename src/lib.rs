@@ -2,6 +2,7 @@
 
 uniffi::setup_scaffolding!();
 
+pub mod connection;
 pub mod crypto;
 pub mod delivery_issue;
 pub mod device;

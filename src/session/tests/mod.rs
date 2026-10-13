@@ -2,6 +2,7 @@ mod accept_member;
 mod accept_pair;
 mod close;
 mod connection;
+mod connection_factory;
 mod convergence;
 mod delivery_contract;
 mod destroy_group;

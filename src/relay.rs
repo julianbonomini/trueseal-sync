@@ -897,22 +897,22 @@ use std::net::TcpStream;
 impl RelayClient<TcpStream> {
     /// Connect to a relay over TCP at `addr`.
     ///
-    /// The stream is put in non-blocking mode before the Transport Version
-    /// exchange, so a silent (pre-version) relay surfaces as a typed timeout
-    /// (within the exchange deadline, 10 s) instead of hanging a blocking
-    /// `read()` forever. Non-blocking is also the mode the FFI and CLI run
-    /// every session in: a blocking receive would hold the session lock for
-    /// the whole `read()` syscall and starve concurrent sends.
+    /// Thin convenience over the connection factory (SYNC-17): the socket is
+    /// opened by [`crate::connection::ConnectionFactory::open`], the only
+    /// socket-open in production code. The stream is non-blocking before the
+    /// Transport Version exchange, so a silent (pre-version) relay surfaces
+    /// as a typed timeout (within the exchange deadline, 10 s) instead of
+    /// hanging a blocking `read()` forever. Non-blocking is also the mode the
+    /// FFI and CLI run every session in: a blocking receive would hold the
+    /// session lock for the whole `read()` syscall and starve concurrent
+    /// sends.
     pub fn connect_tcp(
         addr: &str,
         relay_pub: NoisePublicKey,
         my_keypair: NoiseKeypair,
     ) -> Result<Self, RelayError> {
-        let stream =
-            TcpStream::connect(addr).map_err(|e| RelayError::ConnectionFailed(e.to_string()))?;
-        stream
-            .set_nonblocking(true)
-            .map_err(|e| RelayError::ConnectionFailed(e.to_string()))?;
+        let stream = crate::connection::ConnectionFactory::open(addr)
+            .map_err(RelayError::ConnectionFailed)?;
         Self::connect(stream, relay_pub, my_keypair)
     }
 }
