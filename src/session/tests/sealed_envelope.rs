@@ -484,20 +484,129 @@ fn readdressed_or_ephemeral_swapped_blob_fails() {
 #[test]
 fn replayed_revoke_after_destroy_does_nothing() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use trueseal_noise::keypair::Keypair;
+
+    use crate::keys::NoisePublicKey;
+    use crate::relay::{frame, parse, MsgType};
+    use crate::version::testutil::xx_accept_after_prefix;
+
     let relay_kp = make_relay_kp();
     let device = crate::device::DeviceKeypair::generate();
     let sender = crate::envelope::SigningKeypair::generate();
 
-    let (pipe_client, pipe_relay) = mem_pipe_pair();
-    let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+    // A relay that accepts the receive connection, then accepts AGAIN when
+    // the post-destroy rebind dials in with the rotated identity. SYNC-15
+    // reaps the old receive thread when the rotation swaps the client
+    // (RelayClient::Drop severs the transport) — this test previously
+    // passed only because that zombie thread kept acking. The replay now
+    // proves itself across the rebind: it arrives on the fresh session,
+    // no longer decrypts (addressed to the rotated-away identity), is
+    // acked and dropped, and changes no state.
+    struct RebindRelay {
+        frames: Arc<Mutex<Vec<(u8, Vec<u8>)>>>,
+        accepts: Arc<AtomicUsize>,
+        deliver_tx: std::sync::mpsc::Sender<(u64, Vec<u8>)>,
+    }
+    impl RebindRelay {
+        fn spawn(pipes: Vec<MemPipe>, relay_kp: &Keypair) -> Self {
+            let frames = Arc::new(Mutex::new(Vec::<(u8, Vec<u8>)>::new()));
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let current: Arc<Mutex<Option<Arc<trueseal_noise::session_xx::Session<MemPipe>>>>> =
+                Arc::new(Mutex::new(None));
+            let (deliver_tx, deliver_rx) = std::sync::mpsc::channel::<(u64, Vec<u8>)>();
+            {
+                let frames = frames.clone();
+                let current = current.clone();
+                let accepts = accepts.clone();
+                let relay_priv = relay_kp.private();
+                let relay_pub = relay_kp.public_key;
+                std::thread::spawn(move || {
+                    for pipe in pipes {
+                        let kp = Keypair::new(relay_priv, relay_pub);
+                        let sess = match xx_accept_after_prefix(pipe, kp) {
+                            Ok(s) => s,
+                            Err(_) => return,
+                        };
+                        let sess = Arc::new(sess);
+                        *current.lock().unwrap() = Some(sess.clone());
+                        accepts.fetch_add(1, Ordering::SeqCst);
+                        // Record the client's frames until this link dies —
+                        // close() severs it, and the accept loop then takes
+                        // the rebind.
+                        let frames = frames.clone();
+                        let recv = sess.clone();
+                        std::thread::spawn(move || {
+                            while let Ok(raw) = recv.receive() {
+                                if let Some((t, body)) = parse(&raw) {
+                                    frames.lock().unwrap().push((t as u8, body.to_vec()));
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+            {
+                let current = current.clone();
+                std::thread::spawn(move || {
+                    for (blob_id, env_bytes) in deliver_rx {
+                        let sess = current.lock().unwrap().clone();
+                        let Some(sess) = sess else { continue };
+                        let mut body = blob_id.to_be_bytes().to_vec();
+                        body.extend_from_slice(&env_bytes);
+                        let _ = sess.send(&frame(MsgType::Deliver, &body));
+                    }
+                });
+            }
+            RebindRelay {
+                frames,
+                accepts,
+                deliver_tx,
+            }
+        }
+        fn deliver(
+            &self,
+            blob_id: u64,
+            msg: &crate::message::Message,
+            recipient: NoisePublicKey,
+            sender: &crate::envelope::SigningKeypair,
+            seq: u64,
+        ) {
+            let env = crate::envelope::Envelope::build_sealed(
+                seq,
+                vec![],
+                recipient,
+                sender,
+                crate::operation_log::now_secs() * 1000,
+                &msg.encode(),
+            );
+            self.deliver_tx
+                .send((blob_id, env.encode()))
+                .expect("relay alive");
+        }
+        fn acks(&self) -> Vec<u64> {
+            self.frames
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(t, _)| *t == MsgType::DeliverAck as u8)
+                .filter_map(|(_, b)| b.as_slice().try_into().ok().map(u64::from_be_bytes))
+                .collect()
+        }
+    }
+
+    let (pipe1_client, pipe1_relay) = mem_pipe_pair();
+    let (pipe2_client, pipe2_relay) = mem_pipe_pair();
+    let relay = RebindRelay::spawn(vec![pipe1_relay, pipe2_relay], &relay_kp);
     let manifest = membership(&device, &sender);
     let device_pub = device.public_key();
 
     let destroyed = Arc::new(AtomicUsize::new(0));
     let d = destroyed.clone();
-    let session = super::super::TruesealSession::<MemPipe>::connect_full(
-        pipe_client,
+    let pipe2_slot: Arc<Mutex<Option<MemPipe>>> = Arc::new(Mutex::new(Some(pipe2_client)));
+    let pipe2_slot2 = pipe2_slot.clone();
+    let session = super::super::TruesealSession::<MemPipe>::connect_with_reconnect(
+        pipe1_client,
         relay_pub(&relay_kp),
         device,
         move |_msg, _author, _seq| {},
@@ -507,7 +616,16 @@ fn replayed_revoke_after_destroy_does_nothing() {
         move || {
             d.fetch_add(1, Ordering::SeqCst);
         },
+        move || {
+            pipe2_slot2
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| "rebind pipe exhausted".into())
+        },
         || Err("push factory unused".into()),
+        Some(std::time::Duration::from_millis(50)),
+        None,
     )
     .expect("session");
     session.set_manifest(manifest);
@@ -515,14 +633,22 @@ fn replayed_revoke_after_destroy_does_nothing() {
     relay.deliver(1, &crate::message::Message::Revoke, device_pub, &sender, 1);
     wait_for(
         || destroyed.load(Ordering::SeqCst) == 1,
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(15),
     );
 
-    // The hostile replay: same content, fresh seal, new blob id.
+    // The destroy wiped and rotated the identity; the session rebinds with
+    // the fresh keys.
+    wait_for(
+        || relay.accepts.load(Ordering::SeqCst) == 2,
+        std::time::Duration::from_secs(15),
+    );
+
+    // The hostile replay: same content, fresh seal, new blob id — still
+    // addressed to the rotated-away identity, so it no longer decrypts.
     relay.deliver(2, &crate::message::Message::Revoke, device_pub, &sender, 2);
     wait_for(
-        || relay.deliver_acks() == vec![1, 2],
-        std::time::Duration::from_secs(5),
+        || relay.acks() == vec![1, 2],
+        std::time::Duration::from_secs(15),
     );
     assert_eq!(
         destroyed.load(Ordering::SeqCst),
