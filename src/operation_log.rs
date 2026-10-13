@@ -127,13 +127,19 @@ pub trait OperationLog: Send {
     /// encoding). Implementations with transactions (SQLite) must make the
     /// two writes atomic; a crash leaves either the whole prior state or
     /// the whole new state.
+    ///
+    /// Fallible (B8 review F3): a durable implementation can fail. The
+    /// caller (`join_group`) must NOT set its in-memory Pending Join on
+    /// error — without the durable record and the queued Pair the join
+    /// would hang forever. The error is a description; the session maps
+    /// it to a typed `SessionError`.
     fn begin_pending_join(
         &mut self,
         pending: &[u8],
         recipient: &[u8; 32],
         sequence: u64,
         encoded_pair: Vec<u8>,
-    );
+    ) -> Result<(), String>;
     /// The persisted Pending Join record, if any. Loaded at session
     /// construction so the anchor survives restarts (ADR-0023: a Pending
     /// Join has no timer and survives restarts).
@@ -279,9 +285,10 @@ impl OperationLog for MemLog {
         recipient: &[u8; 32],
         sequence: u64,
         encoded_pair: Vec<u8>,
-    ) {
+    ) -> Result<(), String> {
         self.pending_join = Some(pending.to_vec());
         self.append_control(recipient, sequence, encoded_pair);
+        Ok(())
     }
 
     fn pending_join(&self) -> Option<Vec<u8>> {
@@ -307,9 +314,11 @@ mod tests {
     fn memlog_pending_join_begin_replace_clear() {
         let mut log = MemLog::new();
         assert!(log.pending_join().is_none());
-        log.begin_pending_join(b"anchor-a", &oid(7), 0, b"pair-a".to_vec());
+        log.begin_pending_join(b"anchor-a", &oid(7), 0, b"pair-a".to_vec())
+            .unwrap();
         assert_eq!(log.pending_join().as_deref(), Some(b"anchor-a".as_slice()));
-        log.begin_pending_join(b"anchor-b", &oid(8), 1, b"pair-b".to_vec());
+        log.begin_pending_join(b"anchor-b", &oid(8), 1, b"pair-b".to_vec())
+            .unwrap();
         assert_eq!(log.pending_join().as_deref(), Some(b"anchor-b".as_slice()));
         assert_eq!(log.undelivered_entries().len(), 2);
         log.clear_pending_join();

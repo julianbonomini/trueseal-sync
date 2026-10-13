@@ -468,59 +468,75 @@ fn pair_with_wrong_secret_is_rejected() {
 #[test]
 fn pair_replaying_spent_secret_is_rejected() {
     let relay_kp = make_relay_kp();
-    let relay_pub = relay_pub(&relay_kp);
-    let (pa_c, pa_r) = mem_pipe_pair();
-    let (pb_c, pb_r) = mem_pipe_pair();
-    let (pm_c, pm_r) = mem_pipe_pair();
-    let (nk_rx, nk) = nk_push_channel();
-    spawn_tripartite_relay(&relay_kp, pa_r, pb_r, pm_r, nk_rx);
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
 
-    let device_a = DeviceKeypair::generate();
-    let device_b = DeviceKeypair::generate();
-    let device_m = DeviceKeypair::generate();
-    let m_noise = device_m.public_key();
-    let m_signing = device_m.signing_public_key();
+    let device = DeviceKeypair::generate();
+    let joiner_b = SigningKeypair::generate();
+    let attacker_m = SigningKeypair::generate();
 
-    let session_a =
-        TruesealSession::connect(pa_c, relay_pub, device_a, |_, _, _| {}, nk.factory()).expect("A");
-    let session_b =
-        TruesealSession::connect(pb_c, relay_pub, device_b, |_, _, _| {}, nk.factory()).expect("B");
-    let session_m =
-        TruesealSession::connect(pm_c, relay_pub, device_m, |_, _, _| {}, nk.factory()).expect("M");
-
+    let session = TruesealSession::<MemPipe>::connect_full(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        |_, _, _| {},
+        Box::new(MemLog::new()),
+        || {},
+        |_| {},
+        || {},
+        || Err("push factory unused".into()),
+    )
+    .expect("session");
     let requests = Arc::new(AtomicUsize::new(0));
     let rq = requests.clone();
     let first: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let f = first.clone();
-    session_a.set_on_member_request(move |t, _| {
+    session.set_on_member_request(move |t, _| {
         rq.fetch_add(1, Ordering::SeqCst);
         *f.lock().unwrap() = Some(t);
     });
+    let device_pub = session.noise_pub();
 
-    // B joins and is admitted — the secret is spent.
-    let token = session_a.pairing_token();
+    // B proves the secret and is admitted — the single-use window is spent.
+    let token = session.pairing_token();
     let (_, _, secret, _) = crate::message::decode_pairing_token(&token).expect("token");
-    session_b.join_group(&token).expect("join");
+    relay.deliver(
+        1,
+        &Message::Pair {
+            noise_pub: [0xB1; 32],
+            signing_pub: joiner_b.public_key_bytes(),
+            secret,
+        },
+        device_pub,
+        &joiner_b,
+        1,
+    );
     wait_for(|| first.lock().unwrap().is_some(), Duration::from_secs(5));
     let t = first.lock().unwrap().clone().unwrap();
-    assert!(session_a.accept_member(&t));
+    assert!(session.accept_member(&t));
     assert_eq!(requests.load(Ordering::SeqCst), 1);
 
     // M eavesdropped nothing — but suppose it somehow holds the spent
     // secret (e.g. a photographed token used too late). The replay dies.
-    session_m
-        .push_message(
-            &Message::Pair {
-                noise_pub: m_noise.0,
-                signing_pub: m_signing.0,
-                secret,
-            },
-            session_a.noise_pub(),
-        )
-        .expect("push queues");
+    relay.deliver(
+        2,
+        &Message::Pair {
+            noise_pub: [0x77; 32],
+            signing_pub: attacker_m.public_key_bytes(),
+            secret,
+        },
+        device_pub,
+        &attacker_m,
+        1,
+    );
 
-    // Let the pump deliver; then assert no second request.
-    std::thread::sleep(Duration::from_millis(800));
+    // Deterministic negative assertion (B8 review F4): wait until the
+    // replayed Pair was delivered AND acked — i.e. the handler ran — then
+    // assert it raised nothing.
+    wait_for(
+        || relay.deliver_acks() == vec![1, 2],
+        Duration::from_secs(3),
+    );
     assert_eq!(
         requests.load(Ordering::SeqCst),
         1,
@@ -1340,4 +1356,166 @@ fn new_window_spends_the_old_secret() {
     );
     wait_for(|| relay.deliver_acks() == vec![1], Duration::from_secs(3));
     assert_eq!(requests.load(Ordering::SeqCst), 0);
+}
+
+/// Two concurrent accepts must not both succeed (B8 review F1): the window
+/// check and the consume happen under one lock, so exactly one caller
+/// observes the open window and the other gets `false` — no divergent
+/// genesis manifests.
+#[test]
+fn two_concurrent_accepts_exactly_one_succeeds() {
+    let relay_kp = make_relay_kp();
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let _relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+
+    let device = DeviceKeypair::generate();
+    let session = Arc::new(
+        TruesealSession::<MemPipe>::connect_full(
+            pipe_client,
+            relay_pub(&relay_kp),
+            device,
+            |_, _, _| {},
+            Box::new(MemLog::new()),
+            || {},
+            |_| {},
+            || {},
+            || Err("push factory unused".into()),
+        )
+        .expect("session"),
+    );
+    let _token = session.pairing_token(); // window open
+
+    let joiner_a = SigningKeypair::generate();
+    let joiner_b = SigningKeypair::generate();
+
+    let mut handles = Vec::new();
+    for joiner in [joiner_a, joiner_b] {
+        let session = session.clone();
+        let noise = NoisePublicKey(rand::random());
+        let signing = SigningPublicKey(joiner.public_key_bytes());
+        handles.push(std::thread::spawn(move || {
+            session.accept_pair(noise, signing)
+        }));
+    }
+    let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    assert_eq!(
+        results.iter().filter(|&&ok| ok).count(),
+        1,
+        "concurrent accepts must yield exactly one admission, got {results:?}"
+    );
+    // The winner issued a well-formed genesis (self + one member) — the
+    // loser did not interleave a second, divergent manifest.
+    let members = session.members();
+    assert_eq!(
+        members.len(),
+        1,
+        "exactly one remote member was admitted, got {}",
+        members.len()
+    );
+}
+
+/// A failing op-log: every durable write works EXCEPT `begin_pending_join`,
+/// which reports a store failure. Models a disk-full / locked-SQLite join.
+struct FailingJoinLog {
+    inner: MemLog,
+}
+
+impl FailingJoinLog {
+    fn new() -> Self {
+        Self {
+            inner: MemLog::new(),
+        }
+    }
+}
+
+impl OperationLog for FailingJoinLog {
+    fn append_entry(&mut self, entry: crate::operation_log::LogEntry) {
+        self.inner.append_entry(entry);
+    }
+    fn mark_delivered(&mut self, object_id: &[u8; 32], sequence: u64) {
+        self.inner.mark_delivered(object_id, sequence);
+    }
+    fn remove(&mut self, object_id: &[u8; 32], sequence: u64) {
+        self.inner.remove(object_id, sequence);
+    }
+    fn undelivered_entries(&self) -> Vec<crate::operation_log::LogEntry> {
+        self.inner.undelivered_entries()
+    }
+    fn entries_from(
+        &self,
+        object_id: &[u8; 32],
+        sequence: u64,
+    ) -> Vec<crate::operation_log::LogEntry> {
+        self.inner.entries_from(object_id, sequence)
+    }
+    fn max_sequence(&self) -> Option<u64> {
+        self.inner.max_sequence()
+    }
+    fn record_sequence(&mut self, sequence: u64) {
+        self.inner.record_sequence(sequence);
+    }
+    fn is_handled(&self, message_id: &str) -> bool {
+        self.inner.is_handled(message_id)
+    }
+    fn record_handled(&mut self, message_id: &str, now: u64) {
+        self.inner.record_handled(message_id, now);
+    }
+    fn begin_pending_join(
+        &mut self,
+        _pending: &[u8],
+        _recipient: &[u8; 32],
+        _sequence: u64,
+        _encoded_pair: Vec<u8>,
+    ) -> Result<(), String> {
+        Err("disk is full".into())
+    }
+    fn pending_join(&self) -> Option<Vec<u8>> {
+        self.inner.pending_join()
+    }
+    fn clear_pending_join(&mut self) {
+        self.inner.clear_pending_join();
+    }
+}
+
+/// A store failure on join surfaces a typed error and leaves NO in-memory
+/// Pending Join behind (B8 review F3): before the fix the SQLite error was
+/// swallowed and the device hung forever in PendingJoin with its Pair
+/// never queued.
+#[test]
+fn join_group_store_failure_is_a_typed_error_without_pending_state() {
+    let relay_kp = make_relay_kp();
+    let (pipe_client, pipe_relay) = mem_pipe_pair();
+    let _relay = ScriptedRelay::spawn(pipe_relay, &relay_kp);
+
+    let device = DeviceKeypair::generate();
+    let session = TruesealSession::<MemPipe>::connect_full(
+        pipe_client,
+        relay_pub(&relay_kp),
+        device,
+        |_, _, _| {},
+        Box::new(FailingJoinLog::new()),
+        || {},
+        |_| {},
+        || {},
+        || Err("push factory unused".into()),
+    )
+    .expect("session");
+
+    // A well-formed token (the session's own is fine — the store fails
+    // before any network step matters).
+    let token = session.pairing_token();
+
+    let err = session
+        .join_group(&token)
+        .expect_err("a failed begin_pending_join must surface");
+    assert!(
+        matches!(err, SessionError::Store(ref msg) if msg.contains("disk is full")),
+        "expected SessionError::Store, got {err:?}"
+    );
+    assert_eq!(
+        session.group_status(),
+        GroupStatus::NotJoined,
+        "no in-memory Pending Join survives a failed durable write"
+    );
 }

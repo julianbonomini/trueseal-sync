@@ -81,6 +81,12 @@ pub enum SessionError {
     /// (ADR-0023). (`alreadyInGroup` in ADR-0028's error list.)
     #[error("already in a group")]
     AlreadyInGroup,
+    /// A durable write failed (B8 review F3). The operation did not commit:
+    /// no in-memory state was changed, and the caller may retry. Without
+    /// surfacing this, a failed `begin_pending_join` would leave a join
+    /// hanging forever in PendingJoin with its Pair never queued.
+    #[error("store write failed: {0}")]
+    Store(String),
 }
 
 /// Where the local Device stands in its namespace's Sync Group (ADR-0023,
@@ -921,10 +927,14 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
             }
         };
         let seq = self.next_seq();
+        // B8 review F3: propagate a store failure — the in-memory Pending
+        // Join is set ONLY after the durable record + queued Pair commit,
+        // so a failed join leaves the device honestly NotJoined.
         self.op_log
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .begin_pending_join(&pending.encode(), &initiator_noise, seq, msg.encode());
+            .begin_pending_join(&pending.encode(), &initiator_noise, seq, msg.encode())
+            .map_err(SessionError::Store)?;
         *self.pending_join.lock().unwrap_or_else(|e| e.into_inner()) = Some(pending);
         self.kick.kick();
         Ok(())
@@ -1558,23 +1568,39 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// authentication.
     pub fn pairing_token(&self) -> String {
         let secret: [u8; 32] = rand::random();
-        *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = Some(PairingWindow { secret });
-        // A new window must not inherit requests raised under a spent
-        // secret — its pending requests live and die with the window.
-        self.pending_members
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        {
+            // Hold the window lock across the clear AND the replace (B8
+            // review F2), in the handler's lock order (pairing →
+            // pending_members). A new window must not inherit requests
+            // raised under a spent secret — its pending requests live and
+            // die with the window — and clearing BEFORE the replace means
+            // a Join Request raised under the NEW window can never be
+            // wiped by this clear. Residual, bounded race: a Pair that
+            // passed the OLD window's secret check just before the replace
+            // can still insert after the clear; the single-use window
+            // bounds this — accepting any request spends the window and
+            // drops every other pending request.
+            let mut window = self.pairing.lock().unwrap_or_else(|e| e.into_inner());
+            self.pending_members
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            *window = Some(PairingWindow { secret });
+        }
         let ks = self.keys.lock().unwrap_or_else(|e| e.into_inner());
         crate::message::pairing_token(&ks.noise_pub.0, &ks.signing_pub.0, &secret)
     }
 
     pub fn cancel_pairing(&self) {
-        *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Same lock order as `pairing_token` and the inbound handler
+        // (pairing → pending_members): the window close and the clear of
+        // its pending requests are one observation.
+        let mut window = self.pairing.lock().unwrap_or_else(|e| e.into_inner());
         self.pending_members
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        *window = None;
     }
 
     /// Admit a device; requires both noise and signing pub keys.
@@ -1584,12 +1610,18 @@ impl<T: Read + Write + Send + 'static> TruesealSession<T> {
     /// On success: issues a new `GroupManifest` (genesis or version+1), stores it locally,
     /// and pushes it to all existing members plus the new member.
     pub fn accept_pair(&self, noise_pub: NoisePublicKey, signing_pub: SigningPublicKey) -> bool {
-        let window_open = {
-            let guard = self.pairing.lock().unwrap_or_else(|e| e.into_inner());
-            guard.as_ref().map(|w| w.is_open()).unwrap_or(false)
-        };
-        // Always clear the window.
-        *self.pairing.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // Take the window under ONE lock (B8 review F1): the check and the
+        // consume are atomic, so two concurrent accepts cannot both observe
+        // an open window and issue divergent genesis manifests. The window
+        // is spent whether or not it was open — a closed window is not
+        // revived.
+        let window_open = self
+            .pairing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|w| w.is_open())
+            .unwrap_or(false);
 
         if !window_open {
             return false;
