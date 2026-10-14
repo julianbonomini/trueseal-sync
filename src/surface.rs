@@ -20,7 +20,7 @@
 //! and future SDK codegen (SDK-3/G12), not for app developers.
 
 use crate::ffi::{
-    AdmissionDropReason, ConnectionState, DeliveryIssue, GroupStatus, JoinRequest,
+    AdmissionDropReason, ConnectionState, DeliveryIssue, GroupStatus, MemberRequest,
     SendFailedReason, StatusReason, TrueSealError, TrueSealEvent, UnreadableReason,
 };
 
@@ -88,7 +88,7 @@ pub fn every_event() -> Vec<TrueSealEvent> {
         },
         TrueSealEvent::MembersChanged { members: vec![] },
         TrueSealEvent::JoinRequest {
-            request: JoinRequest {
+            request: MemberRequest {
                 id: String::new(),
                 name: String::new(),
             },

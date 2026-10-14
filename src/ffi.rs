@@ -232,8 +232,12 @@ pub struct TrueSealMessage {
 /// The admitter's view of a Pair that proved knowledge of the Pairing
 /// Secret (ADR-0023). Pass `id` back to `accept()` to admit the device.
 /// An unaccepted request disappears when the Pairing Window closes.
+///
+/// Named `MemberRequest` at the binding level (not `JoinRequest`) so generated
+/// Kotlin does not self-shadow against the nested `TrueSealEvent.JoinRequest`
+/// variant class (G0; the canonical event CASE name `joinRequest` is unchanged).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct JoinRequest {
+pub struct MemberRequest {
     pub id: String,
     pub name: String,
 }
@@ -282,7 +286,7 @@ pub enum TrueSealEvent {
     MembersChanged { members: Vec<Member> },
     /// A device requested to join inside the open Pairing Window
     /// (ADR-0023).
-    JoinRequest { request: JoinRequest },
+    JoinRequest { request: MemberRequest },
     /// The relay link transitioned.
     ConnectionChanged { connection: ConnectionState },
     /// A Pending Membership Change re-application was dropped
@@ -1124,7 +1128,7 @@ impl TrueSeal {
             let events = events.clone();
             inner.set_on_member_request(move |token, name| {
                 events.fire(TrueSealEvent::JoinRequest {
-                    request: JoinRequest { id: token, name },
+                    request: MemberRequest { id: token, name },
                 });
             });
         }
